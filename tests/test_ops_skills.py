@@ -19,9 +19,142 @@ from backend.app.services.ops_skill_registry import (
     approved_script_catalog,
     skill_option_catalog,
 )
+from backend.app.services.ops_skill_runtime import classify_volume_write_failure
 
 
 class OpsSkillCatalogTests(unittest.TestCase):
+    def test_database_open_error_is_correlated_as_write_path_hypothesis(self):
+        plan = {
+            "summary": "CrashLoopBackOff",
+            "evidence": {
+                "logs": {"api": {"previous": "sqlite3.OperationalError: unable to open database file"}},
+                "pod": {
+                    "security_context": {"runAsUser": 10001, "runAsGroup": 10001},
+                    "containers": [{
+                        "name": "api",
+                        "security_context": {"runAsUser": 10001, "runAsGroup": 10001},
+                        "volume_mounts": [{"name": "data", "mount_path": "/var/lib/app"}],
+                    }],
+                },
+                "workload": {
+                    "kind": "Deployment",
+                    "spec": {"template": {"spec": {"securityContext": {"runAsUser": 10001}}}},
+                },
+            },
+        }
+        hypothesis = classify_volume_write_failure(plan)
+        self.assertTrue(hypothesis["detected"])
+        self.assertEqual(hypothesis["signal_class"], "indirect_write_path_error")
+        self.assertGreaterEqual(hypothesis["confidence"], 0.72)
+        self.assertIn("container_volume_mount", hypothesis["corroboration"])
+
+    def test_executable_permission_skill_materializes_same_runtime_plan(self):
+        evidence = {
+            "logs": {"api": {"previous": "sqlite3.OperationalError: unable to open database file"}},
+            "events": [],
+            "pod": {
+                "name": "api-abc",
+                "security_context": {},
+                "containers": [{
+                    "name": "api",
+                    "security_context": {"runAsUser": 10001, "runAsGroup": 10001},
+                    "volume_mounts": [{"name": "data", "mount_path": "/var/lib/app"}],
+                }],
+            },
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "api"},
+                "spec": {"template": {"spec": {"containers": [{"name": "api"}]}}},
+            },
+            "storage": [{"pvc": "api-data", "pvc_phase": "Bound"}],
+        }
+        plan = {
+            "namespace": "default",
+            "target": "Deployment/api",
+            "summary": "unable to open database file",
+            "evidence": evidence,
+            "changes": [],
+        }
+        attached = server._attach_operator_skills_to_plan(
+            plan,
+            {"question": plan["summary"], "evidence": evidence, "plan": plan},
+            preferred_skill_ids=["skill-volume-permission-recovery"],
+        )
+        self.assertEqual(attached["selected_skill_id"], "skill-volume-permission-recovery")
+        self.assertEqual(attached["change_source"], "executable_skill")
+        self.assertEqual(attached["permission_recovery_stage"], "nonroot_group")
+        self.assertEqual(attached["skill_runtime"]["handler_id"], "volume-write-permission-recovery")
+        self.assertEqual(attached["changes"][0]["selection_source"], "executable_skill_handler")
+
+    def test_chat_and_inspection_use_identical_executable_skill_core(self):
+        evidence = {
+            "logs": {"api": {"current": "sqlite3.OperationalError: unable to open database file"}},
+            "events": [],
+            "pod": {
+                "name": "api-abc",
+                "security_context": {},
+                "containers": [{
+                    "name": "api",
+                    "security_context": {"runAsUser": 10001, "runAsGroup": 10001},
+                    "volume_mounts": [{"name": "data", "mount_path": "/var/lib/app"}],
+                }],
+            },
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "api"},
+                "spec": {"template": {"spec": {"containers": [{"name": "api"}]}}},
+            },
+            "storage": [{"pvc": "api-data", "pvc_phase": "Bound"}],
+        }
+        outputs = []
+        for surface in ("sre_chat", "ai_inspection"):
+            plan = {
+                "_skill_incident_id": f"{surface}-incident",
+                "source_surface": surface,
+                "namespace": "default",
+                "target": "Deployment/api",
+                "summary": "unable to open database file",
+                "evidence": evidence,
+                "changes": [],
+            }
+            outputs.append(server._attach_operator_skills_to_plan(
+                plan,
+                {"question": plan["summary"], "evidence": evidence, "plan": plan},
+                preferred_skill_ids=["skill-volume-permission-recovery"],
+            ))
+        self.assertEqual(outputs[0]["skill_runtime"], outputs[1]["skill_runtime"])
+        self.assertEqual(outputs[0]["permission_recovery_stage"], outputs[1]["permission_recovery_stage"])
+        self.assertEqual(outputs[0]["changes"][0]["patch"], outputs[1]["changes"][0]["patch"])
+
+    def test_skill_route_metrics_are_idempotent_for_same_incident(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = OpsSkillRegistry(Path(directory) / "skills")
+            plan = {"_skill_incident_id": "incident-1"}
+            with patch.object(server, "OPS_SKILL_REGISTRY", registry):
+                server._record_skill_route_once(plan, "skill-volume-permission-recovery", "matched")
+                server._record_skill_route_once(plan, "skill-volume-permission-recovery", "matched")
+                server._record_skill_route_once(plan, "skill-volume-permission-recovery", "selected")
+                server._record_skill_route_once(plan, "skill-volume-permission-recovery", "selected")
+            row = next(
+                item for item in registry.usage_stats()["skills"]
+                if item["skill_id"] == "skill-volume-permission-recovery"
+            )
+            self.assertEqual(row["matched"], 1)
+            self.assertEqual(row["selected"], 1)
+
+    def test_skill_effectiveness_uses_distinct_incidents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = OpsSkillRegistry(Path(directory) / "skills")
+            skill_id = "skill-volume-permission-recovery"
+            registry.record_incident(skill_id, "incident-a", "handled")
+            registry.record_incident(skill_id, "incident-a", "handled")
+            registry.record_incident(skill_id, "incident-a", "resolved")
+            registry.record_incident(skill_id, "incident-b", "handled")
+            row = next(item for item in registry.usage_stats()["skills"] if item["skill_id"] == skill_id)
+            self.assertEqual(row["incidents_handled"], 2)
+            self.assertEqual(row["incidents_resolved"], 1)
+            self.assertEqual(row["success_rate"], 0.5)
+
     def test_secret_values_are_removed_from_all_public_payloads(self):
         encoded_fixture = base64.b64encode("-".join(("fixture", "value")).encode("utf-8")).decode("ascii")
         value = server._redact_sensitive({
@@ -113,7 +246,9 @@ class OpsSkillCatalogTests(unittest.TestCase):
             }, actor="old-release")
             reloaded = OpsSkillRegistry(root)
             upgraded = next(item for item in reloaded.list()["skills"] if item["id"] == "skill-storage-pvc-pv")
-            self.assertEqual(upgraded["evidence_required"], ["storage_chain", "events", "storage_class", "workload_spec"])
+            self.assertEqual(upgraded["evidence_required"], ["storage_chain", "events", "workload_spec"])
+            self.assertEqual(upgraded["evidence_any_of"], [["pvc_binding", "storage_class"]])
+            self.assertEqual(upgraded["runtime_handler"], "pvc-pv-binding-recovery")
 
     def test_dynamic_skill_authorizes_and_binds_permission_action(self):
         plan = {
@@ -142,7 +277,8 @@ class OpsSkillCatalogTests(unittest.TestCase):
             "evidence": plan["evidence"],
             "plan": plan,
         })
-        self.assertEqual(attached["change_source"], "dynamic_skill")
+        self.assertEqual(attached["change_source"], "executable_skill")
+        self.assertEqual(attached["skill_runtime"]["handler_id"], "volume-write-permission-recovery")
         self.assertEqual(attached["changes"][0]["skill_id"], "skill-volume-permission-recovery")
         self.assertTrue(attached["changes"][0]["skill_supported"])
 

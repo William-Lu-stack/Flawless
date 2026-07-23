@@ -461,6 +461,8 @@ Deep evidence: {json.dumps(safe_diagnostics, ensure_ascii=False)[:14000]}
 ## 任务
 请以 JSON 格式返回诊断结果，包含以下字段：
 - root_cause: 根因分析（中文）
+- root_cause_candidates: 候选根因数组，每项包含 id、hypothesis、confidence、supporting_evidence、contradicting_evidence、required_next_evidence。必须同时考虑至少 2 个可解释当前症状的候选，除非 Kubernetes 状态已经给出唯一确定原因
+- skill_routing: 包含 primary_skill_id、secondary_skill_ids、rationale。只能引用“按需加载的运维 Skills”中已有 id；通常只选一个主 Skill，只有根因跨两个独立领域且后一个依赖前一个结果时才给出 secondary_skill_ids
 - impact: 影响范围
 - confidence: 置信度 (0-1)
 - risk_level: 风险等级 (low/medium/high/critical)
@@ -482,6 +484,8 @@ Deep evidence: {json.dumps(safe_diagnostics, ensure_ascii=False)[:14000]}
 7. 对复杂问题应覆盖 rollout 回归、PDB 死锁、Service selector/Endpoint、Quota/LimitRange、DNS/CNI、CSI/PVC、证书/Webhook、节点压力和依赖故障等分支。
 8. 命中运维 Skill 时，遵循其中的证据顺序和恢复判据；Skill 与实时证据冲突时以实时证据为准。
 9. 如果日志不存在、Pod 已删除或 container 尚未产生日志，先用 Events/状态/Workload 模板判断是否有 PVC、镜像、ConfigMap、配额或调度阻断；没有模板级阻断时，可以提出 recreate_pod 作为诊断性重建，重建后必须重新采集 current/previous logs。
+10. 不得只做字面关键词匹配。先把应用/框架包装后的错误还原成底层资源操作，再与 Pod YAML 交叉验证。例如 `unable/can't open database file` 可能是父目录不存在、volumeMount/subPath 错误、只读根文件系统、容器 UID/GID 无写权限、磁盘满或数据库文件损坏；只有日志路径、volumeMount、securityContext、PVC/PV/Events 中至少一类旁证支持时，才提高“写路径权限”置信度并匹配卷权限 Skill。lock/WAL/PID/temp file 创建失败使用同一推理方法。
+11. 对每个候选根因列出支持证据和反证。不要因为 Skill 名称、用户描述或单个相似词强行命中；先输出候选根因，再选择主 Skill。主 Skill 的某一阶段验证失败不等于整个 Skill 失败，可连续 Skill 应基于失败后新证据进入下一阶段。
 
 只返回 JSON，不要任何其他内容。"""
 

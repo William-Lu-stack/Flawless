@@ -157,9 +157,13 @@ def render_ops_policy(skill: dict[str, Any]) -> str:
         },
         "workflow": {
             "evidence_required": list(skill.get("evidence_required") or []),
+            "evidence_any_of": list(skill.get("evidence_any_of") or []),
             "diagnostic_steps": list(skill.get("diagnostic_steps") or []),
             "allowed_actions": list(skill.get("allowed_actions") or []),
             "success_criteria": list(skill.get("success_criteria") or []),
+            "runtime_handler": str(skill.get("runtime_handler") or ""),
+            "execution_model": str(skill.get("execution_model") or "host_action_mapping"),
+            "continuation_capable": bool(skill.get("continuation_capable", False)),
         },
         "guardrails": {
             "risk": str(skill.get("risk") or "medium"),
@@ -280,6 +284,7 @@ def read_package(package_dir: Path) -> dict[str, Any]:
         "symptoms": list(matching.get("symptoms") or []),
         "applies_to": list(matching.get("applies_to") or []),
         "evidence_required": list(workflow.get("evidence_required") or []),
+        "evidence_any_of": list(workflow.get("evidence_any_of") or []),
         "diagnostic_steps": list(workflow.get("diagnostic_steps") or []),
         "allowed_actions": list(workflow.get("allowed_actions") or []),
         "success_criteria": list(workflow.get("success_criteria") or []),
@@ -295,6 +300,12 @@ def read_package(package_dir: Path) -> dict[str, Any]:
         "format": AGENT_SKILL_SPEC,
         "portable": True,
         "execution_ready": bool(policy and workflow.get("allowed_actions")),
+        # Imported packages can describe a runtime handler for portability, but
+        # the registry strips it unless the application itself marks the Skill
+        # as a trusted built-in.
+        "runtime_handler": str(workflow.get("runtime_handler") or ""),
+        "execution_model": str(workflow.get("execution_model") or "host_action_mapping"),
+        "continuation_capable": bool(workflow.get("continuation_capable", False)),
         "package_path": str(package_dir),
         "package_files": sum(1 for path in package_dir.rglob("*") if path.is_file()),
         "bundled_scripts": script_files,

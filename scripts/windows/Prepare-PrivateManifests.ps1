@@ -19,7 +19,7 @@ if (-not $OutputDirectory) {
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
 $replacements = [ordered]@{
-    "m.daocloud.io/ghcr.io/your-org/flawless:3.2.3" = "$registry/k8s-agent:3.2.3"
+    "m.daocloud.io/ghcr.io/your-org/flawless:3.2.4" = "$registry/k8s-agent:3.2.4"
     "m.daocloud.io/ghcr.io/your-org/flawless-node-exec:1.36" = "$registry/k8s-agent-node-exec:1.36"
     "registry.cn-hangzhou.aliyuncs.com/google_containers/prometheus:v2.45.0" = "$registry/k8s-agent-prometheus:v2.45.0"
     "m.daocloud.io/registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.1" = "$registry/k8s-agent-kube-state-metrics:v2.10.1"

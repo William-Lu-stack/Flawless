@@ -691,7 +691,7 @@ export function OpsSkillsPage() {
           <p>{skill.summary}</p>
           <div className="chips">{list(skill.allowed_actions).slice(0, 4).map((item: any) => <span key={item}>{item}</span>)}</div>
           {skill.script_policy?.enabled && <div className="skill-script-badge"><TerminalSquare size={13} /><span>批准脚本：{skill.script_policy.script_id}</span></div>}
-          <footer><small>{skill.builtin ? "内置" : skill.lifecycle === "candidate" ? "AI 从成功恢复中沉淀" : "自定义"} · {skill.owner || "operator"} · {skill.execution_ready ? "可执行映射" : "指令型"}</small><div><button className="ghost tiny" onClick={() => exportSkill(skill)} title="导出标准 Agent Skill ZIP"><Download size={13} />导出</button><button className="ghost tiny" onClick={() => editSkill(skill)}>{skill.lifecycle === "candidate" ? "审核并发布" : "编辑"}</button><button className="ghost tiny" onClick={() => disableSkill(skill)}>{skill.builtin ? "禁用" : "删除"}</button></div></footer>
+          <footer><small>{skill.builtin ? "内置" : skill.lifecycle === "candidate" ? "AI 从成功恢复中沉淀" : "自定义"} · {skill.owner || "operator"} · {skill.execution_model === "executable_builtin_skill" ? `内置可执行 Handler：${skill.runtime_handler}` : skill.execution_ready ? "可执行动作映射" : "指令型"}</small><div><button className="ghost tiny" onClick={() => exportSkill(skill)} title="导出标准 Agent Skill ZIP"><Download size={13} />导出</button><button className="ghost tiny" onClick={() => editSkill(skill)}>{skill.lifecycle === "candidate" ? "审核并发布" : "编辑"}</button><button className="ghost tiny" onClick={() => disableSkill(skill)}>{skill.builtin ? "禁用" : "删除"}</button></div></footer>
         </article>)}
       </div>
     </div>
@@ -699,13 +699,18 @@ export function OpsSkillsPage() {
       <SectionHead
         icon={FileClock}
         title="运维 Records 与 Skill 成效"
-        meta={`保留 ${records.data?.retention_days || 365} 天 · 调用只统计实际 executed`}
+        meta={`保留 ${records.data?.retention_days || 365} 天 · 按成功恢复问题数排序，匹配按故障去重`}
         action={<div className="skill-head-actions"><button className="ghost" onClick={() => window.location.assign("/api/ops/records/export?limit=1000")}><Download size={14} />导出</button><button className="ghost" onClick={refreshRecords}><RefreshCcw size={14} />刷新</button></div>}
       />
       <div className="skill-stat-grid">
         {list(records.data?.skill_stats?.skills).map((item: any) => <article key={item.skill_id}>
           <strong>{item.skill_name}</strong><small>{item.skill_id}</small>
-          <div><span>匹配<b>{item.matched || 0}</b></span><span>选中<b>{item.selected || 0}</b></span><span>审批<b>{item.approval_requested || 0}</b></span><span>调用<b>{item.executed || 0}</b></span><span>成功<b>{item.succeeded || 0}</b></span><span>失败<b>{item.failed || 0}</b></span><span>回滚<b>{item.rolled_back || 0}</b></span></div>
+          <div className="skill-effectiveness-primary">
+            <span>解决问题<b>{item.incidents_resolved || 0}</b></span>
+            <span>处理问题<b>{item.incidents_handled || 0}</b></span>
+            <span>恢复成功率<b>{item.success_rate == null ? "暂无" : `${Math.round(Number(item.success_rate) * 100)}%`}</b></span>
+          </div>
+          <div><span>去重匹配<b>{item.matched || 0}</b></span><span>选中<b>{item.selected || 0}</b></span><span>生成方案<b>{item.planned || 0}</b></span><span>审批<b>{item.approval_requested || 0}</b></span><span>真实动作<b>{item.executed || 0}</b></span><span>动作成功<b>{item.succeeded || 0}</b></span><span>失败阶段<b>{item.failed || 0}</b></span><span>回滚<b>{item.rolled_back || 0}</b></span></div>
         </article>)}
       </div>
       <div className="ops-record-list">

@@ -86,11 +86,11 @@ names=(
   "Approved Node Executor"
 )
 sources=(
-  "m.daocloud.io/ghcr.io/your-org/flawless:3.2.3"
+  "m.daocloud.io/ghcr.io/your-org/flawless:3.2.4"
   "m.daocloud.io/ghcr.io/your-org/flawless-node-exec:1.36"
 )
 targets=(
-  "your-org/flawless:3.2.3"
+  "your-org/flawless:3.2.4"
   "your-org/flawless-node-exec:1.36"
 )
 

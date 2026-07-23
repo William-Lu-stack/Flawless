@@ -59,7 +59,7 @@ getent hosts rancher.example.com
 
 必需镜像按以下顺序上传：
 
-1. `registry.example.com/platform/flawless:3.2.3`
+1. `registry.example.com/platform/flawless:3.2.4`
 2. `registry.example.com/platform/flawless-node-exec:1.36`
 
 如果同时部署内置可观测组件：
@@ -155,7 +155,7 @@ helm upgrade --install k8s-agent ./charts/flawless \
   --create-namespace \
   --values ./charts/flawless/values-production.example.yaml \
   --set-string image.repository=registry.example.com/platform/flawless \
-  --set-string image.tag=3.2.3 \
+  --set-string image.tag=3.2.4 \
   --set-string config.NODE_EXEC_IMAGE=registry.example.com/platform/flawless-node-exec:1.36
 
 kubectl apply -f manifests/node-executor.yaml

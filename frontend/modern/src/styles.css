@@ -1689,6 +1689,8 @@ body[data-theme="dark"] .flow-module {
 .skill-stat-grid article > strong { font-size: 10px; }
 .skill-stat-grid article > small { color: var(--muted); font-size: 8px; }
 .skill-stat-grid article > div { display: grid; grid-template-columns: repeat(4,1fr); gap: 5px; margin-top: 4px; }
+.skill-stat-grid article > .skill-effectiveness-primary { grid-template-columns: repeat(3,1fr); padding: 8px; border: 1px solid color-mix(in srgb,var(--good) 30%,var(--line)); border-radius: 7px; background: color-mix(in srgb,var(--good) 7%,var(--surface)); }
+.skill-effectiveness-primary b { color: var(--good); font-size: 14px; }
 .skill-stat-grid span { display: grid; gap: 2px; color: var(--muted); font-size: 8px; }
 .skill-stat-grid b { color: var(--text); font-size: 11px; }
 .ops-record-list { display: grid; gap: 7px; max-height: 480px; overflow: auto; }

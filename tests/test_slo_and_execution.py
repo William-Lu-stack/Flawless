@@ -123,7 +123,11 @@ class ErrorBudgetTests(unittest.TestCase):
         }
         followups = server._derive_followup_plans(plan, "storage volume permission denied")
         self.assertEqual(len(followups[0]["changes"]), 1)
-        self.assertEqual(followups[0]["source"], "progressive_permission_recovery")
+        self.assertEqual(followups[0]["source"], "executable_volume_permission_skill")
+        self.assertEqual(
+            followups[0]["skill_runtime"]["handler_id"],
+            "volume-write-permission-recovery",
+        )
         self.assertEqual(followups[0]["permission_recovery_stage"], "nonroot_group")
         patch = followups[0]["changes"][0]["patch"]
         self.assertEqual(patch["spec"]["template"]["spec"]["securityContext"]["fsGroup"], 472)
@@ -910,6 +914,60 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 os.environ.pop("AUTO_OPS_STATIC_PV_NFS_BASE_PATH", None)
             else:
                 os.environ["AUTO_OPS_STATIC_PV_NFS_BASE_PATH"] = old_path
+
+    async def test_managed_topology_without_cmdb_still_fuses_beyla_flows(self):
+        managed = {
+            "status": "ok",
+            "source": "kubeconfig",
+            "nodes": [{
+                "id": "cluster-a:apps:Deployment/api",
+                "name": "api",
+                "type": "workload",
+                "cluster": "cluster-a",
+                "namespace": "apps",
+            }],
+            "edges": [],
+            "summary": {},
+        }
+        observed = [{
+            "source_system": "ebpf_beyla",
+            "observed": True,
+            "direction": "egress",
+            "source": {
+                "id": "cluster-a:apps:Deployment/api",
+                "cluster": "cluster-a",
+                "cluster_id": "cluster-a",
+                "namespace": "apps",
+                "kind": "Deployment",
+                "name": "api",
+            },
+            "destination": {
+                "id": "external:db.example",
+                "type": "external_ip",
+                "kind": "External",
+                "name": "db.example",
+                "address": "db.example",
+            },
+            "protocol": "tcp",
+            "port": 5432,
+            "bytes": 1024,
+            "confidence": 0.98,
+            "evidence": ["network_flow"],
+        }]
+        with (
+            patch.dict(server.SERVICES, {"cmdb": ""}),
+            patch.object(server, "_managed_topology_payload", AsyncMock(return_value=managed)),
+            patch.object(
+                server,
+                "_fetch_configured_observed_flows",
+                AsyncMock(return_value=(observed, [{"id": "ebpf_beyla", "status": "connected", "flows": 1}])),
+            ),
+            patch.dict(os.environ, {"EBPF_TOPOLOGY_FUSION_ENABLED": "true"}),
+        ):
+            payload = await server.cmdb_topology()
+        self.assertEqual(payload["summary"]["ebpf_observed_edges"], 1)
+        self.assertTrue(any(edge.get("source_system") == "ebpf_beyla" for edge in payload["edges"]))
+        self.assertEqual(payload["diagnostics"]["ebpf_flow_status"][0]["status"], "connected")
 
     async def test_emergency_restart_translates_to_restart_action(self):
         enqueue = AsyncMock(return_value={"id": "ops-emergency", "status": "queued"})

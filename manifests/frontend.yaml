@@ -61,7 +61,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.3
+          image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.4
           imagePullPolicy: Always
           command:
             - python

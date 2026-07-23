@@ -305,6 +305,12 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
         "terms": (
             "permission denied", "operation not permitted", "read-only file system",
             "can't create directory", "cannot create directory", "mkdir:",
+            "unable to open database file", "can't open database file", "cannot open database file",
+            "could not open database file", "attempt to write a readonly database",
+            "attempt to write a read-only database", "database is read-only",
+            "failed to create lock file", "unable to create lock file",
+            "failed to open pid file", "failed to create wal",
+            "failed to create temporary file", "data directory is not writable",
             "权限不足", "目录权限", "无法创建目录",
         ),
         "diagnostics": ("previous_logs", "storage_chain", "workload_spec", "pod_security_context"),
@@ -491,7 +497,7 @@ def score_root_causes(alert: dict, diagnosis: dict, context: dict) -> list[dict[
         "cannot execute binary file",
         "standard_init_linux.go",
     ))
-    storage_permission_proven = any(term in decisive_text for term in (
+    direct_storage_permission = any(term in decisive_text for term in (
         "permission denied",
         "operation not permitted",
         "read-only file system",
@@ -499,6 +505,30 @@ def score_root_causes(alert: dict, diagnosis: dict, context: dict) -> list[dict[
         "cannot create directory",
         "mkdir:",
     ))
+    indirect_write_path_failure = any(term in decisive_text for term in (
+        "unable to open database file",
+        "can't open database file",
+        "cannot open database file",
+        "could not open database file",
+        "attempt to write a readonly database",
+        "attempt to write a read-only database",
+        "database is read-only",
+        "failed to create lock file",
+        "unable to create lock file",
+        "failed to open pid file",
+        "failed to create wal",
+        "failed to create temporary file",
+        "data directory is not writable",
+    ))
+    write_path_corroborated = any(term in decisive_text for term in (
+        "volumemounts", "volume_mounts", "mount_path", "mountpath",
+        "securitycontext", "security_context", "runasuser", "run_as_user",
+        "fsgroup", "persistentvolumeclaim", "pvc_phase",
+    ))
+    storage_permission_proven = bool(
+        direct_storage_permission
+        or (indirect_write_path_failure and write_path_corroborated)
+    )
     log_unavailable_proven = any(term in decisive_text for term in (
         "current_error",
         "previous_error",
@@ -558,8 +588,12 @@ def score_root_causes(alert: dict, diagnosis: dict, context: dict) -> list[dict[
         if runbook_id == "storage_permission" and storage_permission_proven:
             raw_score += 2.6
             matches.append({
-                "source": "container_logs",
-                "terms": ["write_permission_denied"],
+                "source": "container_logs+kubernetes_yaml",
+                "terms": [
+                    "write_permission_denied"
+                    if direct_storage_permission
+                    else "application_write_path_error_correlated_with_mount_or_security_context"
+                ],
                 "weight": 2.6,
             })
         if runbook_id == "crash_unknown" and storage_permission_proven:

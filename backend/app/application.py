@@ -71,6 +71,13 @@ from backend.app.services.cluster_registry import ClusterRegistry
 from cmdb.local_cmdb import _collect_cluster_topology
 from backend.app.services.ops_execution import StageTimeoutError, run_with_heartbeat
 from backend.app.services.ops_skill_registry import OpsSkillRegistry, approved_script_catalog, skill_option_catalog
+from backend.app.services.ops_skill_runtime import (
+    OPS_SKILL_RUNTIME,
+    PVC_PV_SKILL_ID,
+    VOLUME_PERMISSION_SKILL_ID,
+    classify_volume_write_failure,
+    public_runtime_catalog,
+)
 from backend.app.services.agent_skill_packages import AgentSkillPackageError, MAX_PACKAGE_BYTES
 from backend.app.api.reliability import ReliabilityDependencies, build_reliability_router
 from backend.app.domain.slo import evaluate_error_budget
@@ -173,8 +180,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.3")
-APP_CODE_SIGNATURE = "progressive-storage-recovery-v9"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.4")
+APP_CODE_SIGNATURE = "unified-executable-skills-ebpf-v10"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -4427,6 +4434,30 @@ async def cmdb_topology():
     managed_topology = await _managed_topology_payload()
     if not base:
         if managed_topology.get("nodes"):
+            if _env_bool("EBPF_TOPOLOGY_FUSION_ENABLED", "true"):
+                flow_req = ExternalTrafficFlowRequest(
+                    cluster="all",
+                    cluster_id="all",
+                    namespace="all",
+                    workload="",
+                    window=os.getenv("EBPF_TOPOLOGY_WINDOW", "30m"),
+                    source="observed",
+                    include_static_inference=False,
+                    include_cmdb=False,
+                )
+                observed_flows, observed_status = await _fetch_configured_observed_flows(flow_req)
+                flow_payload = build_external_traffic_payload(
+                    [],
+                    cmdb_topology={},
+                    observed_flows=observed_flows,
+                    scope={"cluster": "all", "namespace": "all", "window": flow_req.window},
+                    options={**_external_flow_options(), "include_internal_observed": True},
+                )
+                managed_topology = _merge_observed_flow_topology(
+                    managed_topology,
+                    flow_payload,
+                    observed_status,
+                )
             return managed_topology
         ebpf_only = await _observed_flow_only_topology("CMDB_URL 未配置")
         if ebpf_only:
@@ -4434,7 +4465,13 @@ async def cmdb_topology():
         return {"status": "disabled", "enabled": False, "nodes": [], "edges": [], "message": "CMDB_URL 未配置"}
     flow_cfg = _observed_flow_endpoint_config()
     managed_ids = ",".join(item["id"] for item in CLUSTER_REGISTRY.list())
-    cache_key = f"cmdb:topology:{base}:managed:{managed_ids}:ebpf:{flow_cfg.get('url_env','')}:{flow_cfg.get('url','')}:fusion:{_env_bool('EBPF_TOPOLOGY_FUSION_ENABLED', 'true')}"
+    cache_key = (
+        f"cmdb:topology-v2:{base}:managed:{managed_ids}:"
+        f"ebpf:{flow_cfg.get('url_env','')}:{flow_cfg.get('url','')}:"
+        f"beyla:{os.getenv('BEYLA_LOKI_NAMESPACE','')}:{os.getenv('BEYLA_LOKI_POD_SELECTOR','')}:"
+        f"{os.getenv('BEYLA_LOKI_QUERY','')}:{os.getenv('EBPF_TOPOLOGY_WINDOW','30m')}:"
+        f"fusion:{_env_bool('EBPF_TOPOLOGY_FUSION_ENABLED', 'true')}"
+    )
     cached = await CMDB_TOPOLOGY_CACHE.get(cache_key)
     if cached is not None:
         return {**copy.deepcopy(cached), "cache": {"hit": True, "ttl_seconds": CMDB_TOPOLOGY_CACHE.ttl_seconds}}
@@ -4664,13 +4701,20 @@ async def _fetch_beyla_loki_flows(req: ExternalTrafficFlowRequest) -> tuple[list
 
     namespace = os.getenv("BEYLA_LOKI_NAMESPACE", "flawless-ebpf").strip() or "flawless-ebpf"
     pod_selector = os.getenv("BEYLA_LOKI_POD_SELECTOR", "flawless-beyla.*").strip() or "flawless-beyla.*"
-    query = os.getenv("BEYLA_LOKI_QUERY", "").strip() or f'{{namespace="{namespace}",pod=~"{pod_selector}"}} |= "network_flow:"'
+    configured_query = os.getenv("BEYLA_LOKI_QUERY", "").strip()
+    query = configured_query or f'{{namespace="{namespace}",pod=~"{pod_selector}"}} |= "network_flow:"'
+    query_candidates = list(dict.fromkeys([
+        query,
+        f'{{namespace="{namespace}"}} |= "network_flow:"',
+        f'{{pod=~"{pod_selector}"}} |= "network_flow:"',
+        '{namespace=~".+"} |= "network_flow:"',
+        '{pod=~".+"} |= "network_flow:"',
+    ]))
     limit = max(1, min(int(os.getenv("BEYLA_LOKI_FLOW_LIMIT", "500") or "500"), 5000))
     seconds = _flow_window_seconds(req.window or os.getenv("BEYLA_FLOW_QUERY_WINDOW", "5m"), 300)
     end_ns = int(time.time() * 1_000_000_000)
     start_ns = end_ns - seconds * 1_000_000_000
-    params = {
-        "query": query,
+    base_params = {
         "start": str(start_ns),
         "end": str(end_ns),
         "limit": str(limit),
@@ -4678,19 +4722,49 @@ async def _fetch_beyla_loki_flows(req: ExternalTrafficFlowRequest) -> tuple[list
     }
     try:
         async with _client(12) as c:
-            resp = await c.get(f"{loki_url}/loki/api/v1/query_range", params=params)
-            resp.raise_for_status()
-            payload = resp.json()
+            payload = {}
+            attempts: list[dict] = []
+            effective_query = query
+            for candidate in query_candidates:
+                resp = await c.get(
+                    f"{loki_url}/loki/api/v1/query_range",
+                    params={**base_params, "query": candidate},
+                )
+                resp.raise_for_status()
+                candidate_payload = resp.json()
+                streams = (((candidate_payload or {}).get("data") or {}).get("result") or [])
+                attempts.append({"query": candidate, "streams": len(streams)})
+                if streams:
+                    payload = candidate_payload
+                    effective_query = candidate
+                    break
+                payload = candidate_payload
         raw_flows: list[dict] = []
+        raw_lines = 0
+        malformed_lines = 0
+        stream_labels: list[dict] = []
         for stream in (((payload or {}).get("data") or {}).get("result") or []):
+            if isinstance(stream, dict) and isinstance(stream.get("stream"), dict):
+                stream_labels.append({
+                    str(key): str(value)
+                    for key, value in (stream.get("stream") or {}).items()
+                    if str(key) in {"namespace", "namespace_name", "pod", "pod_name", "container", "job"}
+                })
             values = stream.get("values") if isinstance(stream, dict) else []
             for entry in values or []:
                 if not isinstance(entry, list) or len(entry) < 2:
                     continue
                 line = str(entry[1] or "")
+                raw_lines += 1
                 if "network_flow:" not in line:
                     continue
-                raw_flows.append(_parse_beyla_network_flow_line(line, cluster_hint=req.cluster_id or req.cluster or ""))
+                parsed = _parse_beyla_network_flow_line(
+                    line,
+                    cluster_hint=req.cluster_id or req.cluster or "",
+                )
+                if not ((parsed.get("source") or {}).get("name") and (parsed.get("destination") or {}).get("name")):
+                    malformed_lines += 1
+                raw_flows.append(parsed)
         flows = normalize_observed_flow_payload(
             raw_flows,
             source_system="beyla",
@@ -4702,18 +4776,30 @@ async def _fetch_beyla_loki_flows(req: ExternalTrafficFlowRequest) -> tuple[list
             "status": "connected" if flows else "empty",
             "mode": "loki_network_flow_logs",
             "namespace": namespace,
-            "query": query,
+            "configured_query": query,
+            "effective_query": effective_query,
+            "query_fallback_used": effective_query != query,
+            "query_attempts": attempts,
             "window": f"{seconds}s",
+            "streams": len((((payload or {}).get("data") or {}).get("result") or [])),
+            "raw_lines": raw_lines,
             "lines": len(raw_flows),
+            "malformed_lines": malformed_lines,
             "flows": len(flows),
-            "hint": "" if flows else "Beyla 已接入但最近窗口没有 network_flow 日志；可先访问几个业务接口，或检查 flawless-beyla DaemonSet 日志。",
+            "stream_labels": stream_labels[:5],
+            "hint": (
+                "已通过备用 Loki label 查询发现 Beyla 流；请把页面显示的 effective_query 固化到 BEYLA_LOKI_QUERY。"
+                if flows and effective_query != query else ""
+                if flows else
+                "Loki 可达但没有解析到 network_flow；检查 Beyla network.enable/print_flows、日志采集器是否收集该 namespace，以及页面展示的查询尝试。"
+            ),
         }]
     except Exception as exc:
         return [], [{
             "id": "ebpf_beyla",
             "status": "failed",
             "mode": "loki_network_flow_logs",
-            "query": query,
+            "configured_query": query,
             "error": f"{type(exc).__name__}: {exc}",
         }]
 
@@ -4912,8 +4998,8 @@ async def _collect_mcp_external_flow_resources(req: ExternalTrafficFlowRequest) 
 async def _fetch_configured_observed_flows(req: ExternalTrafficFlowRequest) -> tuple[list[dict], list[dict]]:
     cfg = _observed_flow_endpoint_config()
     url = str(cfg.get("url") or "")
+    beyla_flows, beyla_status = await _fetch_beyla_loki_flows(req)
     if not url or req.source == "static":
-        beyla_flows, beyla_status = await _fetch_beyla_loki_flows(req)
         if beyla_status:
             if beyla_flows or req.source != "static":
                 return beyla_flows, beyla_status
@@ -4953,7 +5039,7 @@ async def _fetch_configured_observed_flows(req: ExternalTrafficFlowRequest) -> t
             cluster_hint=req.cluster_id or req.cluster or "",
             default_namespace=req.namespace or "",
         )
-        return flows, [{
+        endpoint_status = {
             "id": source_system,
             "status": "connected",
             "url": url,
@@ -4962,9 +5048,22 @@ async def _fetch_configured_observed_flows(req: ExternalTrafficFlowRequest) -> t
             "provider": cfg.get("provider"),
             "flows": len(flows),
             "verify_ssl": verify_ssl,
-        }]
+        }
+        combined: dict[str, dict] = {}
+        for item in [*beyla_flows, *flows]:
+            source = item.get("source") or {}
+            destination = item.get("destination") or {}
+            key = "|".join([
+                str(item.get("source_system") or ""),
+                str(source.get("id") or source.get("name") or source.get("ip") or ""),
+                str(destination.get("id") or destination.get("name") or destination.get("address") or ""),
+                str(item.get("port") or ""),
+                str(item.get("protocol") or ""),
+            ])
+            combined[key] = item
+        return list(combined.values()), [*beyla_status, endpoint_status]
     except Exception as exc:
-        return [], [{
+        endpoint_status = {
             "id": source_system,
             "status": "failed",
             "url": url,
@@ -4972,7 +5071,8 @@ async def _fetch_configured_observed_flows(req: ExternalTrafficFlowRequest) -> t
             "cni_mode": cfg.get("cni_mode"),
             "provider": cfg.get("provider"),
             "error": f"{type(exc).__name__}: {exc}",
-        }]
+        }
+        return beyla_flows, [*beyla_status, endpoint_status]
 
 
 async def external_traffic_flows(req: ExternalTrafficFlowRequest):
@@ -5696,7 +5796,13 @@ def _ops_plan_from_finding(finding: dict) -> dict:
             }]}}}},
             "检测到启动慢/探针失败证据；增加 startupProbe 容错窗口，避免容器在真正启动前被反复杀死。",
         ))
-    elif category == "storage_config" and any(term in evidence_text for term in ["permission denied", "operation not permitted", "read-only file system"]) and workload_name and patchable_workload:
+    elif category in {"storage_config", "crashloop"} and any(term in evidence_text for term in [
+        "permission denied", "operation not permitted", "read-only file system",
+        "unable to open database file", "can't open database file", "cannot open database file",
+        "attempt to write a readonly database", "database is read-only",
+        "failed to create lock file", "failed to open pid file", "failed to create wal",
+        "data directory is not writable",
+    ]) and workload_name and patchable_workload:
         strategy_class = "dynamic_skill_required"
         # 权限故障不能被固定 fsGroup 模板抢答。先完成实时深取证，再由 AI 结合
         # 匹配 Skill 生成实际 YAML/命令和重新发布方案。
@@ -5761,7 +5867,16 @@ def _ops_plan_from_finding(finding: dict) -> dict:
         {"root_cause": finding.get("summary", ""), "signals": evidence.get("events", [])},
         engine_context,
     )
-    if engine_plan.get("changes") and not (category == "storage_config" and any(term in evidence_text for term in ["permission denied", "operation not permitted", "read-only file system"])):
+    if engine_plan.get("changes") and not (
+        category in {"storage_config", "crashloop"}
+        and any(term in evidence_text for term in [
+            "permission denied", "operation not permitted", "read-only file system",
+            "unable to open database file", "can't open database file", "cannot open database file",
+            "attempt to write a readonly database", "database is read-only",
+            "failed to create lock file", "failed to open pid file", "failed to create wal",
+            "data directory is not writable",
+        ])
+    ):
         changes = engine_plan["changes"]
         strategy_class = engine_plan.get("runbook_id") or strategy_class
     engine_steps = engine_plan.get("steps") or []
@@ -8099,7 +8214,18 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
         "restart_count_stable": (current_restarts <= max(1, baseline_restarts), f"restart_count={current_restarts}, baseline={baseline_restarts}"),
         "events_no_new_backoff": (not any(term in text for term in ("backoff", "back-off restarting", "failedmount", "errimagepull")), "新 Pod Events 无 BackOff/FailedMount/ImagePull"),
         "mount_events_absent": (not any(term in text for term in ("failedmount", "failedattachvolume", "mountvolume")), "新 Pod 无挂载失败事件"),
-        "write_errors_absent": (not any(term in text for term in ("permission denied", "operation not permitted", "read-only file system", "mkdir:")), "新 Pod 日志无目录写入错误"),
+        "write_errors_absent": (
+            not any(term in text for term in (
+                "permission denied", "operation not permitted", "read-only file system", "mkdir:",
+                "unable to open database file", "can't open database file", "cannot open database file",
+                "attempt to write a readonly database", "attempt to write a read-only database",
+                "database is read-only", "database is readonly",
+                "failed to create lock file", "unable to create lock file",
+                "failed to open pid file", "failed to create wal",
+                "failed to create temporary file", "data directory is not writable",
+            )),
+            "新 Pod 日志无直接或应用层包装的路径写入错误",
+        ),
         "oom_absent": ("oomkilled" not in text and "out of memory" not in text, "新 Pod 无 OOM 证据"),
         "probe_failures_absent": ("probe failed" not in text and "unhealthy" not in text, "新 Pod 无探针失败证据"),
         "image_pulled": (not any(term in text for term in ("imagepullbackoff", "errimagepull", "pull access denied")), "新 Pod 无镜像拉取失败"),
@@ -8701,10 +8827,8 @@ def _storage_permission_text(plan: dict, summary_text: str = "") -> str:
 
 
 def _storage_permission_detected(plan: dict, summary_text: str = "") -> bool:
-    text = _storage_permission_text(plan, summary_text)
-    storage_terms = ["存储", "存储卷", "卷", "volume", "mount", "failedmount", "mountvolume", "pvc", "persistentvolumeclaim"]
-    permission_terms = ["目录权限", "权限不足", "permission denied", "operation not permitted", "read-only file system", "can't create directory", "cannot create directory", "mkdir:"]
-    return any(term in text for term in storage_terms) and any(term in text for term in permission_terms)
+    hypothesis = classify_volume_write_failure(plan, summary_text)
+    return bool(hypothesis.get("detected") and float(hypothesis.get("confidence") or 0) >= 0.55)
 
 
 def _storage_admin_boundary_detected(plan: dict) -> bool:
@@ -8745,6 +8869,13 @@ def _permission_failure_container(plan: dict) -> tuple[dict, str, str]:
     permission_terms = (
         "permission denied", "operation not permitted", "read-only file system",
         "can't create directory", "cannot create directory", "mkdir:",
+        "unable to open database file", "can't open database file",
+        "cannot open database file", "could not open database file",
+        "attempt to write a readonly database", "attempt to write a read-only database",
+        "database is read-only", "database is readonly",
+        "failed to create lock file", "unable to create lock file",
+        "failed to open pid file", "failed to create wal",
+        "failed to create temporary file", "data directory is not writable",
     )
     failing_name = ""
     for name, content in logs.items():
@@ -8761,7 +8892,8 @@ def _permission_failure_container(plan: dict) -> tuple[dict, str, str]:
     failing_name = str(container.get("name") or failing_name or "")
     text = json.dumps(logs.get(failing_name) or logs, ensure_ascii=False, default=str)
     path_match = re.search(
-        r"(?:mkdir(?:\s+-p)?|create\s+directory|open)\s*(?::|for)?\s*[\"']?(/[^\s\"']+)",
+        r"(?:mkdir(?:\s+-p)?|create\s+(?:a\s+)?directory|open(?:ing)?|database(?:\s+file)?)"
+        r"\s*(?::|for|at)?\s*[\"']?(/[^\s\"',;]+)",
         text,
         flags=re.I,
     )
@@ -9157,10 +9289,158 @@ def _permission_hardening_plan(plan: dict) -> dict | None:
     }
 
 
+def _volume_permission_skill_handler(plan: dict, signal: dict) -> dict | None:
+    """Executable handler owned by ``skill-volume-permission-recovery``."""
+    plan["evidence"] = {
+        **(plan.get("evidence") or {}),
+        **((signal.get("evidence") or {}) if isinstance(signal, dict) else {}),
+    }
+    hypothesis = classify_volume_write_failure(
+        plan,
+        str((signal or {}).get("question") or plan.get("summary") or ""),
+    )
+    if not hypothesis.get("detected"):
+        return None
+    plan["write_path_root_cause"] = hypothesis
+    if float(hypothesis.get("confidence") or 0) < 0.62:
+        namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
+        return {
+            "id": f"permission-evidence-{uuid.uuid4().hex[:8]}",
+            "title": "写路径权限假设：补齐挂载关联证据",
+            "namespace": namespace,
+            "target": f"{workload_type}/{workload_name}",
+            "summary": (
+                "日志出现数据库/锁/WAL/临时文件无法打开或创建，但当前 YAML 尚未证明错误路径位于挂载卷；"
+                "先关联 volumeMount、securityContext 和应用数据路径，不能直接提升为 root。"
+            ),
+            "steps": [
+                {"id": "current_logs", "title": "定位应用包装后的底层写错误", "description": "同时读取 current/previous logs、异常栈和退出状态，保留原始错误而不是只看 CrashLoop。", "status": "pending"},
+                {"id": "workload_spec", "title": "关联应用路径与 volumeMount", "description": "从 Pod/Workload YAML 的 args、env、volumeMount 和 PVC 链确认数据库、lock、WAL、PID 或临时文件的真实父目录。", "status": "pending"},
+                {"id": "pod_security_context", "title": "核对运行身份和目录可写性", "description": "比较容器 UID/GID、Pod fsGroup/supplementalGroups、readOnlyRootFilesystem 和挂载 readOnly；证据闭合后再进入最小权限修复阶段。", "status": "pending"},
+            ],
+            "changes": [],
+            "source": "executable_volume_permission_skill",
+            "write_path_root_cause": hypothesis,
+            "evidence_gap": "缺少错误路径与挂载卷/运行身份的关联证据。",
+            "success_criteria": ["pod_ready", "restart_count_stable", "write_errors_absent"],
+        }
+    generated = _permission_recovery_followup(plan)
+    generated["source"] = "executable_volume_permission_skill"
+    generated["write_path_root_cause"] = hypothesis
+    return generated
+
+
+def _pvc_pv_skill_handler(plan: dict, signal: dict) -> dict | None:
+    """Executable handler owned by ``skill-storage-pvc-pv``."""
+    evidence = {
+        **(plan.get("evidence") or {}),
+        **((signal.get("evidence") or {}) if isinstance(signal, dict) else {}),
+        **(plan.get("_runtime_evidence") or {}),
+    }
+    namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
+    pod = evidence.get("pod") or {}
+    engine_plan = build_remediation_plan(
+        {
+            "alert_name": "pvc_pv_binding",
+            "summary": str((signal or {}).get("question") or plan.get("summary") or ""),
+            "namespace": namespace,
+            "workload_type": workload_type,
+            "workload_name": workload_name,
+            "pod": evidence.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan),
+        },
+        {
+            "root_cause": str(
+                ((signal or {}).get("diagnosis") or {}).get("root_cause")
+                or plan.get("summary")
+                or ""
+            ),
+            "signals": evidence.get("events") or [],
+        },
+        {
+            **evidence,
+            "pod": pod,
+            "pods": [pod] if pod else [],
+            "events": {"events": evidence.get("events") or []},
+        },
+    )
+    if str(engine_plan.get("runbook_id") or "") != "storage_mount":
+        return None
+    return {
+        "id": f"pvc-pv-binding-{uuid.uuid4().hex[:8]}",
+        "title": "PVC/PV 绑定恢复",
+        "namespace": namespace,
+        "target": f"{workload_type}/{workload_name}",
+        "pod_name": evidence.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan),
+        "summary": engine_plan.get("reason") or "已沿 Pod → PVC → PV → StorageClass/CSI 定位绑定故障。",
+        "steps": engine_plan.get("steps") or [],
+        "changes": engine_plan.get("changes") or [],
+        "source": "executable_pvc_pv_skill",
+        "storage_recovery_stage": (
+            "create_missing_pvc"
+            if any(change.get("type") == "create_pvc" for change in engine_plan.get("changes") or [])
+            else "create_approved_static_pv"
+            if any(change.get("type") == "create_pv" for change in engine_plan.get("changes") or [])
+            else "diagnose_dynamic_provisioner_or_template"
+        ),
+        "evidence_gap": engine_plan.get("evidence_gap") or "",
+        "root_cause_hypotheses": engine_plan.get("hypotheses") or [],
+        "success_criteria": engine_plan.get("success_criteria") or ["pvc_bound", "mount_events_absent", "pod_ready"],
+        "requires_confirmation": bool(engine_plan.get("changes")),
+        "requires_high_risk_confirmation": bool(engine_plan.get("changes")),
+        "verification_plan": _next_attempt_verification_plan(f"{workload_type}/{workload_name}"),
+    }
+
+
+def _materialize_executable_skill(plan: dict, signal: dict, skill_id: str) -> dict | None:
+    runtime_plan = OPS_SKILL_RUNTIME.materialize(
+        skill_id,
+        plan,
+        signal,
+        {
+            "volume-write-permission-recovery": _volume_permission_skill_handler,
+            "pvc-pv-binding-recovery": _pvc_pv_skill_handler,
+        },
+    )
+    if not runtime_plan:
+        return None
+    # Preserve the same incident binding and continuation state regardless of
+    # whether the caller is SRE chat, inspection preview or an OpsJob replan.
+    runtime_strategy_source = runtime_plan.get("source") or "executable_skill"
+    runtime_plan = {
+        **copy.deepcopy(plan),
+        **runtime_plan,
+        "cluster": runtime_plan.get("cluster") or plan.get("cluster"),
+        "cluster_id": runtime_plan.get("cluster_id") or plan.get("cluster_id"),
+        "namespace": runtime_plan.get("namespace") or plan.get("namespace"),
+        "source": plan.get("source") or runtime_strategy_source,
+        "strategy_source": runtime_strategy_source,
+        "source_surface": plan.get("source_surface") or plan.get("source") or "",
+        "evidence": {
+            **(plan.get("evidence") or {}),
+            **((signal.get("evidence") or {}) if isinstance(signal, dict) else {}),
+        },
+        "_runtime_evidence": plan.get("_runtime_evidence") or {},
+        "_last_failure": plan.get("_last_failure") or {},
+        "_prior_attempts": plan.get("_prior_attempts") or [],
+        "_attempted_actions": plan.get("_attempted_actions") or [],
+        "_attempted_change_fingerprints": plan.get("_attempted_change_fingerprints") or [],
+    }
+    return runtime_plan
+
+
 def _derive_followup_plans(plan: dict, summary_text: str) -> list[dict]:
     if not _storage_permission_detected(plan, summary_text):
         return []
-    return [_permission_recovery_followup(plan)]
+    generated = _materialize_executable_skill(
+        plan,
+        _skill_signal_payload(
+            question=summary_text,
+            evidence=plan.get("_runtime_evidence") or plan.get("evidence") or {},
+            plan=plan,
+        ),
+        VOLUME_PERMISSION_SKILL_ID,
+    )
+    return [generated] if generated else []
 
 
 def _normalize_planner_change(raw: dict, plan: dict) -> tuple[dict | None, str]:
@@ -9360,14 +9640,46 @@ async def _evidence_based_replan(
         str(engine_plan.get("runbook_id") or "") == "storage_permission"
         and _storage_permission_detected(plan, engine_plan.get("reason") or "")
     ):
-        progressive = _permission_recovery_followup(plan)
+        progressive = _materialize_executable_skill(
+            plan,
+            _skill_signal_payload(
+                question=str(plan.get("summary") or engine_plan.get("reason") or ""),
+                alert=alert,
+                diagnosis=diagnosis,
+                evidence=deep,
+                plan=plan,
+            ),
+            VOLUME_PERMISSION_SKILL_ID,
+        )
+        if not progressive:
+            return []
         plan["_runtime_replan"]["planning"] = {
-            "source": "ProgressivePermissionRecovery/v1",
+            "source": "UnifiedExecutableOpsSkillRuntime/v1",
             "accepted_changes": len(progressive.get("changes") or []),
             "stage": progressive.get("permission_recovery_stage") or "administrator_boundary",
             "rejected_candidates": [],
         }
         return [progressive]
+    if str(engine_plan.get("runbook_id") or "") == "storage_mount":
+        storage_plan = _materialize_executable_skill(
+            plan,
+            _skill_signal_payload(
+                question=str(plan.get("summary") or engine_plan.get("reason") or ""),
+                alert=alert,
+                diagnosis=diagnosis,
+                evidence=deep,
+                plan=plan,
+            ),
+            PVC_PV_SKILL_ID,
+        )
+        if storage_plan:
+            plan["_runtime_replan"]["planning"] = {
+                "source": "UnifiedExecutableOpsSkillRuntime/v1",
+                "accepted_changes": len(storage_plan.get("changes") or []),
+                "stage": storage_plan.get("storage_recovery_stage") or "storage_diagnosis",
+                "rejected_candidates": [],
+            }
+            return [storage_plan]
     candidates = list(engine_plan.get("changes") or [])
     planner_meta: dict = {"source": "EvidenceRunbookEngine", "hypotheses": engine_plan.get("hypotheses", [])}
 
@@ -9390,7 +9702,9 @@ async def _evidence_based_replan(
                 plan=plan,
             ), top_k=3)
             prompt = (
-                "你是 Kubernetes 故障修复规划器。根据真实执行证据和动态匹配 Skill，从给定动作目录中只选择一个结构化动作。"
+                "你是 Kubernetes 故障修复规划器，当前模型可能是 deepseek-v4-flash。先从日志、Pod 状态 YAML、Events、"
+                "volumeMount/PVC/PV 和 securityContext 生成多个候选根因及置信度，再根据最高证据一致性动态匹配 Skill，"
+                "最后从给定动作目录中只选择一个结构化动作。"
                 "证据不足时 changes=[]。高风险动作可以提出但必须标 risk=high，所有动作都必须人工审批。"
                 "上一轮方案已经执行且恢复验证失败；不得只改写理由后重复相同动作、目标和参数。只有参数发生实质变化且新证据明确支持时，"
                 "才允许继续使用同一动作类型，否则必须换根因假设、换动作，或明确进入管理员人工处理。"
@@ -9401,8 +9715,12 @@ async def _evidence_based_replan(
                 "如果已命中模板级阻断，禁止用重启掩盖根因。"
                 "对于 Permission denied/目录不可写，不得预设 fsGroup、initContainer 或重启就是答案；必须比较失败路径、镜像用户、"
                 "Pod/容器 securityContext、挂载、PVC/PV、最近配置与匹配 Skill，再给出实际 YAML Patch、重新发布方式或受审批命令。"
+                "不要只识别 permission denied 字面量。unable/can't open database file、readonly database、lock/WAL/PID/temp file "
+                "创建或打开失败都可能是写路径权限、错误路径/挂载、磁盘满或数据库损坏；必须列出支持与反证，并用 YAML/Events 关联后再选 Skill。"
                 "只有匹配 Skill 允许时才可提出 run_shell/exec_pod/exec_node，并必须给 command、明确目标、timeout_seconds、reason、rollback。"
-                "{root_cause,confidence,selected_runbook,reason,changes:[{type,namespace,workload_type,workload_name,pod_name,"
+                "通常只执行最高匹配的一个 Skill；只有两个根因跨域且后一个明确依赖前一个结果时，才串行给 secondary_skill_ids，不能并行乱用多个。"
+                "只返回 {root_cause,candidate_root_causes:[{id,hypothesis,confidence,supporting_evidence,contradicting_evidence,"
+                "required_next_evidence}],selected_skill_id,secondary_skill_ids,confidence,selected_runbook,reason,changes:[{type,namespace,workload_type,workload_name,pod_name,"
                 "container_name,hpa_name,pvc_name,storage,node_name,service_account,configmap_name,api_version,kind,name,replicas,manifest,patch,command,timeout_seconds,reason,rollback}]}。\n"
                 f"动作目录={json.dumps(action_catalog_payload(), ensure_ascii=False)}\n"
                 f"动态匹配 Skills={json.dumps(_redact_sensitive(matched_skill_context), ensure_ascii=False)[:12000]}\n"
@@ -10021,6 +10339,12 @@ async def _execute_ops_plan_once(
         evidence_summary=evidence_summary,
         level="warning" if deep_evidence.get("error") else "success",
     )
+    submitted_change_fingerprints = {
+        _change_item_fingerprint(change)
+        for change in (plan.get("changes") or [])
+        if isinstance(change, dict)
+    }
+    runtime_skill_replacement: dict | None = None
     if not deep_evidence.get("error"):
         changes_before_skill_route = len(plan.get("changes") or [])
         _attach_operator_skills_to_plan(
@@ -10061,6 +10385,16 @@ async def _execute_ops_plan_once(
             rejected_change_count=max(0, changes_before_skill_route - len(plan.get("changes") or [])),
             level="success" if selected_skills else "warning",
         )
+        routed_change_fingerprints = {
+            _change_item_fingerprint(change)
+            for change in (plan.get("changes") or [])
+            if isinstance(change, dict)
+        }
+        if routed_change_fingerprints != submitted_change_fingerprints and plan.get("skill_handler_invoked"):
+            # A Skill-generated YAML/command is a new approval object. Even if
+            # the task-level gate was already confirmed, never execute a
+            # materially changed runtime proposal under the stale receipt.
+            runtime_skill_replacement = copy.deepcopy(plan)
     elif plan.get("changes"):
         # A stale Skill match or task-level confirmation cannot authorize a
         # mutation when fresh evidence collection failed. Preserve the proposal
@@ -10081,7 +10415,20 @@ async def _execute_ops_plan_once(
         )
     preflight_replans: list[dict] = []
     preflight_conflict = False
-    if plan.get("changes") and not deep_evidence.get("error"):
+    if runtime_skill_replacement is not None:
+        preflight_replans = [runtime_skill_replacement]
+        preflight_conflict = True
+        plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
+            "实时证据触发了可执行 Skill，并生成了与提交时不同的变更；"
+            "旧审批不能复用，必须重新展示完整差异并逐项确认。"
+        )
+        await emit(
+            "strategy_switch",
+            "可执行 Skill 已根据实时证据生成新方案；旧审批已作废，等待操作员重新核对。",
+            alternative_plan_count=1,
+            level="warning",
+        )
+    elif plan.get("changes") and not deep_evidence.get("error"):
         await emit("replanning", "用实时证据复核原方案，避免把症状当成根因")
         preflight_attempted = {str(change.get("type") or "") for change in plan.get("changes") or []}
         preflight_attempted.update(str(action) for action in (plan.get("_attempted_actions") or []) if action)
@@ -10747,12 +11094,16 @@ def _public_skill_match(match: dict) -> dict:
         "why": match.get("why"),
         "allowed_actions": skill.get("allowed_actions") or [],
         "evidence_required": skill.get("evidence_required") or [],
+        "evidence_any_of": skill.get("evidence_any_of") or [],
         "success_criteria": skill.get("success_criteria") or [],
         "script_policy": skill.get("script_policy") or {"enabled": False},
         "version": skill.get("version"),
         "format": skill.get("format"),
         "portable": skill.get("portable", False),
         "execution_ready": skill.get("execution_ready", False),
+        "execution_model": skill.get("execution_model") or "host_action_mapping",
+        "runtime_handler": skill.get("runtime_handler") or "",
+        "continuation_capable": bool(skill.get("continuation_capable")),
         "execution_authorized": bool(match.get("_execution_authorized")),
         "evidence_collected": match.get("_evidence_collected") or [],
         "evidence_missing": match.get("_evidence_missing") or [],
@@ -10905,6 +11256,32 @@ def _collected_skill_evidence(signal: dict) -> set[str]:
     return collected
 
 
+def _skill_incident_id(plan: dict) -> str:
+    incident_id = str(
+        plan.get("_skill_incident_id")
+        or plan.get("_lineage_id")
+        or plan.get("finding_id")
+        or ""
+    ).strip()
+    if not incident_id:
+        incident_id = f"skill-incident-{uuid.uuid4().hex}"
+    plan["_skill_incident_id"] = incident_id
+    return incident_id
+
+
+def _record_skill_route_once(plan: dict, skill_id: str, event: str, *, stage: str = "") -> dict:
+    """Deduplicate internal rerenders/replans from operator-facing usage counts."""
+    incident_id = _skill_incident_id(plan)
+    scope = f"{incident_id}:{skill_id}"
+    if stage:
+        scope = f"{scope}:{stage}"
+    return OPS_SKILL_REGISTRY.record_usage(
+        skill_id,
+        event,
+        idempotency_key=scope,
+    )
+
+
 def _attach_operator_skills_to_plan(
     plan: dict,
     signal: dict,
@@ -10924,7 +11301,12 @@ def _attach_operator_skills_to_plan(
     matches = [
         item for item in result.get("matches") or []
         if float(item.get("confidence") or 0) > 0
-        and str((item.get("skill") or {}).get("id") or "") not in attempted_skill_ids
+        and (
+            str((item.get("skill") or {}).get("id") or "") not in attempted_skill_ids
+            or OPS_SKILL_RUNTIME.continuation_capable(
+                str((item.get("skill") or {}).get("id") or "")
+            )
+        )
     ]
     preferred_skill_ids = [str(item) for item in preferred_skill_ids or [] if str(item)]
     if preferred_skill_ids:
@@ -10953,7 +11335,7 @@ def _attach_operator_skills_to_plan(
         match["rank"] = index
         skill_id = str((match.get("skill") or {}).get("id") or "")
         if skill_id:
-            OPS_SKILL_REGISTRY.record_usage(skill_id, "matched")
+            _record_skill_route_once(plan, skill_id, "matched")
     if not matches:
         plan.setdefault("operator_skills", [])
         if plan.get("changes") and _env_bool("SKILL_EXECUTION_REQUIRED", "true"):
@@ -10967,9 +11349,25 @@ def _attach_operator_skills_to_plan(
         skill = match.get("skill") or {}
         required = [str(item).strip() for item in (skill.get("evidence_required") or []) if str(item).strip()]
         missing = [item for item in required if item not in collected_evidence]
+        any_of_groups = [
+            [str(item).strip() for item in group if str(item).strip()]
+            for group in (skill.get("evidence_any_of") or [])
+            if isinstance(group, (list, tuple))
+        ]
+        missing_any_of = [
+            group for group in any_of_groups
+            if group and not any(item in collected_evidence for item in group)
+        ]
         match["_evidence_collected"] = [item for item in required if item in collected_evidence]
-        match["_evidence_missing"] = missing
-        match["_execution_authorized"] = bool(skill.get("execution_ready")) and not missing
+        match["_evidence_missing"] = [
+            *missing,
+            *(f"任一即可({', '.join(group)})" for group in missing_any_of),
+        ]
+        match["_execution_authorized"] = (
+            bool(skill.get("execution_ready"))
+            and not missing
+            and not missing_any_of
+        )
     active_match = matches[0]
     active_skill = active_match.get("skill") or {}
     active_skill_id = str(active_skill.get("id") or "")
@@ -10980,7 +11378,7 @@ def _attach_operator_skills_to_plan(
     plan["skill_execution_mode"] = "adaptive_serial"
     plan["skill_execution_threshold"] = float(result.get("execution_threshold") or 0.70)
     if active_skill_id:
-        OPS_SKILL_REGISTRY.record_usage(active_skill_id, "selected")
+        _record_skill_route_once(plan, active_skill_id, "selected")
     plan["skill_evidence"] = {
         "collected": sorted(collected_evidence),
         "missing_by_skill": {
@@ -11012,6 +11410,28 @@ def _attach_operator_skills_to_plan(
             f"最高匹配 Skill 置信度 {active_confidence:.0%} 低于 70%；"
             "本轮只执行该 Skill 的只读诊断步骤，取得新证据后重新排序。"
         )
+    if execution_matches and OPS_SKILL_RUNTIME.is_executable(active_skill_id):
+        runtime_plan = _materialize_executable_skill(plan, signal, active_skill_id)
+        if runtime_plan:
+            plan.clear()
+            plan.update(runtime_plan)
+            plan["operator_skills"] = [_public_skill_match(item) for item in matches]
+            plan["skill_candidates"] = copy.deepcopy(plan["operator_skills"])
+            plan["selected_skill_id"] = active_skill_id
+            plan["skill_execution_mode"] = "executable_skill_serial"
+            plan["decision"] = "ready_for_approval" if plan.get("changes") else "executable_skill_evidence_required"
+            plan["skill_handler_invoked"] = True
+            plan["skill_handler_stage"] = (
+                plan.get("permission_recovery_stage")
+                or plan.get("storage_recovery_stage")
+                or "evidence_collection"
+            )
+            stage_receipt = str(
+                plan.get("permission_recovery_stage")
+                or plan.get("storage_recovery_stage")
+                or _change_fingerprint(plan)
+            )
+            _record_skill_route_once(plan, active_skill_id, "planned", stage=stage_receipt)
     actions = sorted({
         action
         for match in execution_matches
@@ -11023,13 +11443,19 @@ def _attach_operator_skills_to_plan(
         owners = [active_skill_id]
         for change in plan.get("changes") or []:
             change["skill_supported"] = str(change.get("type") or "") in actions
-            change["selection_source"] = "matched_skill" if change["skill_supported"] else "evidence_engine_fallback"
+            change["selection_source"] = change.get("selection_source") or (
+                "matched_skill" if change["skill_supported"] else "evidence_engine_fallback"
+            )
             if change["skill_supported"]:
                 change["skill_id"] = active_skill_id or (owners[0] if owners else "")
         supported_changes = [change for change in plan.get("changes") or [] if change.get("skill_supported")]
         if supported_changes:
             plan["changes"] = supported_changes
-            plan["change_source"] = "dynamic_skill"
+            plan["change_source"] = (
+                "executable_skill"
+                if plan.get("skill_handler_invoked") or plan.get("skill_runtime")
+                else "dynamic_skill"
+            )
             plan["selected_skill_id"] = supported_changes[0].get("skill_id")
             plan["decision"] = "ready_for_approval"
         elif plan.get("changes") and _env_bool("SKILL_EXECUTION_REQUIRED", "true"):
@@ -11083,7 +11509,11 @@ def _attach_operator_skills_to_plan(
         plan["skill_script_candidates"] = script_candidates
     if routing:
         plan["skill_routing"] = _redact_sensitive(routing)
-    plan["planning_engine"] = "DynamicSREPlanner/v5 + AdaptiveSerialSkillRouter/v1 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
+    plan["planning_engine"] = (
+        plan.get("planning_engine")
+        if plan.get("skill_handler_invoked")
+        else "DynamicSREPlanner/v5 + AdaptiveSerialSkillRouter/v1 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
+    )
     plan["skill_match_policy"] = (
         "候选 Skill 按 40/20/20/10/10 加权排序；同一时刻只允许最高分 Skill 执行，"
         "低于 70% 先只读取证后重排，失败后排除已失败 Skill 并基于新证据选择下一项。"
@@ -11136,6 +11566,7 @@ def _attach_operator_skills_to_chat(req: ChatRequest, data: dict) -> dict:
     )
     plan = diagnosis.get("remediation_plan")
     if isinstance(plan, dict):
+        plan["source_surface"] = "sre_chat"
         context_pod = live_evidence.get("pod") if isinstance(live_evidence.get("pod"), dict) else {}
         context_workload = context_pod.get("workload") if isinstance(context_pod.get("workload"), dict) else {}
         context_workload_name = str(context_pod.get("workload_name") or context_workload.get("name") or "")
@@ -11165,7 +11596,24 @@ def _attach_operator_skills_to_chat(req: ChatRequest, data: dict) -> dict:
             **(plan.get("evidence") or {}),
             **live_evidence,
         }
-        diagnosis["remediation_plan"] = _attach_operator_skills_to_plan(plan, signal)
+        llm_skill_routing = diagnosis.get("skill_routing") if isinstance(diagnosis.get("skill_routing"), dict) else {}
+        preferred_skill_ids = [
+            str(llm_skill_routing.get("primary_skill_id") or ""),
+            *[str(item) for item in (llm_skill_routing.get("secondary_skill_ids") or [])],
+        ]
+        preferred_skill_ids = [item for item in preferred_skill_ids if item]
+        diagnosis["remediation_plan"] = _attach_operator_skills_to_plan(
+            plan,
+            signal,
+            preferred_skill_ids=preferred_skill_ids or None,
+            routing={
+                "engine": "DeepSeekRootCauseSkillRouter/v1",
+                "source": "llm_root_cause_candidates+semantic_match",
+                "selected_skill_ids": preferred_skill_ids,
+                "rationale": llm_skill_routing.get("rationale") or "",
+                "root_cause_candidates": diagnosis.get("root_cause_candidates") or [],
+            } if llm_skill_routing or diagnosis.get("root_cause_candidates") else None,
+        )
         diagnosis["operator_skills"] = diagnosis["remediation_plan"].get("operator_skills", [])
     return data
 
@@ -11322,6 +11770,7 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
             "router_error": router_error or None,
         }
         plan = finding.get("ops_plan") or _ops_plan_from_finding(finding)
+        plan["source_surface"] = "ai_inspection"
         plan = _attach_operator_skills_to_plan(
             plan,
             _inspection_skill_signal(finding),
@@ -11705,7 +12154,8 @@ async def ops_capabilities():
     skills = OPS_SKILL_REGISTRY.list()
     return {
         "status": "ok",
-        "planner": "EvidenceRunbookEngine/v1 + InfrastructureSREPlanner/v1 + constrained LLM replanner",
+        "planner": "DeepSeekRootCauseSkillRouter/v1 + UnifiedExecutableOpsSkillRuntime/v1 + ApprovalGate + RecoveryVerifier",
+        "executable_skill_handlers": public_runtime_catalog(),
         "actions": action_catalog_payload(),
         "skill_options": skill_option_catalog(),
         "approved_scripts": approved_script_catalog(),
@@ -11881,6 +12331,8 @@ async def _wait_for_continuous_recheck(
 
 async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel_event: asyncio.Event):
     current = _apply_ops_continuation_context(copy.deepcopy(initial_plan))
+    current["_lineage_id"] = current.get("_lineage_id") or job_id
+    current["_skill_incident_id"] = current.get("_skill_incident_id") or current["_lineage_id"]
     attempted: set[str] = {
         str(value) for value in (current.get("_attempted_strategy_fingerprints") or []) if value
     }
@@ -12058,6 +12510,12 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
             await _update_ops_job(job_id, history=history, result=result)
             active_skill_id = str(current.get("selected_skill_id") or "")
             skill_was_executed = bool(result.get("results"))
+            if active_skill_id and skill_was_executed:
+                OPS_SKILL_REGISTRY.record_incident(
+                    active_skill_id,
+                    str(current.get("_skill_incident_id") or job_id),
+                    "handled",
+                )
             if (
                 active_skill_id
                 and skill_was_executed
@@ -12066,11 +12524,12 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                     and (result.get("verification") or {}).get("recovered") is True
                 )
             ):
-                OPS_SKILL_REGISTRY.record_usage(active_skill_id, "failed")
-                current["_attempted_skill_ids"] = sorted({
-                    *{str(item) for item in (current.get("_attempted_skill_ids") or []) if str(item)},
-                    active_skill_id,
-                })
+                if not OPS_SKILL_RUNTIME.continuation_capable(active_skill_id):
+                    OPS_SKILL_REGISTRY.record_usage(active_skill_id, "failed")
+                    current["_attempted_skill_ids"] = sorted({
+                        *{str(item) for item in (current.get("_attempted_skill_ids") or []) if str(item)},
+                        active_skill_id,
+                    })
             if result.get("status") == "cancelled" or cancel_event.is_set():
                 result = _ensure_effectiveness_record(current, result)
                 await _update_ops_job(job_id, result=result)
@@ -12211,6 +12670,20 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                         OPS_SKILL_REGISTRY.record_usage(active_skill_id, "failed")
                     else:
                         OPS_SKILL_REGISTRY.record_usage(active_skill_id, "succeeded")
+                resolved_skill_ids = {
+                    str(item.get("skill_id") or "")
+                    for item in history
+                    if isinstance(item, dict) and item.get("skill_id")
+                    and bool(((item.get("result") or {}).get("results") or []))
+                }
+                if active_skill_id and skill_was_executed:
+                    resolved_skill_ids.add(active_skill_id)
+                for resolved_skill_id in resolved_skill_ids:
+                    OPS_SKILL_REGISTRY.record_incident(
+                        resolved_skill_id,
+                        str(current.get("_skill_incident_id") or job_id),
+                        "resolved",
+                    )
                 await _append_ops_job_event(job_id, "summarizing", "生成恢复结论和验证证据", status="running")
                 result["ai_summary"] = await _llm_ops_summary(current, result.get("steps") or [], result.get("results") or [])
                 result = _ensure_effectiveness_record(current, result)
@@ -12869,6 +13342,7 @@ async def preview_ai_inspection_finding(req: InspectionPreviewRequest):
 
     finding = copy.deepcopy(finding)
     base_plan = _ops_plan_from_finding(finding)
+    base_plan["source_surface"] = "ai_inspection"
     base_plan["model_profile_id"] = req.model_profile_id or finding.get("model_profile_id") or ""
     evidence_timeout = max(10, int(os.getenv("OPS_EVIDENCE_TIMEOUT_SECONDS", "70")))
     try:

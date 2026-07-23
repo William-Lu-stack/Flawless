@@ -11,7 +11,7 @@ namespaceOverride: k8s-agent
 
 image:
   repository: m.daocloud.io/ghcr.io/your-org/flawless
-  tag: 3.2.3
+  tag: 3.2.4
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

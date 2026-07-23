@@ -1743,13 +1743,15 @@ function TopologyPage() {
 
   const policy = analysis.data?.policy || {};
   const blast = policy.blast_radius || {};
+  const ebpfStatuses = asList(topology.data?.diagnostics?.ebpf_flow_status);
+  const beylaStatus = ebpfStatuses.find((item: any) => item?.id === "ebpf_beyla") || ebpfStatuses[0];
   return (
     <section className="topology-modern">
       <Panel className="topology-map">
         <PanelTitle
           icon={GitBranch}
           title={view === "2d" ? "有向依赖拓扑" : "3D 集群世界"}
-          subtitle="节点与边严格来自同一份 CMDB 数据"
+          subtitle="合并 CMDB、Kubernetes 与 eBPF/Beyla 真实流量；每条观测边保留数据源"
           action={<button className="ghost" onClick={refreshTopology}><RefreshCcw size={15} />刷新</button>}
         />
         <div className="topology-tools">
@@ -1801,7 +1803,18 @@ function TopologyPage() {
           <Metric title="拓扑节点" value={visibleGraph.nodes.length} />
           <Metric title="关系边" value={visibleGraph.edges.length} />
           <Metric title="CMDB 状态" value={topology.data?.status || "unknown"} />
+          <Metric title="eBPF 流边" value={topology.data?.summary?.ebpf_observed_edges || 0} />
         </div>
+        {beylaStatus && (
+          <div className={cx("analysis-card", beylaStatus.status === "connected" ? "success" : "warning")}>
+            <span>eBPF/Beyla 接入 · {beylaStatus.status || "unknown"}</span>
+            <strong>{beylaStatus.flows || 0} 条有效流 / {beylaStatus.lines || 0} 条 flow 日志</strong>
+            <p>
+              {beylaStatus.hint || beylaStatus.error || `Loki 查询：${beylaStatus.effective_query || beylaStatus.configured_query || "-"}`}
+            </p>
+            {beylaStatus.query_fallback_used && <small>配置的 Loki labels 未命中；当前通过备用查询发现数据，请按 effective_query 更新 ConfigMap。</small>}
+          </div>
+        )}
         {selected && (
           <div className="analysis-card selected-node">
             <span>{selected.type || "node"} · {selected.cluster}</span>

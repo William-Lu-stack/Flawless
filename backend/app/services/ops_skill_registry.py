@@ -34,14 +34,21 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "id": "skill-volume-permission-recovery",
         "name": "容器卷权限修复与重新发布",
         "category": "storage",
-        "summary": "根据 mkdir permission denied 的真实日志、运行用户、挂载和 Workload 配置动态选择 YAML Patch 或受审批命令，并重新发布验证。",
-        "symptoms": ["mkdir", "permission denied", "can't create directory", "read-only file system", "CrashLoopBackOff"],
+        "summary": "根据直接权限错误或数据库/锁/WAL/临时文件不可写等间接日志，关联运行用户、挂载和 Workload 配置，逐级执行最小权限 YAML 修复并重新发布验证。",
+        "symptoms": [
+            "mkdir", "permission denied", "can't create directory", "read-only file system",
+            "unable to open database file", "can't open database file",
+            "attempt to write a readonly database", "database is read-only",
+            "failed to create lock file", "failed to open pid file", "failed to create wal",
+            "data directory is not writable", "CrashLoopBackOff",
+        ],
         "applies_to": ["Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "PVC", "PV"],
-        "evidence_required": ["previous_logs", "workload_spec", "pod_security_context", "storage_chain", "recent_changes"],
+        "evidence_required": ["workload_spec", "pod_security_context"],
+        "evidence_any_of": [["current_logs", "previous_logs", "events"]],
         "diagnostic_steps": [
-            "读取失败容器的 current/previous logs，锁定实际 mkdir 路径、运行阶段和退出码。",
-            "读取镜像运行用户、Pod/容器 securityContext、volumeMount、PVC/PV 与后端访问模式，不预设 fsGroup 一定正确。",
-            "让 AI 基于证据生成实际 YAML Patch 或受控命令，展示完整 diff、重新发布方式、回滚和恢复判据。",
+            "读取失败容器的 current/previous logs 和 Pod 状态 YAML，把 database/lock/WAL/PID/temp file 无法打开或创建归一成候选写路径故障。",
+            "将错误路径与 volumeMount、镜像运行用户、Pod/容器 securityContext、PVC/PV 和后端访问模式关联；应用层报错只能形成假设，不能直接证明必须 root。",
+            "依次尝试实际 UID/GID 的非 root 组权限、受限 root initContainer，仍失败才把实际故障容器提升为 root；每阶段单独审批、重新发布和验证。",
         ],
         "allowed_actions": ["patch_workload", "patch_workload_runtime_security", "replace_immutable_workload", "patch_resource", "apply_manifest", "exec_pod", "exec_node"],
         "success_criteria": ["rollout_complete", "pod_ready", "restart_count_stable", "events_no_new_backoff", "write_errors_absent"],
@@ -50,6 +57,9 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "owner": "Flawless",
         "enabled": True,
         "builtin": True,
+        "runtime_handler": "volume-write-permission-recovery",
+        "execution_model": "executable_builtin_skill",
+        "continuation_capable": True,
     },
     {
         "id": "skill-crashloop-root-cause",
@@ -78,7 +88,8 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "summary": "处理 PVC 缺失、Pending、PV 未绑定、挂载失败和目录权限问题。",
         "symptoms": ["FailedMount", "FailedAttachVolume", "persistentvolumeclaim not found", "no persistent volumes available", "read-only file system"],
         "applies_to": ["Pod", "PVC", "PV", "StatefulSet", "Job", "CronJob"],
-        "evidence_required": ["storage_chain", "events", "storage_class", "workload_spec"],
+        "evidence_required": ["storage_chain", "events", "workload_spec"],
+        "evidence_any_of": [["pvc_binding", "storage_class"]],
         "diagnostic_steps": [
             "沿 Pod volume -> PVC -> PV -> StorageClass/CSI 读取真实状态。",
             "区分 PVC 不存在、PVC 未绑定、PV 权限/路径错误和 CSI 组件异常。",
@@ -90,6 +101,9 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "owner": "Flawless",
         "enabled": True,
         "builtin": True,
+        "runtime_handler": "pvc-pv-binding-recovery",
+        "execution_model": "executable_builtin_skill",
+        "continuation_capable": True,
     },
     {
         "id": "skill-config-reference-recovery",
@@ -331,6 +345,7 @@ def _clip(value: Any, limit: int = 2200) -> str:
 SKILL_USAGE_FIELDS = (
     "matched",
     "selected",
+    "planned",
     "approval_requested",
     "executed",
     "succeeded",
@@ -380,11 +395,24 @@ class OpsSkillRegistry:
         value = value or {}
         return {
             **{field: max(0, int(value.get(field) or 0)) for field in SKILL_USAGE_FIELDS},
+            "incidents_handled": max(0, int(value.get("incidents_handled") or 0)),
+            "incidents_resolved": max(0, int(value.get("incidents_resolved") or 0)),
+            "incidents_unresolved": max(0, int(value.get("incidents_unresolved") or 0)),
+            "event_receipts": [
+                str(item) for item in (value.get("event_receipts") or []) if str(item)
+            ][-1000:],
+            "incident_receipts": {
+                str(key): str(outcome)
+                for key, outcome in (value.get("incident_receipts") or {}).items()
+                if str(key) and str(outcome) in {"handled", "resolved", "unresolved"}
+            },
             "last_matched_at": str(value.get("last_matched_at") or ""),
             "last_selected_at": str(value.get("last_selected_at") or ""),
+            "last_planned_at": str(value.get("last_planned_at") or ""),
             "last_executed_at": str(value.get("last_executed_at") or ""),
             "last_succeeded_at": str(value.get("last_succeeded_at") or ""),
             "last_failed_at": str(value.get("last_failed_at") or ""),
+            "last_resolved_at": str(value.get("last_resolved_at") or ""),
         }
 
     def _persist_usage(self) -> None:
@@ -431,8 +459,9 @@ class OpsSkillRegistry:
                         if builtin and record.get("builtin"):
                             policy_fields = {
                                 "name", "description", "category", "summary", "symptoms", "applies_to",
-                                "evidence_required", "diagnostic_steps", "allowed_actions", "success_criteria",
-                                "risk", "rollback", "script_policy", "execution_ready",
+                                "evidence_required", "evidence_any_of", "diagnostic_steps", "allowed_actions",
+                                "success_criteria", "risk", "rollback", "script_policy", "execution_ready",
+                                "runtime_handler", "execution_model", "continuation_capable",
                             }
                             if any(record.get(key) != builtin.get(key) for key in policy_fields if key in builtin):
                                 upgraded_builtin_ids.add(str(record["id"]))
@@ -513,6 +542,11 @@ class OpsSkillRegistry:
             "symptoms": [str(x).strip() for x in (item.get("symptoms") or item.get("triggers") or []) if str(x).strip()],
             "applies_to": [str(x).strip() for x in (item.get("applies_to") or []) if str(x).strip()],
             "evidence_required": [str(x).strip() for x in (item.get("evidence_required") or []) if str(x).strip()],
+            "evidence_any_of": [
+                [str(x).strip() for x in group if str(x).strip()]
+                for group in (item.get("evidence_any_of") or [])
+                if isinstance(group, (list, tuple)) and any(str(x).strip() for x in group)
+            ],
             "diagnostic_steps": [str(x).strip() for x in (item.get("diagnostic_steps") or item.get("steps") or []) if str(x).strip()],
             "allowed_actions": [str(x).strip() for x in (item.get("allowed_actions") or []) if str(x).strip()],
             "success_criteria": [str(x).strip() for x in (item.get("success_criteria") or []) if str(x).strip()],
@@ -529,6 +563,20 @@ class OpsSkillRegistry:
             "format": str(item.get("format") or AGENT_SKILL_SPEC),
             "portable": bool(item.get("portable", True)),
             "execution_ready": bool(item.get("execution_ready", bool(item.get("allowed_actions")))),
+            # Only application-shipped built-ins may own a privileged runtime
+            # handler. Imported/custom packages remain portable policy Skills
+            # and must map to the ordinary host action catalog.
+            "runtime_handler": str(item.get("runtime_handler") or "").strip() if item.get("builtin") else "",
+            "execution_model": (
+                "executable_builtin_skill"
+                if item.get("builtin") and item.get("runtime_handler")
+                else "host_action_mapping"
+            ),
+            "continuation_capable": bool(
+                item.get("continuation_capable")
+                and item.get("builtin")
+                and item.get("runtime_handler")
+            ),
             "package_path": str(item.get("package_path") or self.root / skill_id),
             "package_files": int(item.get("package_files") or 0),
             "bundled_scripts": [str(x) for x in item.get("bundled_scripts") or []],
@@ -570,7 +618,7 @@ class OpsSkillRegistry:
                 },
             }
 
-    def record_usage(self, skill_id: str, event: str) -> dict[str, Any]:
+    def record_usage(self, skill_id: str, event: str, *, idempotency_key: str = "") -> dict[str, Any]:
         """Persist one lifecycle counter.
 
         ``executed`` is deliberately separate from matching, selection and
@@ -580,12 +628,20 @@ class OpsSkillRegistry:
             raise ValueError(f"unsupported skill usage event: {event}")
         with self._lock:
             usage = self._normalize_usage(self._usage.get(skill_id))
+            receipt = f"{event}:{idempotency_key}" if idempotency_key else ""
+            if receipt and receipt in usage["event_receipts"]:
+                return {**deepcopy(usage), "recorded": False}
             usage[event] += 1
+            if receipt:
+                usage["event_receipts"].append(receipt)
+                del usage["event_receipts"][:-1000]
             now = _now()
             if event == "matched":
                 usage["last_matched_at"] = now
             elif event == "selected":
                 usage["last_selected_at"] = now
+            elif event == "planned":
+                usage["last_planned_at"] = now
             elif event == "executed":
                 usage["last_executed_at"] = now
             elif event == "succeeded":
@@ -594,7 +650,41 @@ class OpsSkillRegistry:
                 usage["last_failed_at"] = now
             self._usage[skill_id] = usage
             self._persist_usage()
-            return deepcopy(usage)
+            return {**deepcopy(usage), "recorded": True}
+
+    def record_incident(self, skill_id: str, incident_id: str, outcome: str) -> dict[str, Any]:
+        """Record Skill effectiveness once per independent incident.
+
+        Stage retries are action invocations, not additional incidents. A later
+        ``resolved`` outcome upgrades the existing incident receipt rather than
+        inflating the denominator.
+        """
+        if outcome not in {"handled", "resolved", "unresolved"}:
+            raise ValueError(f"unsupported incident outcome: {outcome}")
+        incident_id = str(incident_id or "").strip()
+        if not incident_id:
+            return {**self._normalize_usage(self._usage.get(skill_id)), "recorded": False}
+        with self._lock:
+            usage = self._normalize_usage(self._usage.get(skill_id))
+            previous = usage["incident_receipts"].get(incident_id)
+            if previous == outcome or previous == "resolved":
+                return {**deepcopy(usage), "recorded": False}
+            if previous is None:
+                usage["incidents_handled"] += 1
+            if previous == "unresolved":
+                usage["incidents_unresolved"] = max(0, usage["incidents_unresolved"] - 1)
+            if outcome == "resolved":
+                usage["incidents_resolved"] += 1
+                usage["last_resolved_at"] = _now()
+            elif outcome == "unresolved":
+                usage["incidents_unresolved"] += 1
+            usage["incident_receipts"][incident_id] = outcome
+            # Bound persisted cardinality while keeping the most recent order.
+            while len(usage["incident_receipts"]) > 1000:
+                usage["incident_receipts"].pop(next(iter(usage["incident_receipts"])))
+            self._usage[skill_id] = usage
+            self._persist_usage()
+            return {**deepcopy(usage), "recorded": True}
 
     def usage_stats(self) -> dict[str, Any]:
         with self._lock:
@@ -604,18 +694,39 @@ class OpsSkillRegistry:
                 usage = self._normalize_usage(self._usage.get(skill_id))
                 for field in SKILL_USAGE_FIELDS:
                     totals[field] += usage[field]
-                executions = usage["executed"]
+                for field in ("incidents_handled", "incidents_resolved", "incidents_unresolved"):
+                    totals[field] += usage[field]
                 rows.append({
                     "skill_id": skill_id,
                     "skill_name": skill.get("name") or skill_id,
                     "category": skill.get("category") or "custom",
                     **usage,
-                    "success_rate": round(usage["succeeded"] / executions, 4) if executions else None,
+                    "success_rate": (
+                        round(usage["incidents_resolved"] / usage["incidents_handled"], 4)
+                        if usage["incidents_handled"] else None
+                    ) if usage["incidents_handled"] else (
+                        round(usage["succeeded"] / usage["executed"], 4)
+                        if usage["executed"] else None
+                    ),
+                    "success_rate_basis": "incidents" if usage["incidents_handled"] else "actions_fallback",
+                    "action_success_rate": (
+                        round(usage["succeeded"] / usage["executed"], 4)
+                        if usage["executed"] else None
+                    ),
                 })
-            rows.sort(key=lambda item: (-int(item["executed"]), -int(item["selected"]), item["skill_id"]))
+            rows.sort(key=lambda item: (
+                -int(item["incidents_resolved"]),
+                -(float(item["success_rate"]) if item["success_rate"] is not None else -1.0),
+                -int(item["executed"]),
+                item["skill_id"],
+            ))
             return {
                 "status": "ok",
-                "definition": "executed 才计为 Skill 调用；matched/selected/approval_requested 仅表示路由与审批阶段。",
+                "definition": (
+                    "matched/selected 按同一故障与证据阶段去重；planned 表示可执行 Skill handler 已生成方案；"
+                    "executed 才计为 Skill 调用中的真实动作调用数；incidents_resolved/incidents_handled "
+                    "才用于衡量解决问题数量与故障恢复成功率。"
+                ),
                 "totals": totals,
                 "skills": rows,
             }
@@ -743,14 +854,21 @@ class OpsSkillRegistry:
                 usage = self._normalize_usage(self._usage.get(str(skill.get("id"))))
                 executions = usage["executed"]
                 historical_score = (
-                    (usage["succeeded"] + 1) / (executions + 2)
+                    (usage["incidents_resolved"] + 1) / (usage["incidents_handled"] + 2)
+                    if usage["incidents_handled"]
+                    else (usage["succeeded"] + 1) / (executions + 2)
                     if executions
                     else 0.5
                 )
                 risk_score = {"low": 1.0, "medium": 0.72, "high": 0.45}.get(str(skill.get("risk")), 0.6)
                 recent_reliability_score = 0.7
                 if executions:
-                    failure_rate = usage["failed"] / max(1, executions)
+                    failure_rate = (
+                        (usage["incidents_handled"] - usage["incidents_resolved"])
+                        / max(1, usage["incidents_handled"])
+                        if usage["incidents_handled"]
+                        else usage["failed"] / max(1, executions)
+                    )
                     recent_reliability_score = max(0.1, min(1.0, historical_score * (1.0 - failure_rate * 0.35)))
                 score_breakdown = {
                     "symptom_log_match": round(symptom_score, 4),
