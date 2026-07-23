@@ -46,7 +46,12 @@ from agents.aiops_observability import (
     trace_hierarchy_schema,
     update_trace,
 )
-from agents.effectiveness import record_inspection, record_remediation, summary as effectiveness_summary
+from agents.effectiveness import (
+    record_inspection,
+    record_remediation,
+    successful_remediation_hint,
+    summary as effectiveness_summary,
+)
 from agents.model_registry import (
     get_active_model_profile_id,
     registry_payload,
@@ -180,8 +185,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.4")
-APP_CODE_SIGNATURE = "unified-executable-skills-ebpf-v10"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.5")
+APP_CODE_SIGNATURE = "semantic-root-cause-strategy-memory-v11"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -5801,7 +5806,7 @@ def _ops_plan_from_finding(finding: dict) -> dict:
         "unable to open database file", "can't open database file", "cannot open database file",
         "attempt to write a readonly database", "database is read-only",
         "failed to create lock file", "failed to open pid file", "failed to create wal",
-        "data directory is not writable",
+        "data directory is not writable", " is not writable", "paths_data", "path_data",
     ]) and workload_name and patchable_workload:
         strategy_class = "dynamic_skill_required"
         # 权限故障不能被固定 fsGroup 模板抢答。先完成实时深取证，再由 AI 结合
@@ -5874,7 +5879,7 @@ def _ops_plan_from_finding(finding: dict) -> dict:
             "unable to open database file", "can't open database file", "cannot open database file",
             "attempt to write a readonly database", "database is read-only",
             "failed to create lock file", "failed to open pid file", "failed to create wal",
-            "data directory is not writable",
+            "data directory is not writable", " is not writable", "paths_data", "path_data",
         ])
     ):
         changes = engine_plan["changes"]
@@ -8223,6 +8228,7 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
                 "failed to create lock file", "unable to create lock file",
                 "failed to open pid file", "failed to create wal",
                 "failed to create temporary file", "data directory is not writable",
+                " is not writable", "paths_data", "path_data",
             )),
             "新 Pod 日志无直接或应用层包装的路径写入错误",
         ),
@@ -8876,6 +8882,7 @@ def _permission_failure_container(plan: dict) -> tuple[dict, str, str]:
         "failed to create lock file", "unable to create lock file",
         "failed to open pid file", "failed to create wal",
         "failed to create temporary file", "data directory is not writable",
+        "paths_data", "path_data", " is not writable",
     )
     failing_name = ""
     for name, content in logs.items():
@@ -8892,8 +8899,12 @@ def _permission_failure_container(plan: dict) -> tuple[dict, str, str]:
     failing_name = str(container.get("name") or failing_name or "")
     text = json.dumps(logs.get(failing_name) or logs, ensure_ascii=False, default=str)
     path_match = re.search(
-        r"(?:mkdir(?:\s+-p)?|create\s+(?:a\s+)?directory|open(?:ing)?|database(?:\s+file)?)"
-        r"\s*(?::|for|at)?\s*[\"']?(/[^\s\"',;]+)",
+        r"(?:"
+        r"[A-Z][A-Z0-9_]*(?:PATH|PATHS|DATA|DIR)[A-Z0-9_]*\s*=\s*"
+        r"|(?:configured\s+)?(?:data\s+)?(?:path|dir(?:ectory)?)\s*[=:]?\s*"
+        r"|(?:mkdir(?:\s+-p)?|create\s+(?:a\s+)?directory|open(?:ing)?|database(?:\s+file)?)"
+        r"\s*(?::|for|at)?\s*)"
+        r"[\"']?(/[^\s\"',;]+)",
         text,
         flags=re.I,
     )
@@ -8925,7 +8936,11 @@ def _permission_attempted_stages(plan: dict) -> set[str]:
     return attempted
 
 
-def _permission_recovery_followup(plan: dict) -> dict:
+def _permission_recovery_followup(
+    plan: dict,
+    *,
+    preferred_strategy: str = "",
+) -> dict:
     namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
     target = f"{workload_type}/{workload_name}" if workload_name else str(plan.get("target") or namespace)
     deep = plan.get("_runtime_evidence") or {}
@@ -8972,8 +8987,15 @@ def _permission_recovery_followup(plan: dict) -> dict:
     pod_name = str(deep.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan) or "")
     change: dict | None = None
     stage = ""
+    force_root = preferred_strategy == "root_workload_security_context"
 
-    if (uid is None or gid is None or uid == 0) and "identity_probe" not in attempted and pod_name and container_name:
+    if (
+        not force_root
+        and (uid is None or gid is None or uid == 0)
+        and "identity_probe" not in attempted
+        and pod_name
+        and container_name
+    ):
         stage = "identity_probe"
         change = {
             "type": "exec_pod",
@@ -8985,7 +9007,13 @@ def _permission_recovery_followup(plan: dict) -> dict:
             "reason": "模板没有给出可信的非 root UID/GID；先读取目标容器实际身份，再生成最小权限 Patch。",
             **ACTION_CATALOG["exec_pod"],
         }
-    elif uid is not None and gid is not None and uid > 0 and "nonroot_group" not in attempted:
+    elif (
+        not force_root
+        and uid is not None
+        and gid is not None
+        and uid > 0
+        and "nonroot_group" not in attempted
+    ):
         stage = "nonroot_group"
         change = {
             "type": "patch_workload_runtime_security",
@@ -9035,7 +9063,8 @@ def _permission_recovery_followup(plan: dict) -> dict:
             or os.getenv("NODE_EXEC_IMAGE", "").strip()
         )
         if (
-            "init_owner" not in attempted
+            not force_root
+            and "init_owner" not in attempted
             and uid is not None
             and gid is not None
             and uid > 0
@@ -9096,6 +9125,13 @@ def _permission_recovery_followup(plan: dict) -> dict:
             }
         elif "root" not in attempted and container_name:
             stage = "root"
+            root_reason = (
+                "实时日志明确指出已配置的数据目录不可写，且数据库在同一路径启动失败；"
+                "该路径已确认位于挂载卷内，当前 Workload 又强制非 root 身份。"
+                "根据候选根因评分或同类已验证恢复记录，直接把 Pod 组与故障容器的 UID/GID 提升为 0。"
+                if force_root else
+                "非 root 与有界目录修复均未恢复；仅把实际失败容器及必要 Pod 组提升为 0，其他容器保持原配置。"
+            )
             change = {
                 "type": "patch_workload_runtime_security",
                 "namespace": namespace,
@@ -9121,7 +9157,7 @@ def _permission_recovery_followup(plan: dict) -> dict:
                         },
                     }],
                 }}}},
-                "reason": "非 root 与有界目录修复均未恢复；仅把实际失败容器及必要 Pod 组提升为 0，其他容器保持原配置。",
+                "reason": root_reason,
                 **ACTION_CATALOG["patch_workload_runtime_security"],
             }
 
@@ -9163,6 +9199,12 @@ def _permission_recovery_followup(plan: dict) -> dict:
         ],
         "changes": [change],
         "permission_recovery_stage": stage,
+        "permission_strategy_preference": preferred_strategy or (
+            "root_workload_security_context" if stage == "root" else stage
+        ),
+        "permission_strategy_decision": copy.deepcopy(
+            plan.get("permission_strategy_decision") or {}
+        ),
         "requires_confirmation": True,
         "requires_high_risk_confirmation": True,
         "source": "progressive_permission_recovery",
@@ -9302,6 +9344,58 @@ def _volume_permission_skill_handler(plan: dict, signal: dict) -> dict | None:
     if not hypothesis.get("detected"):
         return None
     plan["write_path_root_cause"] = hypothesis
+    diagnosis = (signal or {}).get("diagnosis") if isinstance(signal, dict) else {}
+    diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+    llm_routing = diagnosis.get("skill_routing") if isinstance(diagnosis.get("skill_routing"), dict) else {}
+    model_strategy = str(
+        llm_routing.get("strategy_id")
+        or llm_routing.get("primary_strategy")
+        or plan.get("_skill_strategy_preference")
+        or ""
+    ).strip()
+    memory_hint = successful_remediation_hint(plan, VOLUME_PERMISSION_SKILL_ID)
+    ranked_strategies = [
+        item for item in (hypothesis.get("strategy_candidates") or [])
+        if isinstance(item, dict)
+    ]
+    evidence_strategy = str(hypothesis.get("recommended_strategy") or "")
+    root_evidence_closed = bool(
+        float(hypothesis.get("confidence") or 0) >= 0.86
+        and hypothesis.get("explicit_path_error")
+        and hypothesis.get("database_bootstrap_error")
+        and hypothesis.get("path_on_mount")
+        and (hypothesis.get("configured_identity") or {}).get("non_root_enforced")
+    )
+    selected_strategy = ""
+    strategy_source = ""
+    if (
+        str(memory_hint.get("strategy_id") or "") == "root_workload_security_context"
+        and float(memory_hint.get("confidence") or 0) >= 0.72
+    ):
+        selected_strategy = "root_workload_security_context"
+        strategy_source = "verified_recovery_memory"
+    elif model_strategy == "root_workload_security_context" and root_evidence_closed:
+        selected_strategy = model_strategy
+        strategy_source = "deepseek_candidate_reasoning+server_evidence_guard"
+    elif evidence_strategy == "root_workload_security_context" and root_evidence_closed:
+        selected_strategy = evidence_strategy
+        strategy_source = "semantic_candidate_scoring"
+    elif model_strategy in {"nonroot_group_ownership", "init_owner"}:
+        selected_strategy = model_strategy
+        strategy_source = "deepseek_candidate_reasoning"
+    plan["permission_strategy_decision"] = {
+        "selected_strategy": selected_strategy or "progressive_least_privilege",
+        "source": strategy_source or "progressive_evidence_fallback",
+        "model_strategy": model_strategy,
+        "root_evidence_closed": root_evidence_closed,
+        "verified_memory": memory_hint,
+        "candidates": ranked_strategies,
+        "guardrail": (
+            "root 只在明确不可写路径、数据库启动错误、volumeMount 和非 root securityContext "
+            "四类证据闭合，或同一目标存在已验证恢复记录时进入；仍须人工逐项审批。"
+        ),
+    }
+    plan["root_cause_candidates"] = ranked_strategies
     if float(hypothesis.get("confidence") or 0) < 0.62:
         namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
         return {
@@ -9324,7 +9418,10 @@ def _volume_permission_skill_handler(plan: dict, signal: dict) -> dict | None:
             "evidence_gap": "缺少错误路径与挂载卷/运行身份的关联证据。",
             "success_criteria": ["pod_ready", "restart_count_stable", "write_errors_absent"],
         }
-    generated = _permission_recovery_followup(plan)
+    generated = _permission_recovery_followup(
+        plan,
+        preferred_strategy=selected_strategy,
+    )
     generated["source"] = "executable_volume_permission_skill"
     generated["write_path_root_cause"] = hypothesis
     return generated
@@ -11130,7 +11227,8 @@ def _capture_candidate_skill(plan: dict, result: dict) -> dict | None:
     known_symptoms = [
         term for term in (
             "permission denied", "mkdir", "crashloopbackoff", "failedmount", "imagepullbackoff",
-            "oomkilled", "failedscheduling", "read-only file system",
+            "oomkilled", "failedscheduling", "read-only file system", "not writable",
+            "unable to open database file", "readonly database",
         ) if term in evidence_text
     ]
     diagnostics = [
@@ -11597,6 +11695,13 @@ def _attach_operator_skills_to_chat(req: ChatRequest, data: dict) -> dict:
             **live_evidence,
         }
         llm_skill_routing = diagnosis.get("skill_routing") if isinstance(diagnosis.get("skill_routing"), dict) else {}
+        strategy_preference = str(
+            llm_skill_routing.get("strategy_id")
+            or llm_skill_routing.get("primary_strategy")
+            or ""
+        ).strip()
+        if strategy_preference:
+            plan["_skill_strategy_preference"] = strategy_preference
         preferred_skill_ids = [
             str(llm_skill_routing.get("primary_skill_id") or ""),
             *[str(item) for item in (llm_skill_routing.get("secondary_skill_ids") or [])],
@@ -11610,6 +11715,8 @@ def _attach_operator_skills_to_chat(req: ChatRequest, data: dict) -> dict:
                 "engine": "DeepSeekRootCauseSkillRouter/v1",
                 "source": "llm_root_cause_candidates+semantic_match",
                 "selected_skill_ids": preferred_skill_ids,
+                "strategy_id": strategy_preference,
+                "strategy_confidence": llm_skill_routing.get("strategy_confidence"),
                 "rationale": llm_skill_routing.get("rationale") or "",
                 "root_cause_candidates": diagnosis.get("root_cause_candidates") or [],
             } if llm_skill_routing or diagnosis.get("root_cause_candidates") else None,
@@ -11673,24 +11780,63 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
             "evidence_required": item.get("evidence_required") or [],
             "allowed_actions": item.get("allowed_actions") or [],
         } for item in skill_items[:40]]
-        finding_catalog = [{
-            "id": item.get("id"),
-            "category": item.get("category"),
-            "severity": item.get("severity"),
-            "title": item.get("title"),
-            "summary": item.get("summary"),
-            "target": {
-                "kind": (item.get("workload") or {}).get("kind"),
-                "name": (item.get("workload") or {}).get("name") or item.get("name"),
-                "namespace": item.get("namespace"),
-            },
-            "event_signals": [
-                {"reason": event.get("reason"), "message": _clip_text(event.get("message"), 240)}
-                for event in ((item.get("evidence") or {}).get("events") or [])[:5]
-                if isinstance(event, dict)
-            ],
-            "deterministic_candidates": deterministic.get(str(item.get("id")), []),
-        } for item in findings[:24]]
+        finding_catalog = []
+        for item in findings[:24]:
+            evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+            pod = evidence.get("pod") if isinstance(evidence.get("pod"), dict) else {}
+            log_signals = []
+            for container_name, log_payload in (evidence.get("logs") or {}).items():
+                if isinstance(log_payload, dict):
+                    for stream_name in ("current", "previous"):
+                        content = str(log_payload.get(stream_name) or "").strip()
+                        if content:
+                            log_signals.append({
+                                "container": str(container_name),
+                                "stream": stream_name,
+                                "content": _clip_text(content, 1200),
+                            })
+                elif str(log_payload).strip():
+                    log_signals.append({
+                        "container": str(container_name),
+                        "stream": "current",
+                        "content": _clip_text(log_payload, 1200),
+                    })
+            container_runtime = [{
+                "name": container.get("name"),
+                "security_context": container.get("security_context") or container.get("securityContext") or {},
+                "volume_mounts": container.get("volume_mounts") or container.get("volumeMounts") or [],
+                "state": container.get("state"),
+                "reason": container.get("reason"),
+                "restart_count": container.get("restart_count"),
+            } for container in (pod.get("containers") or []) if isinstance(container, dict)]
+            finding_catalog.append({
+                "id": item.get("id"),
+                "category": item.get("category"),
+                "severity": item.get("severity"),
+                "title": item.get("title"),
+                "summary": item.get("summary"),
+                "target": {
+                    "kind": (item.get("workload") or {}).get("kind"),
+                    "name": (item.get("workload") or {}).get("name") or item.get("name"),
+                    "namespace": item.get("namespace"),
+                },
+                "log_signals": log_signals[:8],
+                "event_signals": [
+                    {"reason": event.get("reason"), "message": _clip_text(event.get("message"), 500)}
+                    for event in (evidence.get("events") or [])[:8]
+                    if isinstance(event, dict)
+                ],
+                "pod_security_context": pod.get("security_context") or pod.get("securityContext") or {},
+                "containers": container_runtime[:8],
+                "workload_template": _redact_sensitive(
+                    evidence.get("workload")
+                    or (pod.get("workload") if isinstance(pod.get("workload"), dict) else {})
+                    or item.get("workload")
+                    or {}
+                ),
+                "storage_chain": _redact_sensitive((evidence.get("storage") or [])[:12]),
+                "deterministic_candidates": deterministic.get(str(item.get("id")), []),
+            })
 
         router_trace = start_trace(
             "flawless.inspection.skill_router",
@@ -11713,10 +11859,19 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
             from agents.llm_client import get_llm
             llm = get_llm(temperature=0.0, max_tokens=1400, profile_id=model_profile_id or None)
             prompt = (
-                "你是企业 AIOps 的运维 Skill 路由器。根据真实异常摘要、对象类型和事件证据，"
-                "为每个 finding 选择最多 3 个最相关的 Skill。只能选择目录中已有 id，不得生成动作、命令或新 Skill。"
+                "你是企业 AIOps 的根因与运维 Skill 路由器，当前模型可能是 deepseek-v4-flash。"
+                "必须同时阅读 current/previous logs、Pod/Workload securityContext、volumeMount、PVC/PV 和 Events，"
+                "先生成候选根因及支持/反证，再为每个 finding 选择最多 3 个最相关的 Skill。"
+                "只能选择目录中已有 id，不得生成命令或新 Skill。通常只把最高证据一致性的 Skill 作为第一项；"
+                "只有跨域依赖时才保留后续 Skill。"
+                "遇到 `PATH...=/path is not writable` 加数据库/lock/WAL 打开失败时，不能停在应用报错；"
+                "要核对路径是否位于 volumeMount、当前 UID/GID、fsGroup、只读挂载、容量、I/O、数据库损坏和 root_squash。"
+                "若明确不可写路径、同路径数据库启动失败、挂载关联和非 root 约束四类证据闭合，"
+                "可以建议 strategy_id=root_workload_security_context；否则不得仅凭一个相似词建议 root。"
                 "优先选择能覆盖根因证据、对象类型和恢复判据的 Skill；证据不足时保留确定性候选并降低 confidence。"
-                "只返回 JSON：{routes:[{finding_id,skill_ids,confidence,rationale}]}。\n"
+                "只返回 JSON：{routes:[{finding_id,skill_ids,confidence,strategy_id,strategy_confidence,"
+                "root_cause_candidates:[{hypothesis,confidence,supporting_evidence,contradicting_evidence,"
+                "required_next_evidence}],rationale}]}。\n"
                 f"Skill目录={json.dumps(_redact_sensitive(skill_catalog), ensure_ascii=False)[:14000]}\n"
                 f"巡检异常={json.dumps(_redact_sensitive(finding_catalog), ensure_ascii=False)[:18000]}"
             )
@@ -11737,6 +11892,14 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
                     llm_routes[finding_id] = {
                         "skill_ids": selected,
                         "confidence": max(0.0, min(1.0, float(route.get("confidence") or 0.0))),
+                        "strategy_id": _clip_text(route.get("strategy_id"), 120),
+                        "strategy_confidence": max(
+                            0.0,
+                            min(1.0, float(route.get("strategy_confidence") or 0.0)),
+                        ),
+                        "root_cause_candidates": _redact_sensitive(
+                            (route.get("root_cause_candidates") or [])[:6]
+                        ),
                         "rationale": _clip_text(route.get("rationale"), 500),
                     }
             end_observation(router_generation, output={"routes": list(llm_routes.values())}, usage=router_usage)
@@ -11766,11 +11929,17 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
             "source": "llm+semantic_match" if llm_route else "semantic_match_fallback",
             "selected_skill_ids": preferred,
             "confidence": (llm_route or {}).get("confidence"),
+            "strategy_id": (llm_route or {}).get("strategy_id") or "",
+            "strategy_confidence": (llm_route or {}).get("strategy_confidence"),
+            "root_cause_candidates": (llm_route or {}).get("root_cause_candidates") or [],
             "rationale": (llm_route or {}).get("rationale") or "根据症状、对象类型、证据字段和 Skill 描述匹配。",
             "router_error": router_error or None,
         }
         plan = finding.get("ops_plan") or _ops_plan_from_finding(finding)
         plan["source_surface"] = "ai_inspection"
+        if routing.get("strategy_id"):
+            plan["_skill_strategy_preference"] = routing["strategy_id"]
+            plan["model_root_cause_candidates"] = routing.get("root_cause_candidates") or []
         plan = _attach_operator_skills_to_plan(
             plan,
             _inspection_skill_signal(finding),
@@ -12625,25 +12794,27 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                 if str(current.get("permission_recovery_stage") or "") == "root":
                     hardening = _permission_hardening_plan(current)
                     if hardening:
-                        hardening = _attach_operator_skills_to_plan(
-                            hardening,
-                            _skill_signal_payload(
-                                question=hardening.get("summary") or "",
-                                alert={
-                                    "cluster": current.get("cluster"),
-                                    "cluster_id": current.get("cluster_id"),
-                                    "namespace": current.get("namespace"),
-                                    "target": current.get("target"),
-                                },
-                                diagnosis={
-                                    "root_cause": "root 状态已恢复，尝试最小权限加固",
-                                    "signals": (current.get("_runtime_evidence") or {}).get("events") or [],
-                                },
-                                evidence=current.get("_runtime_evidence") or current.get("evidence") or {},
-                                plan=hardening,
-                            ),
-                            preferred_skill_ids=[str(current.get("selected_skill_id") or "skill-volume-permission-recovery")],
+                        # This plan is already produced by the verified
+                        # permission Skill. Re-running root-cause routing here
+                        # would see the original error logs and incorrectly
+                        # replace the optional non-root hardening with root
+                        # again.
+                        hardening["selected_skill_id"] = str(
+                            current.get("selected_skill_id")
+                            or VOLUME_PERMISSION_SKILL_ID
                         )
+                        hardening["operator_skills"] = copy.deepcopy(
+                            current.get("operator_skills") or []
+                        )
+                        hardening["skill_runtime"] = copy.deepcopy(
+                            current.get("skill_runtime") or {}
+                        )
+                        hardening["change_source"] = "post_recovery_hardening"
+                        for hardening_change in hardening.get("changes") or []:
+                            if isinstance(hardening_change, dict):
+                                hardening_change["skill_id"] = hardening["selected_skill_id"]
+                                hardening_change["skill_supported"] = True
+                                hardening_change["selection_source"] = "verified_root_post_recovery"
                         hardening["high_risk_confirmed"] = False
                         hardening["operator_force_execute"] = False
                         hardening["stepwise_confirmation"] = True
@@ -12653,18 +12824,23 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                         await _append_ops_job_event(
                             job_id,
                             "root_recovered_hardening_proposed",
-                            "root 恢复已连续验证通过；已生成单独审批的非 root 加固方案，失败会按审批中展示的补丁自动回滚。",
+                            "root 恢复已连续验证通过，当前故障立即闭环；另附一个独立、可选且需重新审批的非 root 加固方案。",
                             status="running",
                             root_recovery_verification=result.get("verification") or {},
-                            residual_risk="当前业务容器以 root 运行，等待操作员决定是否尝试非 root 加固。",
+                            residual_risk="当前业务容器以 root 运行；可在业务恢复后另行评估非 root 加固，不阻塞本次恢复结论。",
                             level="warning",
                         )
-                        current = hardening
-                        await _update_ops_job(job_id, plan=copy.deepcopy(current))
-                        continue
-                    result.setdefault("verification", {})["residual_risk"] = (
-                        "业务已在 root 状态恢复，但缺少可信的原非 root UID/GID，无法自动生成安全加固补丁。"
-                    )
+                        result["post_recovery_hardening"] = hardening
+                        result.setdefault("alternative_plans", []).append(hardening)
+                        result.setdefault("verification", {})["residual_risk"] = (
+                            "业务已通过 root securityContext 恢复；非 root 加固是独立后续变更，"
+                            "不会把已恢复故障重新标记为未完成。"
+                        )
+                    else:
+                        result.setdefault("verification", {})["residual_risk"] = (
+                            "业务已在 root 状态恢复，但缺少可信的原非 root UID/GID，"
+                            "无法自动生成安全加固补丁。"
+                        )
                 if active_skill_id and skill_was_executed:
                     if (result.get("verification") or {}).get("hardening_succeeded") is False:
                         OPS_SKILL_REGISTRY.record_usage(active_skill_id, "failed")

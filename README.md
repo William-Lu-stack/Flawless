@@ -16,7 +16,7 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.4**.
+Current release: **3.2.5**.
 
 Release 3.2 adds persistent remediation lineage: every failed strategy, action,
 verification result, and replacement plan stays linked across operator-approved

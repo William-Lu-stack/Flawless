@@ -95,7 +95,7 @@ if ($LASTEXITCODE -ne 0) {
 
 if ($ImageMode -eq "public-cn") {
     $appRepository = "m.daocloud.io/ghcr.io/your-org/flawless"
-    $appTag = "3.2.4"
+    $appTag = "3.2.5"
     $nodeExecutorImage = "m.daocloud.io/ghcr.io/your-org/flawless-node-exec:1.36"
 } else {
     $registry = $PrivateRegistry.Trim().TrimEnd('/')
@@ -103,7 +103,7 @@ if ($ImageMode -eq "public-cn") {
         Fail "PrivateRegistry must be host[:port] without a URL scheme"
     }
     $appRepository = "$registry/k8s-agent"
-    $appTag = "3.2.4"
+    $appTag = "3.2.5"
     $nodeExecutorImage = "$registry/k8s-agent-node-exec:1.36"
 
     if ($RegistryUsername) {

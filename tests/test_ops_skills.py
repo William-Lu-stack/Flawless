@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException, Request
 
+from agents import effectiveness
 from agents.remediation_engine import action_catalog_payload
 from backend.app import main as server
 from backend.app.schemas.chat import ChatRiskRankRequest
@@ -23,6 +24,170 @@ from backend.app.services.ops_skill_runtime import classify_volume_write_failure
 
 
 class OpsSkillCatalogTests(unittest.TestCase):
+    def test_explicit_grafana_data_path_error_selects_root_security_context(self):
+        logs = "\n".join([
+            "GF_PATHS_DATA='/var/lib/grafana' is not writable.",
+            "logger=sqlstore msg=\"Connecting to DB\" dbtype=sqlite3",
+            "Error: unable to open database file (14)",
+        ])
+        evidence = {
+            "logs": {"grafana": {"current": logs}},
+            "events": [],
+            "pod": {
+                "name": "grafana-abc",
+                "security_context": {
+                    "runAsUser": 472,
+                    "runAsGroup": 472,
+                    "runAsNonRoot": True,
+                    "fsGroup": 472,
+                },
+                "containers": [{
+                    "name": "grafana",
+                    "security_context": {
+                        "runAsUser": 472,
+                        "runAsGroup": 472,
+                        "runAsNonRoot": True,
+                    },
+                    "volume_mounts": [{
+                        "name": "data",
+                        "mount_path": "/var/lib/grafana",
+                    }],
+                }],
+            },
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "grafana"},
+                "spec": {"template": {"spec": {
+                    "securityContext": {
+                        "runAsUser": 472,
+                        "runAsGroup": 472,
+                        "runAsNonRoot": True,
+                        "fsGroup": 472,
+                    },
+                    "containers": [{"name": "grafana"}],
+                }}},
+            },
+            "storage": [{"pvc": "grafana-data", "pvc_phase": "Bound"}],
+        }
+        plan = {
+            "_skill_incident_id": "grafana-write-path",
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "summary": "Grafana cannot start",
+            "evidence": evidence,
+            "changes": [],
+        }
+        hypothesis = classify_volume_write_failure(plan)
+        self.assertEqual(hypothesis["signal_class"], "explicit_mounted_path_not_writable")
+        self.assertEqual(hypothesis["candidate_path"], "/var/lib/grafana")
+        self.assertTrue(hypothesis["path_on_mount"])
+        self.assertEqual(hypothesis["recommended_strategy"], "root_workload_security_context")
+
+        attached = server._attach_operator_skills_to_plan(
+            plan,
+            {
+                "question": "Grafana data path is not writable",
+                "diagnosis": {
+                    "skill_routing": {
+                        "primary_skill_id": "skill-volume-permission-recovery",
+                        "strategy_id": "root_workload_security_context",
+                    },
+                },
+                "evidence": evidence,
+                "plan": plan,
+            },
+            preferred_skill_ids=["skill-volume-permission-recovery"],
+        )
+        self.assertEqual(attached["permission_recovery_stage"], "root")
+        self.assertEqual(
+            attached["permission_strategy_decision"]["source"],
+            "deepseek_candidate_reasoning+server_evidence_guard",
+        )
+        spec = attached["changes"][0]["patch"]["spec"]["template"]["spec"]
+        self.assertEqual(spec["securityContext"]["runAsUser"], 0)
+        self.assertEqual(spec["securityContext"]["runAsGroup"], 0)
+        self.assertEqual(spec["securityContext"]["fsGroup"], 0)
+        self.assertEqual(spec["securityContext"]["supplementalGroups"], [0])
+        self.assertFalse(spec["securityContext"]["runAsNonRoot"])
+        self.assertEqual(spec["containers"][0]["securityContext"]["runAsUser"], 0)
+        self.assertEqual(spec["containers"][0]["securityContext"]["runAsGroup"], 0)
+        self.assertFalse(spec["containers"][0]["securityContext"]["runAsNonRoot"])
+
+    def test_capacity_evidence_prevents_direct_root_strategy(self):
+        plan = {
+            "summary": "data path failure",
+            "evidence": {
+                "logs": {"db": {"current": (
+                    "DATA_PATH='/var/lib/app' is not writable; "
+                    "unable to open database file; no space left on device"
+                )}},
+                "pod": {
+                    "security_context": {"runAsUser": 10001, "runAsNonRoot": True},
+                    "containers": [{
+                        "name": "db",
+                        "security_context": {"runAsUser": 10001, "runAsNonRoot": True},
+                        "volume_mounts": [{"name": "data", "mount_path": "/var/lib/app"}],
+                    }],
+                },
+            },
+        }
+        hypothesis = classify_volume_write_failure(plan)
+        self.assertNotEqual(hypothesis["recommended_strategy"], "root_workload_security_context")
+        root = next(
+            item for item in hypothesis["strategy_candidates"]
+            if item["strategy_id"] == "root_workload_security_context"
+        )
+        self.assertIn("no space left on device", root["contradicting_evidence"])
+
+    def test_verified_root_recovery_is_reused_as_strategy_hint_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {
+                "EFFECTIVENESS_STORE_PATH": str(Path(directory) / "effectiveness.json"),
+                "EFFECTIVENESS_STORE_FALLBACK_PATH": str(Path(directory) / "fallback.json"),
+            }):
+                effectiveness._STORE_LOADED_FROM = ""
+                effectiveness.INSPECTION_RUNS.clear()
+                effectiveness.REMEDIATION_OUTCOMES.clear()
+                recovered_plan = {
+                    "id": "plan-1",
+                    "target": "Deployment/metrics",
+                    "namespace": "monitoring",
+                    "selected_skill_id": "skill-volume-permission-recovery",
+                    "permission_recovery_stage": "root",
+                    "evidence": {
+                        "logs": {"metrics": {"current": (
+                            "DATA_PATH='/var/lib/metrics' is not writable; "
+                            "unable to open database file"
+                        )}},
+                    },
+                    "changes": [{
+                        "type": "patch_workload_runtime_security",
+                        "workload_type": "Deployment",
+                        "workload_name": "metrics",
+                        "patch": {"spec": {"template": {"spec": {
+                            "securityContext": {"runAsUser": 0, "runAsGroup": 0, "fsGroup": 0},
+                        }}}},
+                    }],
+                }
+                effectiveness.record_remediation(recovered_plan, {
+                    "status": "completed",
+                    "results": [{"status": "success"}],
+                    "verification": {"recovered": True},
+                })
+                hint = effectiveness.successful_remediation_hint(
+                    {
+                        "target": "Deployment/metrics",
+                        "evidence": recovered_plan["evidence"],
+                    },
+                    "skill-volume-permission-recovery",
+                )
+                self.assertEqual(hint["strategy_id"], "root_workload_security_context")
+                self.assertGreaterEqual(hint["confidence"], 0.86)
+                self.assertNotIn("patch", hint)
+                effectiveness._STORE_LOADED_FROM = ""
+                effectiveness.INSPECTION_RUNS.clear()
+                effectiveness.REMEDIATION_OUTCOMES.clear()
+
     def test_database_open_error_is_correlated_as_write_path_hypothesis(self):
         plan = {
             "summary": "CrashLoopBackOff",

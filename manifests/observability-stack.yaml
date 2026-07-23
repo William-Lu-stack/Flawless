@@ -43,7 +43,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: cmdb
-          image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.4
+          image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.5
           imagePullPolicy: IfNotPresent
           command:
             - sh

@@ -543,8 +543,12 @@ export function OpsPlanPanel({ plan, autonomous = false }: { plan: OpsPlan; auto
   const [serverRequiresHighRisk, setServerRequiresHighRisk] = useState(false);
   const active = job && ACTIVE_STATUSES.has(job.status);
   const changes = useMemo(() => asList(plan?.changes), [plan]);
-  const hypotheses = useMemo(() => asList(plan?.root_cause_hypotheses).slice(0, 3), [plan]);
+  const hypotheses = useMemo(
+    () => asList(plan?.root_cause_candidates || plan?.root_cause_hypotheses).slice(0, 3),
+    [plan],
+  );
   const operatorSkills = useMemo(() => asList(plan?.operator_skills), [plan]);
+  const strategyDecision = plan?.permission_strategy_decision || {};
   const requiresHighRisk = useMemo(
     () => serverRequiresHighRisk || Boolean(plan?.requires_high_risk_confirmation) || changes.some((change: any) => change.risk === "high" || change.auto_allowed === false || change.requires_high_risk_confirmation || HIGH_RISK_ACTIONS.has(String(change.type || change.action || ""))),
     [changes, plan?.requires_high_risk_confirmation, serverRequiresHighRisk],
@@ -617,11 +621,17 @@ export function OpsPlanPanel({ plan, autonomous = false }: { plan: OpsPlan; auto
       <b>匹配到的运维 Skill</b>
       {operatorSkills.map((skill: any) => <span key={skill.id}><strong>{skill.name}</strong><small>{Math.round(Number(skill.confidence || 0) * 100)}% · {skill.category} · {skill.risk} · {skill.execution_authorized ? "所需证据已齐，可进入审批" : asList(skill.evidence_missing).length ? `仍缺 ${asList(skill.evidence_missing).join("、")}` : "仅诊断，未发布执行权限"}</small></span>)}
     </div>}
+    {strategyDecision.selected_strategy && <div className="ops-strategy-decision">
+      <b>智能策略选择</b>
+      <span><strong>{strategyDecision.selected_strategy}</strong><small>来源：{strategyDecision.source || "实时证据评分"} · root 证据闭合：{strategyDecision.root_evidence_closed ? "是" : "否"}</small></span>
+      {strategyDecision.guardrail && <p>{strategyDecision.guardrail}</p>}
+      {strategyDecision.verified_memory?.record_id && <small>参考已验证恢复记录 {strategyDecision.verified_memory.record_id}；只复用策略，不复用旧审批或旧 YAML。</small>}
+    </div>}
     {hypotheses.length > 0 && <div className="ops-decision-basis">
       <b>可审计决策依据</b>
       <small>展示证据、置信度和动作依据，不展示或伪造模型内部思维链。</small>
       {hypotheses.map((hypothesis: any, index: number) => <div key={`${hypothesis.id || hypothesis.title || "hypothesis"}-${index}`}>
-        <i>{index + 1}</i><span><strong>{hypothesis.title || hypothesis.root_cause || hypothesis.name || "候选根因"}</strong><small>{hypothesis.reason || asList(hypothesis.matched_evidence).join(" · ") || "由当前日志、Events 和资源状态共同支持。"}</small></span><em>{Math.round(Number(hypothesis.confidence || 0) * 100)}%</em>
+        <i>{index + 1}</i><span><strong>{hypothesis.hypothesis || hypothesis.title || hypothesis.root_cause || hypothesis.name || "候选根因"}</strong><small>{hypothesis.reason || asList(hypothesis.supporting_evidence || hypothesis.matched_evidence).join(" · ") || "由当前日志、Events 和资源状态共同支持。"}{asList(hypothesis.contradicting_evidence).length ? `；反证：${asList(hypothesis.contradicting_evidence).join(" · ")}` : ""}</small></span><em>{Math.round(Number(hypothesis.confidence || 0) * 100)}%</em>
       </div>)}
     </div>}
     <div className="ops-plan-columns">

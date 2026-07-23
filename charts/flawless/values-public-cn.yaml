@@ -2,7 +2,7 @@
 # Keep immutable tags in production; avoid `latest` so mirror caches stay deterministic.
 image:
   repository: m.daocloud.io/ghcr.io/your-org/flawless
-  tag: 3.2.4
+  tag: 3.2.5
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

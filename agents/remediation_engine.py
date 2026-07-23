@@ -305,6 +305,7 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
         "terms": (
             "permission denied", "operation not permitted", "read-only file system",
             "can't create directory", "cannot create directory", "mkdir:",
+            " is not writable", "paths_data", "path_data",
             "unable to open database file", "can't open database file", "cannot open database file",
             "could not open database file", "attempt to write a readonly database",
             "attempt to write a read-only database", "database is read-only",
@@ -504,6 +505,7 @@ def score_root_causes(alert: dict, diagnosis: dict, context: dict) -> list[dict[
         "can't create directory",
         "cannot create directory",
         "mkdir:",
+        " is not writable",
     ))
     indirect_write_path_failure = any(term in decisive_text for term in (
         "unable to open database file",
@@ -519,6 +521,7 @@ def score_root_causes(alert: dict, diagnosis: dict, context: dict) -> list[dict[
         "failed to create wal",
         "failed to create temporary file",
         "data directory is not writable",
+        "paths_data",
     ))
     write_path_corroborated = any(term in decisive_text for term in (
         "volumemounts", "volume_mounts", "mount_path", "mountpath",

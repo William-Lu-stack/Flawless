@@ -37,6 +37,7 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "summary": "根据直接权限错误或数据库/锁/WAL/临时文件不可写等间接日志，关联运行用户、挂载和 Workload 配置，逐级执行最小权限 YAML 修复并重新发布验证。",
         "symptoms": [
             "mkdir", "permission denied", "can't create directory", "read-only file system",
+            "path is not writable", "paths_data is not writable",
             "unable to open database file", "can't open database file",
             "attempt to write a readonly database", "database is read-only",
             "failed to create lock file", "failed to open pid file", "failed to create wal",

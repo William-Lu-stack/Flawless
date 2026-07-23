@@ -86,6 +86,26 @@ INDIRECT_WRITE_PATH_TERMS = (
     "storage directory is not writable",
 )
 
+DATABASE_BOOTSTRAP_WRITE_TERMS = (
+    "unable to open database file",
+    "can't open database file",
+    "cannot open database file",
+    "could not open database file",
+    "attempt to write a readonly database",
+    "attempt to write a read-only database",
+    "database is read-only",
+    "database is readonly",
+)
+
+CAPACITY_OR_CORRUPTION_TERMS = (
+    "no space left on device",
+    "disk quota exceeded",
+    "filesystem full",
+    "database disk image is malformed",
+    "database corruption",
+    "input/output error",
+)
+
 
 def _flatten_text(value: Any) -> str:
     parts: list[str] = []
@@ -150,6 +170,10 @@ def _security_context_present(pod: dict[str, Any], workload: dict[str, Any]) -> 
 
 def _candidate_path(text: str) -> str:
     patterns = (
+        r"[A-Z][A-Z0-9_]*(?:PATH|PATHS|DATA|DIR)[A-Z0-9_]*\s*=\s*[\"']?"
+        r"(/[^\s\"',;]+)[\"']?\s+(?:is\s+)?not\s+writable",
+        r"(?:configured\s+)?(?:data\s+)?(?:path|dir(?:ectory)?)\s*[=:]?\s*[\"']?"
+        r"(/[^\s\"',;]+)[\"']?\s+(?:is\s+)?not\s+writable",
         r"(?:mkdir(?:\s+-p)?|create\s+(?:a\s+)?directory|open(?:ing)?|database(?:\s+file)?)"
         r"\s*(?::|for|at)?\s*[\"']?(/[^\s\"',;]+)",
         r"(?:path|dir(?:ectory)?|file)\s*[=:]\s*[\"']?(/[^\s\"',;]+)",
@@ -159,6 +183,149 @@ def _candidate_path(text: str) -> str:
         if match:
             return str(match.group(1)).rstrip(").,;:")
     return ""
+
+
+def _configured_identity(pod: dict[str, Any], workload: dict[str, Any]) -> dict[str, Any]:
+    pod_context = pod.get("security_context") or pod.get("securityContext") or {}
+    pod_template = (((workload.get("spec") or {}).get("template") or {}).get("spec") or {})
+    template_context = pod_template.get("securityContext") or {}
+    containers = [
+        *(pod.get("containers") or []),
+        *(pod_template.get("containers") or []),
+    ]
+    container_contexts = [
+        (item.get("security_context") or item.get("securityContext") or {})
+        for item in containers
+        if isinstance(item, dict)
+    ]
+
+    def first_int(*values: Any) -> int | None:
+        for value in values:
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    uid = first_int(
+        *(item.get("runAsUser") for item in container_contexts),
+        pod_context.get("runAsUser"),
+        template_context.get("runAsUser"),
+    )
+    gid = first_int(
+        *(item.get("runAsGroup") for item in container_contexts),
+        pod_context.get("runAsGroup"),
+        template_context.get("runAsGroup"),
+        pod_context.get("fsGroup"),
+        template_context.get("fsGroup"),
+    )
+    run_as_non_root = next(
+        (
+            bool(value)
+            for value in [
+                *(item.get("runAsNonRoot") for item in container_contexts),
+                pod_context.get("runAsNonRoot"),
+                template_context.get("runAsNonRoot"),
+            ]
+            if value is not None
+        ),
+        None,
+    )
+    return {
+        "run_as_user": uid,
+        "run_as_group": gid,
+        "run_as_non_root": run_as_non_root,
+        "non_root_enforced": bool((uid is not None and uid > 0) or run_as_non_root is True),
+    }
+
+
+def _rank_permission_strategies(
+    *,
+    explicit_path_error: bool,
+    database_bootstrap_error: bool,
+    path_on_mount: bool,
+    identity: dict[str, Any],
+    text: str,
+) -> list[dict[str, Any]]:
+    """Rank recovery strategies from evidence instead of a fixed stage list."""
+    capacity_or_corruption = sorted({
+        term for term in CAPACITY_OR_CORRUPTION_TERMS if term in text
+    })
+    root_squash_risk = any(
+        term in text for term in ("root_squash", "rootsquash", "nfs root squash")
+    )
+    root_score = 0.30
+    root_support: list[str] = []
+    root_contradictions: list[str] = []
+    if explicit_path_error:
+        root_score += 0.22
+        root_support.append("application_explicitly_reports_configured_path_not_writable")
+    if database_bootstrap_error:
+        root_score += 0.15
+        root_support.append("database_bootstrap_fails_on_same_data_path")
+    if path_on_mount:
+        root_score += 0.16
+        root_support.append("configured_data_path_is_inside_volume_mount")
+    if identity.get("non_root_enforced"):
+        root_score += 0.14
+        root_support.append("workload_security_context_enforces_non_root_identity")
+    if root_squash_risk:
+        root_score -= 0.30
+        root_contradictions.append("storage_reports_root_squash")
+    if capacity_or_corruption:
+        root_score -= 0.45
+        root_contradictions.extend(capacity_or_corruption)
+
+    nonroot_score = 0.46
+    nonroot_support: list[str] = []
+    if identity.get("non_root_enforced"):
+        nonroot_score += 0.13
+        nonroot_support.append("known_non_root_uid_gid")
+    if path_on_mount:
+        nonroot_score += 0.10
+        nonroot_support.append("volume_mount_can_receive_fs_group")
+    if root_squash_risk:
+        nonroot_score += 0.16
+        nonroot_support.append("root_squash_favors_storage_supported_group_ownership")
+    if explicit_path_error and database_bootstrap_error:
+        nonroot_score -= 0.04
+
+    candidates = [
+        {
+            "strategy_id": "root_workload_security_context",
+            "confidence": round(max(0.0, min(root_score, 0.99)), 4),
+            "hypothesis": "当前非 root 身份无法写入已挂载的数据目录，需把 Pod 与故障容器运行身份提升为 UID/GID 0。",
+            "supporting_evidence": root_support,
+            "contradicting_evidence": root_contradictions,
+            "requires_human_approval": True,
+        },
+        {
+            "strategy_id": "nonroot_group_ownership",
+            "confidence": round(max(0.0, min(nonroot_score, 0.95)), 4),
+            "hypothesis": "卷支持 fsGroup 或目录属组修复，可保持业务容器非 root。",
+            "supporting_evidence": nonroot_support,
+            "contradicting_evidence": (
+                ["application_still_reports_exact_data_path_not_writable"]
+                if explicit_path_error and database_bootstrap_error else []
+            ),
+            "requires_human_approval": True,
+        },
+        {
+            "strategy_id": "path_capacity_or_database_integrity",
+            "confidence": round(0.90 if capacity_or_corruption else 0.28, 4),
+            "hypothesis": "目录容量、I/O 或数据库损坏导致打开失败，而非容器身份权限。",
+            "supporting_evidence": capacity_or_corruption,
+            "contradicting_evidence": (
+                ["configured_path_explicitly_not_writable"]
+                if explicit_path_error and not capacity_or_corruption else []
+            ),
+            "requires_human_approval": False,
+        },
+    ]
+    candidates.sort(key=lambda item: -float(item["confidence"]))
+    return candidates
 
 
 def classify_volume_write_failure(plan: dict[str, Any], summary_text: str = "") -> dict[str, Any]:
@@ -178,6 +345,17 @@ def classify_volume_write_failure(plan: dict[str, Any], summary_text: str = "") 
     })
     direct = sorted({term for term in DIRECT_WRITE_PERMISSION_TERMS if term in text})
     indirect = sorted({term for term in INDIRECT_WRITE_PATH_TERMS if term in text})
+    explicit_path_error = bool(re.search(
+        r"(?:[A-Z][A-Z0-9_]*(?:PATH|PATHS|DATA|DIR)[A-Z0-9_]*\s*=\s*[\"']?/"
+        r"|(?:path|dir(?:ectory)?)\s*[=:]?\s*[\"']?/)[^\n]{0,240}?"
+        r"(?:is\s+)?not\s+writable",
+        text,
+        flags=re.I,
+    ))
+    if explicit_path_error:
+        direct.append("configured_path_is_not_writable")
+        direct = sorted(set(direct))
+    database_bootstrap_error = any(term in text for term in DATABASE_BOOTSTRAP_WRITE_TERMS)
     pod, workload = _pod_and_workload(plan)
     mounts = _mount_paths(pod, workload)
     path = _candidate_path(text)
@@ -192,6 +370,7 @@ def classify_volume_write_failure(plan: dict[str, Any], summary_text: str = "") 
         or any(term in text for term in ("pvc", "persistentvolumeclaim", "volume", "mount"))
     )
     has_security_context = _security_context_present(pod, workload)
+    identity = _configured_identity(pod, workload)
     corroboration = []
     if mounts:
         corroboration.append("container_volume_mount")
@@ -203,7 +382,10 @@ def classify_volume_write_failure(plan: dict[str, Any], summary_text: str = "") 
         corroboration.append("storage_chain")
 
     detected = bool(direct or indirect)
-    if direct:
+    if explicit_path_error and path_on_mount:
+        confidence = 0.99 if database_bootstrap_error and has_security_context else 0.94
+        signal_class = "explicit_mounted_path_not_writable"
+    elif direct:
         confidence = 0.96 if has_storage or has_security_context else 0.84
         signal_class = "direct_permission_error"
     elif indirect:
@@ -215,6 +397,17 @@ def classify_volume_write_failure(plan: dict[str, Any], summary_text: str = "") 
     else:
         confidence = 0.0
         signal_class = "none"
+    strategy_candidates = _rank_permission_strategies(
+        explicit_path_error=explicit_path_error,
+        database_bootstrap_error=database_bootstrap_error,
+        path_on_mount=path_on_mount,
+        identity=identity,
+        text=text,
+    ) if detected else []
+    recommended_strategy = (
+        str((strategy_candidates[0] or {}).get("strategy_id") or "")
+        if strategy_candidates else ""
+    )
     return {
         "detected": detected,
         "confidence": confidence,
@@ -226,6 +419,11 @@ def classify_volume_write_failure(plan: dict[str, Any], summary_text: str = "") 
         "mount_paths": mounts,
         "path_on_mount": path_on_mount,
         "corroboration": corroboration,
+        "explicit_path_error": explicit_path_error,
+        "database_bootstrap_error": database_bootstrap_error,
+        "configured_identity": identity,
+        "strategy_candidates": strategy_candidates,
+        "recommended_strategy": recommended_strategy,
         "requires_write_probe": bool(indirect and confidence < 0.72),
     }
 

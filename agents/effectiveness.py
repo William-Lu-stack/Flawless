@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,10 @@ class RemediationOutcome:
     parent_job_id: str = ""
     lineage_attempt: int = 0
     attempted_strategies: list[dict[str, Any]] = field(default_factory=list)
+    skill_id: str = ""
+    incident_signature: str = ""
+    strategy_id: str = ""
+    symptoms: list[str] = field(default_factory=list)
 
 
 INSPECTION_RUNS: list[InspectionRun] = []
@@ -208,6 +213,70 @@ def _extract_recovered_pods(plan: dict[str, Any], verification: dict[str, Any]) 
     return [pod_name] if pod_name else []
 
 
+def _semantic_symptoms(plan: dict[str, Any]) -> list[str]:
+    evidence = plan.get("_runtime_evidence") or plan.get("evidence") or {}
+    text = json.dumps({
+        "summary": plan.get("summary"),
+        "reason": plan.get("reason"),
+        "logs": evidence.get("logs"),
+        "events": evidence.get("events"),
+        "state": evidence.get("state_text"),
+    }, ensure_ascii=False, default=str).lower()
+    features = {
+        "configured_path_not_writable": (
+            "not writable" in text
+            and any(term in text for term in ("path", "data", "directory", "dir"))
+        ),
+        "database_open_failure": any(term in text for term in (
+            "unable to open database file",
+            "can't open database file",
+            "cannot open database file",
+            "readonly database",
+        )),
+        "permission_denied": any(term in text for term in (
+            "permission denied", "operation not permitted", "read-only file system",
+        )),
+        "pvc_pending": any(term in text for term in (
+            "pvc pending", "persistentvolumeclaim pending", "no persistent volumes available",
+        )),
+        "failed_mount": any(term in text for term in ("failedmount", "failed mount", "mountvolume")),
+        "capacity_exhausted": any(term in text for term in ("no space left", "disk quota exceeded", "filesystem full")),
+        "crash_loop": "crashloopbackoff" in text,
+    }
+    return sorted(name for name, present in features.items() if present)
+
+
+def _strategy_id_from_changes(changes: list[dict[str, Any]], plan: dict[str, Any]) -> str:
+    explicit = str(plan.get("permission_recovery_stage") or plan.get("storage_recovery_stage") or "")
+    if explicit:
+        return "root_workload_security_context" if explicit == "root" else explicit
+
+    def values(value: Any, key: str) -> list[Any]:
+        if isinstance(value, dict):
+            return [
+                *([value[key]] if key in value else []),
+                *(item for child in value.values() for item in values(child, key)),
+            ]
+        if isinstance(value, list):
+            return [item for child in value for item in values(child, key)]
+        return []
+
+    patches = [item.get("patch") or {} for item in changes if isinstance(item, dict)]
+    run_as_users = [item for patch in patches for item in values(patch, "runAsUser")]
+    fs_groups = [item for patch in patches for item in values(patch, "fsGroup")]
+    if 0 in run_as_users and 0 in fs_groups:
+        return "root_workload_security_context"
+    if any(isinstance(item, int) and item > 0 for item in run_as_users):
+        return "nonroot_group_ownership"
+    return str((changes[0] if changes else {}).get("type") or "")
+
+
+def _incident_signature(plan: dict[str, Any], symptoms: list[str]) -> str:
+    target_kind = str(plan.get("target") or "").split("/", 1)[0].lower()
+    material = "|".join([target_kind, *symptoms])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16] if material else ""
+
+
 def _record_inspection_in_memory(scope_cluster: str, scope_namespace: str, payload: dict[str, Any], model_id: str = "") -> dict[str, Any]:
     findings = payload.get("findings") or []
     affected_pods = {f.get("name") for f in findings if f.get("name")}
@@ -250,6 +319,7 @@ def _record_remediation_in_memory(plan: dict[str, Any], result: dict[str, Any], 
     verification = result.get("verification") or {}
     continuation = result.get("continuation_context") if isinstance(result.get("continuation_context"), dict) else {}
     recovered_pods = _extract_recovered_pods(plan, verification)
+    symptoms = _semantic_symptoms(plan)
     pods_recovered = int(
         result.get("pods_recovered")
         or len(recovered_pods)
@@ -281,6 +351,10 @@ def _record_remediation_in_memory(plan: dict[str, Any], result: dict[str, Any], 
         parent_job_id=str(continuation.get("parent_job_id") or plan.get("_parent_job_id") or ""),
         lineage_attempt=int(continuation.get("attempt_count") or plan.get("_prior_attempt_count") or 0),
         attempted_strategies=_redact(continuation.get("attempts") or plan.get("_prior_attempts") or [])[-12:],
+        skill_id=str(plan.get("selected_skill_id") or ""),
+        incident_signature=_incident_signature(plan, symptoms),
+        strategy_id=_strategy_id_from_changes(changes, plan),
+        symptoms=symptoms,
     )
     REMEDIATION_OUTCOMES.append(outcome)
     del REMEDIATION_OUTCOMES[:-500]
@@ -293,6 +367,71 @@ def record_remediation(plan: dict[str, Any], result: dict[str, Any], model_id: s
         recorded = _record_remediation_in_memory(plan, result, model_id)
         recorded["storage"] = _persist_state()
         return recorded
+
+
+def successful_remediation_hint(plan: dict[str, Any], skill_id: str = "") -> dict[str, Any]:
+    """Find a previously verified strategy without replaying its old approval.
+
+    Only the strategy identity and evidence similarity are returned. The caller
+    must rebuild a fresh patch from current YAML and request a new approval.
+    """
+    with _STORE_LOCK:
+        _ensure_store_loaded()
+        current_target = str(plan.get("target") or "")
+        current_symptoms = set(_semantic_symptoms(plan))
+        current_signature = _incident_signature(plan, sorted(current_symptoms))
+        candidates: list[dict[str, Any]] = []
+        for outcome in reversed(REMEDIATION_OUTCOMES):
+            row = asdict(outcome)
+            verification = row.get("verification") or {}
+            if not (
+                verification.get("recovered") is True
+                or (row.get("risk_reduced") and row.get("status") == "completed")
+            ):
+                continue
+            strategy_id = str(
+                row.get("strategy_id")
+                or _strategy_id_from_changes(row.get("changes") or [], {})
+            )
+            if not strategy_id:
+                continue
+            score = 0.0
+            support: list[str] = []
+            if current_target and row.get("target") == current_target:
+                score += 0.58
+                support.append("same_workload_target")
+            previous_symptoms = set(row.get("symptoms") or [])
+            overlap = current_symptoms & previous_symptoms
+            if overlap:
+                score += min(0.28, 0.10 + 0.09 * len(overlap))
+                support.append(f"shared_symptoms:{','.join(sorted(overlap))}")
+            if current_signature and row.get("incident_signature") == current_signature:
+                score += 0.18
+                support.append("same_semantic_incident_signature")
+            if skill_id and row.get("skill_id") == skill_id:
+                score += 0.08
+                support.append("same_executable_skill")
+            # Backward-compatible records may not have semantic fields. Exact
+            # target + a verified root patch is still a strong reusable hint.
+            if (
+                current_target
+                and row.get("target") == current_target
+                and strategy_id == "root_workload_security_context"
+            ):
+                score = max(score, 0.86)
+                support.append("legacy_verified_root_patch_on_same_target")
+            candidates.append({
+                "strategy_id": strategy_id,
+                "confidence": round(min(score, 0.99), 4),
+                "supporting_evidence": list(dict.fromkeys(support)),
+                "record_id": row.get("id") or "",
+                "verified_at": row.get("timestamp") or "",
+            })
+        candidates.sort(
+            key=lambda item: (float(item["confidence"]), str(item["verified_at"])),
+            reverse=True,
+        )
+        return candidates[0] if candidates and float(candidates[0]["confidence"]) >= 0.72 else {}
 
 
 def _summary_in_memory() -> dict[str, Any]:
