@@ -86,8 +86,8 @@ names=(
   "Approved Node Executor"
 )
 sources=(
-  "m.daocloud.io/ghcr.io/your-org/flawless:3.2.7"
-  "m.daocloud.io/ghcr.io/your-org/flawless-node-exec:1.36"
+  "ghcr.dockerproxy.net/your-org/flawless:3.2.7"
+  "ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36"
 )
 targets=(
   "your-org/flawless:3.2.7"

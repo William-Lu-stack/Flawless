@@ -10,7 +10,7 @@ fullnameOverride: k8s-agent
 namespaceOverride: k8s-agent
 
 image:
-  repository: m.daocloud.io/ghcr.io/your-org/flawless
+  repository: ghcr.dockerproxy.net/your-org/flawless
   tag: 3.2.7
   pullPolicy: IfNotPresent
 
@@ -198,4 +198,4 @@ config:
   WRITE_RATE_LIMIT_PER_MINUTE: "120"
 
   NODE_EXEC_NAMESPACE: flawless-node-exec
-  NODE_EXEC_IMAGE: m.daocloud.io/ghcr.io/your-org/flawless-node-exec:1.36
+  NODE_EXEC_IMAGE: ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36

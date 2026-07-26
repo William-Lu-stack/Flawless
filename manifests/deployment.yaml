@@ -171,7 +171,7 @@ data:
   NODE_EXEC_NAMESPACE: flawless-node-exec
   OPS_LLM_PLANNER_TIMEOUT_SECONDS: '60'
   OPS_LLM_PLANNER_MAX_TOKENS: '4096'
-  NODE_EXEC_IMAGE: m.daocloud.io/ghcr.io/your-org/flawless-node-exec:1.36
+  NODE_EXEC_IMAGE: ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36
   AUTO_OPS_MAX_ATTEMPTS: '4'
   OPS_CONTINUATION_INTERVAL_SECONDS: '30'
   OPS_STEP_APPROVAL_TIMEOUT_SECONDS: '0'
@@ -272,7 +272,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: mcp-server
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.7
+        image: ghcr.dockerproxy.net/your-org/flawless:3.2.7
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -310,7 +310,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: observability-agent
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.7
+        image: ghcr.dockerproxy.net/your-org/flawless:3.2.7
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -367,7 +367,7 @@ spec:
             cpu: 1
             memory: 1Gi
       - name: healing-agent
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.7
+        image: ghcr.dockerproxy.net/your-org/flawless:3.2.7
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -405,7 +405,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: incident-agent
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.7
+        image: ghcr.dockerproxy.net/your-org/flawless:3.2.7
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -443,7 +443,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: postmortem-agent
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.7
+        image: ghcr.dockerproxy.net/your-org/flawless:3.2.7
         imagePullPolicy: Always
         command:
         - sh
@@ -495,7 +495,7 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 3
       - name: openwebui-adapter
-        image: m.daocloud.io/ghcr.io/your-org/flawless:3.2.7
+        image: ghcr.dockerproxy.net/your-org/flawless:3.2.7
         imagePullPolicy: Always
         command:
         - uvicorn

@@ -94,9 +94,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ($ImageMode -eq "public-cn") {
-    $appRepository = "m.daocloud.io/ghcr.io/your-org/flawless"
+    $appRepository = "ghcr.dockerproxy.net/your-org/flawless"
     $appTag = "3.2.7"
-    $nodeExecutorImage = "m.daocloud.io/ghcr.io/your-org/flawless-node-exec:1.36"
+    $nodeExecutorImage = "ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36"
 } else {
     $registry = $PrivateRegistry.Trim().TrimEnd('/')
     if (-not $registry -or $registry -match '://') {

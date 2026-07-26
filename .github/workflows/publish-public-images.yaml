@@ -117,8 +117,8 @@ jobs:
           set -euo pipefail
           short_sha="${GITHUB_SHA::7}"
           owner="${GITHUB_REPOSITORY_OWNER,,}"
-          app_image="m.daocloud.io/ghcr.io/${owner}/flawless:sha-${short_sha}"
-          node_image="m.daocloud.io/ghcr.io/${owner}/flawless-node-exec:1.36"
+          app_image="ghcr.dockerproxy.net/${owner}/flawless:sha-${short_sha}"
+          node_image="ghcr.dockerproxy.net/${owner}/flawless-node-exec:1.36"
 
           for image in "$app_image" "$node_image"; do
             pulled=false

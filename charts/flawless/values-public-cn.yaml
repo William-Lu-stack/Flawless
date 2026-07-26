@@ -1,11 +1,11 @@
-# Public multi-architecture images routed through DaoCloud's mainland mirror.
+# Public multi-architecture images routed through a mainland-accessible GHCR proxy.
 # Keep immutable tags in production; avoid `latest` so mirror caches stay deterministic.
 image:
-  repository: m.daocloud.io/ghcr.io/your-org/flawless
+  repository: ghcr.dockerproxy.net/your-org/flawless
   tag: 3.2.7
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
 
 config:
-  NODE_EXEC_IMAGE: m.daocloud.io/ghcr.io/your-org/flawless-node-exec:1.36
+  NODE_EXEC_IMAGE: ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36
