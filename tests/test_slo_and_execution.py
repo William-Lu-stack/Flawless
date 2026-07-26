@@ -1452,9 +1452,9 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         os.environ["AUTO_OPS_STATIC_PV_NFS_SERVER"] = "192.0.2.10"
         os.environ["AUTO_OPS_STATIC_PV_NFS_BASE_PATH"] = "/exports"
         try:
-            with patch.object(server, "_collect_plan_deep_evidence", AsyncMock(return_value=evidence)), patch.object(
-                server, "_execute_change", AsyncMock()
-            ) as execute_change:
+            with patch.dict(os.environ, {"ALLOWED_NAMESPACES": "k8s-agent"}), patch.object(
+                server, "_collect_plan_deep_evidence", AsyncMock(return_value=evidence)
+            ), patch.object(server, "_execute_change", AsyncMock()) as execute_change:
                 result = await server._execute_ops_plan_once(plan, summarize=False)
             self.assertEqual(result["status"], "planned")
             self.assertFalse(result["executed"])
