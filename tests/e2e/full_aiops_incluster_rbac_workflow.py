@@ -24,7 +24,7 @@ KUBECTL = os.getenv("E2E_KUBECTL", "kubectl")
 PLATFORM_IMAGE = os.getenv("E2E_PLATFORM_IMAGE", "flawless-local:latest")
 WORKLOAD_IMAGE = os.getenv("E2E_WORKLOAD_IMAGE", PLATFORM_IMAGE)
 LLM_API_BASE = os.environ["E2E_LLM_API_BASE"]
-LLM_API_KEY = os.environ["E2E_LLM_API_KEY"]
+LLM_API_KEY = os.environ.get("E2E_LLM_API_KEY", "")
 LLM_MODEL = os.getenv("E2E_LLM_MODEL", "deepseek-v4-pro")
 BASE_URL = os.getenv("E2E_BASE_URL", "http://127.0.0.1:18081").rstrip("/")
 PLATFORM_NAMESPACE = "k8s-agent"
@@ -34,6 +34,9 @@ TARGET_NAMESPACE = os.getenv(
 )
 WORKLOAD = "security-context-file-writer"
 TIMEOUT_SECONDS = int(os.getenv("E2E_TIMEOUT_SECONDS", "360"))
+
+if not LLM_API_KEY:
+    raise RuntimeError("E2E_LLM_API_KEY must be provided at runtime")
 
 
 def kubectl(*args: str, stdin: dict | None = None, check: bool = True) -> str:
