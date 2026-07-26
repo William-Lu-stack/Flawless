@@ -7,6 +7,7 @@ SRE Graph — 核心编排引擎 (本地化版)
   - 通过 MCP client 调用 k8s-mcp-server（不再用 fake 数据）
   - 证书校验由 OUTBOUND_VERIFY_SSL 控制，生产建议开启并配置企业 CA
 """
+import asyncio
 import os
 import json
 import uuid
@@ -404,9 +405,19 @@ async def diagnose(state: SREState) -> SREState:
     model_profile_id = state.get("model_profile_id") or alert.get("model_profile_id") or ""
     target_pod = context.get("pod") or {}
     scoped_pods = [target_pod] if target_pod and (alert.get("deployment") or alert.get("workload_name") or alert.get("pod")) else context.get("pods", {}).get("pods", [])[:5]
+    configured_diagnosis_tokens = int(os.getenv("LLM_DIAGNOSIS_MAX_TOKENS", "1400"))
+    # DeepSeek reasoning-compatible endpoints can consume a substantial part
+    # of the completion budget before emitting the final JSON. A truncated,
+    # empty final answer must not silently turn every diagnosis into fallback.
+    diagnosis_model_hint = os.getenv("LLM_MODEL", "").lower()
+    diagnosis_max_tokens = (
+        max(4096, configured_diagnosis_tokens)
+        if "deepseek" in diagnosis_model_hint
+        else configured_diagnosis_tokens
+    )
     llm = get_llm(
         temperature=0.1,
-        max_tokens=int(os.getenv("LLM_DIAGNOSIS_MAX_TOKENS", "1400")),
+        max_tokens=diagnosis_max_tokens,
         profile_id=model_profile_id or None,
         profile_override=state.get("model_profile_override") or None,
     )
@@ -498,7 +509,28 @@ Deep evidence: {json.dumps(safe_diagnostics, ensure_ascii=False)[:14000]}
 只返回 JSON，不要任何其他内容。"""
 
     try:
-        response = llm.invoke(prompt)
+        diagnosis_timeout = max(
+            0.05,
+            min(float(os.getenv("SRE_DIAGNOSIS_TIMEOUT_SECONDS", "35")), 180.0),
+        )
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                llm.invoke,
+                prompt,
+                response_format={"type": "json_object"},
+            ),
+            timeout=diagnosis_timeout,
+        )
+        if not str(getattr(response, "content", "") or "").strip():
+            metadata = getattr(response, "response_metadata", {}) or {}
+            reasoning = (getattr(response, "additional_kwargs", {}) or {}).get(
+                "reasoning_content"
+            )
+            raise RuntimeError(
+                "LLM returned no final diagnosis JSON"
+                f" (finish_reason={metadata.get('finish_reason') or 'unknown'},"
+                f" reasoning_content={bool(reasoning)}, max_tokens={diagnosis_max_tokens})"
+            )
         diagnosis = _extract_json_object(response.content)
 
         # 安全获取 token 用量
@@ -674,14 +706,40 @@ def _fallback_diagnosis(alert: dict, context: dict) -> dict:
         for c in p.get("containers", [])
     ) or any(term in evidence_text for term in ("crashloopbackoff", "back-off restarting", "imagepullbackoff", "errimagepull"))
 
-    if any(term in evidence_text for term in ("permission denied", "can't create directory", "cannot create directory", "read-only file system")):
+    explicit_write_failure = any(term in evidence_text for term in (
+        "permission denied",
+        "can't create directory",
+        "cannot create directory",
+        "read-only file system",
+        " is not writable",
+        "data directory is not writable",
+        "attempt to write a readonly database",
+        "attempt to write a read-only database",
+    ))
+    wrapped_write_failure = any(term in evidence_text for term in (
+        "unable to open database file",
+        "can't open database file",
+        "cannot open database file",
+        "failed to create lock file",
+        "failed to open pid file",
+        "failed to create wal",
+    ))
+    has_volume_evidence = any(term in evidence_text for term in (
+        "volume_mount", "volumemount", "mount_path", "mountpath", "persistentvolumeclaim",
+    ))
+    has_nonroot_evidence = any(term in evidence_text for term in (
+        '"runasnonroot": true', '"run_as_non_root": true',
+        '"runasuser": 472', '"run_as_user": 472',
+        '"runasuser": 1000', '"run_as_user": 1000',
+    ))
+    if explicit_write_failure or (wrapped_write_failure and has_volume_evidence and has_nonroot_evidence):
         return {
-            "root_cause": "容器日志显示写入目录权限不足，优先怀疑挂载卷属主/属组、运行用户或底层存储目录权限不匹配。",
+            "root_cause": "日志中的目录不可写或数据库/锁文件打开失败，与挂载和非 root securityContext 形成旁证，优先怀疑卷属主/属组和运行 UID/GID 不匹配。",
             "impact": "目标 Pod 无法完成启动或业务初始化，Workload 可用副本可能不足。",
             "confidence": 0.86,
             "risk_level": "high",
             "blast_radius": "目标 Workload 及依赖其提供服务的上游调用会受影响。",
-            "signals": [{"source": "logs", "finding": "命中 permission denied / mkdir 目录创建失败"}],
+            "signals": [{"source": "logs+workload_spec", "finding": "目录/数据库写入失败，并与 volumeMount、非 root securityContext 交叉验证"}],
             "immediate_actions": [
                 {"title": "读取 previous logs", "description": "确认失败发生在启动初始化阶段还是业务运行阶段。", "probe": "previous_logs"},
                 {"title": "核对运行用户和挂载点", "description": "检查 runAsUser/runAsGroup、volumeMount 和 PVC/PV。", "probe": "pod_security_context"},

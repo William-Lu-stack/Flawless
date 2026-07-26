@@ -2,9 +2,10 @@ import asyncio
 import httpx
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -19,6 +20,62 @@ from backend.app.services.external_traffic import build_external_traffic_payload
 
 
 class ErrorBudgetTests(unittest.TestCase):
+    def test_kubernetes_patch_redaction_keeps_deep_approval_values_visible(self):
+        patch = {
+            "pending_approval": {
+                "change": {
+                    "patch": {
+                        "spec": {
+                            "template": {
+                                "spec": {
+                                    "containers": [{
+                                        "name": "grafana",
+                                        "securityContext": {
+                                            "runAsUser": 10001,
+                                            "runAsGroup": 10001,
+                                            "runAsNonRoot": True,
+                                        },
+                                    }],
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+        redacted = server._redact_sensitive(patch)
+        security_context = redacted["pending_approval"]["change"]["patch"]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
+        self.assertEqual(security_context["runAsUser"], 10001)
+        self.assertEqual(security_context["runAsGroup"], 10001)
+        self.assertTrue(security_context["runAsNonRoot"])
+
+    def test_deepseek_structured_json_disables_thinking_by_default(self):
+        from agents import llm_client
+
+        response = MagicMock()
+        response.json.return_value = {
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": '{"status":"ok"}'},
+            }],
+            "usage": {},
+        }
+        with patch.object(llm_client._gateway_client, "post", return_value=response) as post:
+            model = llm_client.GatewayChatModel(
+                model_name="deepseek-v4-flash",
+                base_url="https://model.example/v1",
+                auth_type="none",
+            )
+            result = model.invoke(
+                "只返回 JSON",
+                response_format={"type": "json_object"},
+            )
+        self.assertEqual(result.content, '{"status":"ok"}')
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+
     def test_default_production_slo_is_99_9(self):
         budget = evaluate_error_budget({"service": "svc", "window_days": 30})
         self.assertEqual(budget["target_percent"], 99.9)
@@ -488,6 +545,186 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 timeout_seconds=0.05,
                 heartbeat_seconds=0.01,
             )
+
+    async def test_stage_timeout_is_not_defeated_by_cancellation_resistant_child(self):
+        async def resists_one_cancel():
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)
+
+        started = time.monotonic()
+        with self.assertRaises(StageTimeoutError):
+            await run_with_heartbeat(
+                resists_one_cancel(),
+                stage="resistant",
+                timeout_seconds=0.05,
+                heartbeat_seconds=0.01,
+                cleanup_grace_seconds=0.01,
+            )
+        self.assertLess(time.monotonic() - started, 0.15)
+
+    async def test_slow_heartbeat_sink_cannot_block_stage_completion(self):
+        async def work():
+            await asyncio.sleep(0.06)
+            return "recovered"
+
+        async def blocked_sink(_elapsed, _remaining):
+            await asyncio.sleep(5)
+
+        started = time.monotonic()
+        result = await run_with_heartbeat(
+            work(),
+            stage="repair",
+            timeout_seconds=0.3,
+            heartbeat_seconds=0.01,
+            heartbeat_timeout_seconds=0.01,
+            cleanup_grace_seconds=0.01,
+            on_heartbeat=blocked_sink,
+        )
+        self.assertEqual(result, "recovered")
+        self.assertLess(time.monotonic() - started, 0.2)
+
+    async def test_permission_evidence_bypasses_generic_runbook_and_llm(self):
+        plan = {
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "summary": "CrashLoopBackOff",
+            "_runtime_evidence": {
+                "logs": {
+                    "grafana": {
+                        "current": (
+                            "GF_PATHS_DATA='/var/lib/grafana' is not writable\n"
+                            "failed to open database file /var/lib/grafana/grafana.db"
+                        )
+                    }
+                },
+                "pod": {
+                    "name": "grafana-bad",
+                    "security_context": {"runAsUser": 472, "runAsGroup": 472},
+                    "containers": [{
+                        "name": "grafana",
+                        "security_context": {"runAsUser": 472, "runAsGroup": 472},
+                        "volume_mounts": [{"name": "data", "mount_path": "/var/lib/grafana"}],
+                    }],
+                },
+                "workload": {
+                    "kind": "Deployment",
+                    "metadata": {"name": "grafana", "namespace": "monitoring"},
+                    "spec": {"template": {"spec": {
+                        "securityContext": {"runAsUser": 472, "runAsGroup": 472},
+                    }}},
+                },
+            },
+        }
+        generic = {
+            "runbook_id": "generic_crashloop",
+            "reason": "container repeatedly exits",
+            "hypotheses": [{"confidence": 0.81}],
+            "changes": [],
+            "steps": [],
+        }
+        materialized = {
+            **plan,
+            "selected_skill_id": "volume-write-permission-recovery",
+            "permission_recovery_stage": "nonroot_group",
+            "changes": [{"type": "patch_workload_runtime_security"}],
+        }
+        with patch.object(server, "build_remediation_plan", return_value=generic), patch.object(
+            server,
+            "_materialize_executable_skill",
+            return_value=materialized,
+        ) as skill_runtime, patch(
+            "agents.llm_client.get_llm",
+        ) as llm_factory:
+            replans = await server._evidence_based_replan(plan, [], set(), include_llm=True)
+        self.assertEqual(replans[0]["selected_skill_id"], "volume-write-permission-recovery")
+        self.assertEqual(plan["_runtime_replan"]["runbook_id"], "storage_permission")
+        skill_runtime.assert_called_once()
+        llm_factory.assert_not_called()
+
+    async def test_ops_progress_does_not_wait_for_record_store_io(self):
+        job_id = "ops-nonblocking-store"
+        server.OPS_JOBS[job_id] = {
+            "id": job_id,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "events": [],
+        }
+
+        def slow_persist(_snapshot=None):
+            time.sleep(0.2)
+
+        old_task = server.OPS_JOB_PERSIST_TASK
+        old_dirty = server.OPS_JOB_PERSIST_DIRTY
+        server.OPS_JOB_PERSIST_TASK = None
+        server.OPS_JOB_PERSIST_DIRTY = False
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+                server,
+                "OPS_JOB_STORE_PATH",
+                Path(temp_dir) / "ops-jobs.json",
+            ), patch.object(server, "_persist_ops_jobs", side_effect=slow_persist), patch.dict(
+                os.environ,
+                {"OPS_JOB_STORE_DEBOUNCE_SECONDS": "0.01"},
+            ):
+                started = time.monotonic()
+                await server._append_ops_job_event(job_id, "diagnosing", "根因诊断")
+                self.assertLess(time.monotonic() - started, 0.05)
+                task = server.OPS_JOB_PERSIST_TASK
+                if task:
+                    await asyncio.wait_for(task, timeout=1)
+        finally:
+            server.OPS_JOBS.pop(job_id, None)
+            server.OPS_JOB_PERSIST_TASK = old_task
+            server.OPS_JOB_PERSIST_DIRTY = old_dirty
+
+    async def test_sre_diagnosis_timeout_falls_back_without_blocking_event_loop(self):
+        from agents import sre_graph
+
+        class BlockingLLM:
+            model_name = "blocked-model"
+            profile_id = "timeout-test"
+
+            def invoke(self, _prompt, **_kwargs):
+                time.sleep(0.2)
+                raise RuntimeError("late model failure")
+
+        state = {
+            "alert": {
+                "alert_name": "KubePodCrashLooping",
+                "namespace": "monitoring",
+                "deployment": "grafana",
+            },
+            "k8s_context": {
+                "pods": {"pods": []},
+                "events": {"events": []},
+                "logs": {
+                    "grafana": {
+                        "current": (
+                            "GF_PATHS_DATA='/var/lib/grafana' is not writable; "
+                            "unable to open database file"
+                        )
+                    }
+                },
+                "pod": {
+                    "containers": [{
+                        "name": "grafana",
+                        "security_context": {"runAsUser": 472, "runAsNonRoot": True},
+                        "volume_mounts": [{"mount_path": "/var/lib/grafana"}],
+                    }]
+                },
+            },
+        }
+        with patch.object(sre_graph, "get_llm", return_value=BlockingLLM()), patch.dict(
+            os.environ,
+            {"SRE_DIAGNOSIS_TIMEOUT_SECONDS": "0.05"},
+        ):
+            started = time.monotonic()
+            result = await sre_graph.diagnose(state)
+        self.assertLess(time.monotonic() - started, 0.15)
+        diagnosis = result["diagnosis"]
+        self.assertEqual(diagnosis["diagnosis_metadata"]["source"], "fallback")
+        self.assertIn("UID/GID", diagnosis["root_cause"])
 
     async def test_recovery_verification_stops_immediately_on_terminal_failure(self):
         terminal = {

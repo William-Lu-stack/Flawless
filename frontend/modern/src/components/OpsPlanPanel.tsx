@@ -24,7 +24,7 @@ const ACTIVE_STATUSES = new Set(["queued", "running", "awaiting_approval", "resu
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "unresolved", "blocked"]);
 const ACTIVE_EVENT_STAGES = new Set([
   "queued", "starting", "attempt", "collecting_evidence", "step_start", "step_waiting",
-  "diagnosing", "diagnosis_waiting", "skill_routed", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
+  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "skill_routed", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
   "continuation_wait", "resume_pending",
 ]);
 const EXECUTION_PHASES = ["采集证据", "根因诊断", "提交变更", "恢复验证"];
@@ -58,6 +58,8 @@ function stageLabel(stage: unknown) {
     log_triage_done: "日志分级完成",
     diagnosing: "根因诊断",
     diagnosis_waiting: "根因诊断进行中",
+    root_cause_diagnosing: "根因诊断进行中",
+    root_cause_diagnosed: "根因诊断完成",
     diagnosis_done: "根因诊断完成",
     skill_routed: "Skill 动态路由",
     step_waiting: "诊断进行中",
@@ -72,7 +74,7 @@ function stageLabel(stage: unknown) {
     stage_timeout: "阶段超时",
     verifying: "恢复验证",
     verification_done: "验证完成",
-    replanning: "策略重规划",
+    replanning: "失败后根因重诊断",
     summarizing: "生成结论",
     strategy_switch: "切换策略",
     continuation_wait: "等待持续复检",
@@ -124,7 +126,7 @@ function eventIcon(event: any, active: boolean) {
 function phaseIndex(stage: unknown) {
   const value = String(stage || "");
   if (["queued", "starting", "attempt", "release_gate", "collecting_evidence", "collecting_evidence_done"].includes(value)) return 0;
-  if (["log_triage_done", "diagnosing", "diagnosis_waiting", "diagnosis_done", "skill_routed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
+  if (["log_triage_done", "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "root_cause_diagnosed", "diagnosis_done", "skill_routed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
   if (["awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting", "change_done"].includes(value)) return 2;
   if (["verifying", "verification_done", "recovered"].includes(value)) return 3;
   return 1;
@@ -135,7 +137,7 @@ function completedPhase(stage: unknown) {
   if (["verification_done", "recovered"].includes(value)) return 3;
   if (["change_done", "verifying"].includes(value)) return 2;
   if (value === "collecting_evidence_done") return 0;
-  if (["diagnosis_done", "strategy_switch", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting"].includes(value)) return 1;
+  if (["root_cause_diagnosed", "diagnosis_done", "strategy_switch", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting"].includes(value)) return 1;
   return -1;
 }
 
@@ -414,7 +416,7 @@ export function OpsJobProgress({
         <span className={classNames("job-dot", active && "active", statusClass)} />
         <div>
           <strong>{currentJob?.message || stageLabel(currentJob?.stage)}</strong>
-          <small>{currentJob?.status || "running"} · {stageLabel(currentJob?.stage)} · 故障链第 {currentJob?.lineage_attempt || currentJob?.attempt || 0} 轮 · {currentJob?.continuous_until_recovered ? "持续到恢复验证成功或人工中断" : `本任务上限 ${currentJob?.max_attempts || 1} 轮`}</small>
+          <small>{currentJob?.status || "running"} · {stageLabel(currentJob?.stage)} · 后端 {currentJob?.worker_build_version || "unknown"} · 故障链第 {currentJob?.lineage_attempt || currentJob?.attempt || 0} 轮 · {currentJob?.continuous_until_recovered ? "持续到恢复验证成功或人工中断" : `本任务上限 ${currentJob?.max_attempts || 1} 轮`}</small>
         </div>
         {active && onCancel && <button className="ghost tiny" onClick={onCancel}><Square size={13} />中断</button>}
       </div>

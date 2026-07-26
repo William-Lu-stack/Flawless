@@ -16,7 +16,13 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.7**.
+Current release: **3.2.8**.
+
+Release 3.2.8 makes root-cause planning preemptible and observable, including
+explicit diagnosis stages, bounded model/persistence calls, DeepSeek-compatible
+structured routing, and deterministic Skill fallback. The progressive volume
+permission Skill now keeps the incident open through non-root remediation,
+approved root escalation, new-Pod verification, and independent recovery proof.
 
 Release 3.2 adds persistent remediation lineage: every failed strategy, action,
 verification result, and replacement plan stays linked across operator-approved

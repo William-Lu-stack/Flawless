@@ -185,6 +185,22 @@ class GatewayChatModel(BaseChatModel):
         if stop:
             payload["stop"] = stop
         payload.update(kwargs)
+        if (
+            payload.get("response_format") == {"type": "json_object"}
+            and "deepseek" in self.model_name.lower()
+            and "thinking" not in payload
+        ):
+            # Structured routers need a short, complete JSON contract. DeepSeek
+            # v4 enables thinking by default, which can consume the completion
+            # budget and leave the JSON truncated. Keep deep reasoning for free
+            # form diagnosis, but default JSON control-plane calls to the
+            # documented non-thinking mode unless explicitly overridden.
+            thinking_mode = os.getenv(
+                "LLM_STRUCTURED_THINKING_MODE",
+                "disabled",
+            ).strip().lower()
+            if thinking_mode in {"enabled", "disabled"}:
+                payload["thinking"] = {"type": thinking_mode}
 
         base = self.base_url.rstrip("/")
         url = base if base.endswith("/chat/completions") else base + "/chat/completions"
@@ -200,14 +216,26 @@ class GatewayChatModel(BaseChatModel):
         data = response.json()
 
         choice = data["choices"][0]
-        content = choice.get("message", {}).get("content") or choice.get("text") or ""
+        message_payload = choice.get("message") or {}
+        content = message_payload.get("content") or choice.get("text") or ""
+        reasoning_content = (
+            message_payload.get("reasoning_content")
+            or message_payload.get("reasoning")
+            or ""
+        )
         usage = _usage_dict(data.get("usage"))
         message = AIMessage(
             content=content,
+            additional_kwargs=(
+                {"reasoning_content": reasoning_content}
+                if reasoning_content else {}
+            ),
             response_metadata={
                 "model": data.get("model", self.model_name),
                 "model_profile_id": self.profile_id,
                 "token_usage": usage,
+                "finish_reason": choice.get("finish_reason"),
+                "has_reasoning_content": bool(reasoning_content),
             },
         )
         return ChatResult(

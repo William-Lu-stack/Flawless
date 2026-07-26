@@ -187,8 +187,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.7")
-APP_CODE_SIGNATURE = "severity-first-progressive-recovery-v12"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.8")
+APP_CODE_SIGNATURE = "preemptible-root-cause-recovery-v13"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -220,6 +220,12 @@ async def startup_build_banner():
 @app.on_event("shutdown")
 async def shutdown_http_clients():
     global RANCHER_HTTP_CLIENT
+    persist_task = OPS_JOB_PERSIST_TASK
+    if persist_task is not None and not persist_task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(persist_task), timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            persist_task.cancel()
     if RANCHER_HTTP_CLIENT is not None:
         await RANCHER_HTTP_CLIENT.aclose()
         RANCHER_HTTP_CLIENT = None
@@ -532,6 +538,8 @@ OPS_JOB_STEP_APPROVAL_EVENTS: dict[str, asyncio.Event] = {}
 OPS_JOBS_LOCK = asyncio.Lock()
 OPS_JOB_STORE_PATH = Path(os.getenv("OPS_JOB_STORE_PATH", "").strip()) if os.getenv("OPS_JOB_STORE_PATH", "").strip() else None
 OPS_JOB_STORE_ERROR = ""
+OPS_JOB_PERSIST_TASK: asyncio.Task | None = None
+OPS_JOB_PERSIST_DIRTY = False
 RATE_LIMIT_WINDOWS: dict[str, tuple[float, int]] = {}
 RELIABILITY_STORE = ReliabilityStore()
 OPS_SKILL_REGISTRY = OpsSkillRegistry(OPS_SKILL_ROOT, legacy_path=OPS_SKILL_STORE_PATH)
@@ -640,7 +648,10 @@ def _redact_text(value: str) -> str:
 
 
 def _redact_sensitive(value, depth: int = 0):
-    if depth > 8:
+    # A normal Kubernetes workload patch reaches 10+ levels
+    # (spec.template.spec.containers[].securityContext.*). Keep the safety
+    # ceiling, but do not hide the exact values an operator must approve.
+    if depth > 20:
         return "[REDACTED:MAX_DEPTH]"
     if isinstance(value, dict):
         secret_object = str(value.get("kind") or "").lower() == "secret"
@@ -670,7 +681,7 @@ def _compact_dict(value, limit: int = 2000):
         return text[:limit]
 
 
-def _persist_ops_jobs() -> None:
+def _persist_ops_jobs(jobs_snapshot: list[dict] | None = None) -> None:
     """Persist public, redacted job lineage; live asyncio events remain process-local."""
     global OPS_JOB_STORE_ERROR
     if OPS_JOB_STORE_PATH is None:
@@ -681,7 +692,7 @@ def _persist_ops_jobs() -> None:
             days=max(1, int(os.getenv("OPS_RECORD_RETENTION_DAYS", "365")))
         )
         retained_jobs = []
-        for job in OPS_JOBS.values():
+        for job in (jobs_snapshot if jobs_snapshot is not None else list(OPS_JOBS.values())):
             try:
                 created_at = datetime.fromisoformat(str(job.get("created_at") or "").replace("Z", "+00:00"))
             except (TypeError, ValueError):
@@ -702,6 +713,50 @@ def _persist_ops_jobs() -> None:
         OPS_JOB_STORE_ERROR = ""
     except Exception as exc:
         OPS_JOB_STORE_ERROR = f"{type(exc).__name__}: {_redact_text(str(exc))}"
+
+
+async def _flush_ops_jobs_debounced() -> None:
+    """Coalesce audit writes and keep serialization/I/O off the API event loop."""
+    global OPS_JOB_PERSIST_DIRTY, OPS_JOB_PERSIST_TASK, OPS_JOB_STORE_ERROR
+    try:
+        while OPS_JOB_PERSIST_DIRTY:
+            OPS_JOB_PERSIST_DIRTY = False
+            await asyncio.sleep(
+                max(0.01, min(float(os.getenv("OPS_JOB_STORE_DEBOUNCE_SECONDS", "0.15")), 2.0))
+            )
+            snapshot = list(OPS_JOBS.values())
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(_persist_ops_jobs, snapshot),
+                    timeout=max(
+                        0.25,
+                        min(float(os.getenv("OPS_JOB_STORE_WRITE_TIMEOUT_SECONDS", "5")), 30.0),
+                    ),
+                )
+            except asyncio.TimeoutError:
+                OPS_JOB_STORE_ERROR = (
+                    "TimeoutError: operation record persistence exceeded its bounded write timeout"
+                )
+    finally:
+        OPS_JOB_PERSIST_TASK = None
+        if OPS_JOB_PERSIST_DIRTY:
+            _schedule_ops_jobs_persistence()
+
+
+def _schedule_ops_jobs_persistence() -> None:
+    """Schedule one non-blocking persistence pass; repeated events are coalesced."""
+    global OPS_JOB_PERSIST_DIRTY, OPS_JOB_PERSIST_TASK
+    if OPS_JOB_STORE_PATH is None:
+        return
+    OPS_JOB_PERSIST_DIRTY = True
+    if OPS_JOB_PERSIST_TASK is not None and not OPS_JOB_PERSIST_TASK.done():
+        return
+    try:
+        OPS_JOB_PERSIST_TASK = asyncio.get_running_loop().create_task(
+            _flush_ops_jobs_debounced()
+        )
+    except RuntimeError:
+        _persist_ops_jobs()
 
 
 def _restore_ops_jobs() -> None:
@@ -1357,7 +1412,11 @@ async def _route_chat_intent(req: ChatRequest) -> dict:
     try:
         def _call_llm() -> tuple[str, dict]:
             from agents.llm_client import get_llm
-            resp = get_llm(temperature=0.0, max_tokens=220, profile_id=req.model_profile_id or None).invoke(prompt)
+            resp = get_llm(
+                temperature=0.0,
+                max_tokens=220,
+                profile_id=req.model_profile_id or None,
+            ).invoke(prompt, response_format={"type": "json_object"})
             return (getattr(resp, "content", "") or ""), ((getattr(resp, "response_metadata", {}) or {}).get("token_usage") or {})
 
         timeout = float(os.getenv("LLM_INTENT_ROUTER_TIMEOUT_SECONDS", "4.0"))
@@ -1896,7 +1955,11 @@ async def rank_chat_risks(req: ChatRiskRankRequest):
                 "只返回 JSON：{ordered_keys:[...],rationales:{key:'一句运维人员能看懂的理由'}}。\n"
                 f"范围={req.cluster}/{req.namespace}\n风险对象={json.dumps(_redact_sensitive(risks), ensure_ascii=False)[:14000]}"
             )
-            response = get_llm(temperature=0.0, max_tokens=900, profile_id=req.model_profile_id or None).invoke(prompt)
+            response = get_llm(
+                temperature=0.0,
+                max_tokens=900,
+                profile_id=req.model_profile_id or None,
+            ).invoke(prompt, response_format={"type": "json_object"})
             return _extract_json_object(getattr(response, "content", str(response)))
 
         ranked = await asyncio.wait_for(
@@ -9884,10 +9947,19 @@ async def _evidence_based_replan(
         "evidence_gap": engine_plan.get("evidence_gap"),
         "success_criteria": engine_plan.get("success_criteria") or [],
     }
-    if (
-        str(engine_plan.get("runbook_id") or "") == "storage_permission"
-        and _storage_permission_detected(plan, engine_plan.get("reason") or "")
-    ):
+    permission_detected = _storage_permission_detected(
+        plan,
+        " ".join([
+            str(engine_plan.get("reason") or ""),
+            str(plan.get("summary") or ""),
+            str((deep.get("log_triage") or {}).get("summary") or ""),
+        ]),
+    )
+    if permission_detected:
+        # Direct log + Workload/storage evidence is stronger than a generic
+        # CrashLoop runbook label. Resolve this deterministic Skill before any
+        # LLM call so a model/network stall cannot hold root-cause diagnosis.
+        plan["_runtime_replan"]["runbook_id"] = "storage_permission"
         progressive = _materialize_executable_skill(
             plan,
             _skill_signal_payload(
@@ -9984,7 +10056,7 @@ async def _evidence_based_replan(
                 f"目标与原计划={json.dumps(_redact_sensitive({k: v for k, v in plan.items() if not k.startswith('_')}), ensure_ascii=False)[:7000]}\n"
                 f"真实证据={json.dumps(_redact_sensitive(deep), ensure_ascii=False)[:15000]}"
             )
-            response = llm.invoke(prompt)
+            response = llm.invoke(prompt, response_format={"type": "json_object"})
             return _extract_json_object(getattr(response, "content", str(response)))
 
         planner_timeout = max(5, min(int(os.getenv("OPS_LLM_PLANNER_TIMEOUT_SECONDS", "60")), 180))
@@ -10739,7 +10811,10 @@ async def _execute_ops_plan_once(
             level="warning",
         )
     elif plan.get("changes") and not deep_evidence.get("error"):
-        await emit("replanning", "用实时证据复核原方案，避免把症状当成根因")
+        await emit(
+            "root_cause_diagnosing",
+            "根因诊断：用实时证据复核原方案，避免把症状当成根因。",
+        )
         preflight_attempted = {str(change.get("type") or "") for change in plan.get("changes") or []}
         preflight_attempted.update(str(action) for action in (plan.get("_attempted_actions") or []) if action)
         preflight_replans = await _evidence_based_replan(
@@ -11135,18 +11210,18 @@ async def _execute_ops_plan_once(
             }
         root_cause_timeout = max(10, int(os.getenv("OPS_ROOT_CAUSE_TIMEOUT_SECONDS", "75")))
         await emit(
-            "replanning",
+            "root_cause_diagnosing",
             "根因诊断正在根据实时证据重排候选根因，并选择最高匹配的可执行 Skill。",
             waiting_on="EvidenceRunbookEngine/LLM/Skill Router",
         )
         try:
             evidence_replans = await run_with_heartbeat(
                 _evidence_based_replan(plan, executed_steps, attempted_actions),
-                stage="replanning",
+                stage="root_cause_diagnosing",
                 timeout_seconds=root_cause_timeout,
                 heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
                 cancel_event=cancel_event,
-                on_heartbeat=heartbeat("replanning", "EvidenceRunbookEngine/LLM/Skill Router"),
+                on_heartbeat=heartbeat("root_cause_diagnosing", "EvidenceRunbookEngine/LLM/Skill Router"),
             )
         except StageTimeoutError:
             await emit(
@@ -11209,7 +11284,7 @@ async def _execute_ops_plan_once(
         next_steps = _ops_terminal_next_steps(plan, verification, evidence_replans, verification["operator_steps"])
         verification["next_steps"] = next_steps
         await emit(
-            "replanning",
+            "root_cause_diagnosed",
             "根因诊断与 Skill 重规划完成。",
             alternative_plan_count=len(evidence_replans),
             level="success" if evidence_replans else "warning",
@@ -11347,7 +11422,7 @@ async def _execute_ops_plan_once(
         if failed_after_change and failed_after_change.get("name"):
             plan["pod_name"] = failed_after_change["name"]
         await emit(
-            "replanning",
+            "root_cause_diagnosing",
             "恢复验证未通过，重新采集失败后新 Pod 的 Logs、Events、Workload、PVC/PV 证据，再生成下一轮修复方案。",
             failed_pod=(failed_after_change or {}).get("name"),
             level="warning",
@@ -11392,7 +11467,66 @@ async def _execute_ops_plan_once(
                 f"失败后证据采集异常，使用已有证据继续规划：{type(exc).__name__}",
                 level="warning",
             )
-        evidence_replans = await _evidence_based_replan(plan, executed_steps, attempted_actions)
+        root_cause_timeout = max(10, int(os.getenv("OPS_ROOT_CAUSE_TIMEOUT_SECONDS", "75")))
+        try:
+            evidence_replans = await run_with_heartbeat(
+                _evidence_based_replan(plan, executed_steps, attempted_actions),
+                stage="root_cause_diagnosing",
+                timeout_seconds=root_cause_timeout,
+                heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
+                cancel_event=cancel_event,
+                on_heartbeat=heartbeat(
+                    "root_cause_diagnosing",
+                    "失败后 EvidenceRunbookEngine/LLM/Skill Router",
+                ),
+            )
+        except StageTimeoutError:
+            await emit(
+                "stage_timeout",
+                f"失败后根因规划超过 {root_cause_timeout} 秒，已切换到确定性引擎。",
+                timed_out_stage="post_failure_root_cause_planning",
+                timeout_seconds=root_cause_timeout,
+                level="warning",
+            )
+            try:
+                evidence_replans = await _evidence_based_replan(
+                    plan,
+                    executed_steps,
+                    attempted_actions,
+                    include_llm=False,
+                )
+            except Exception as exc:
+                evidence_replans = []
+                plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
+                    f"失败后确定性根因规划失败：{type(exc).__name__}: {_redact_text(str(exc))}"
+                )
+        except Exception as exc:
+            await emit(
+                "stage_timeout",
+                "失败后根因规划异常，已切换到确定性引擎。",
+                timed_out_stage="post_failure_root_cause_planning",
+                error=f"{type(exc).__name__}: {_redact_text(str(exc))}",
+                level="warning",
+            )
+            try:
+                evidence_replans = await _evidence_based_replan(
+                    plan,
+                    executed_steps,
+                    attempted_actions,
+                    include_llm=False,
+                )
+            except Exception as fallback_exc:
+                evidence_replans = []
+                plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
+                    f"失败后确定性根因规划失败：{type(fallback_exc).__name__}: "
+                    f"{_redact_text(str(fallback_exc))}"
+                )
+        await emit(
+            "root_cause_diagnosed",
+            "失败后根因诊断完成，已生成差异化下一轮策略。",
+            alternative_plan_count=len(evidence_replans),
+            level="success" if evidence_replans else "warning",
+        )
     raw_alternatives = evidence_replans + _derive_alternative_plans(plan, verification, results)
     alternative_plans: list[dict] = []
     for candidate in raw_alternatives:
@@ -12264,7 +12398,7 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
                 f"Skill目录={json.dumps(_redact_sensitive(skill_catalog), ensure_ascii=False)[:14000]}\n"
                 f"巡检异常={json.dumps(_redact_sensitive(finding_catalog), ensure_ascii=False)[:18000]}"
             )
-            response = llm.invoke(prompt)
+            response = llm.invoke(prompt, response_format={"type": "json_object"})
             usage = ((getattr(response, "response_metadata", {}) or {}).get("token_usage") or {})
             return _extract_json_object(getattr(response, "content", str(response))), usage
 
@@ -12424,7 +12558,7 @@ async def delete_ops_record(job_id: str, request: Request):
         if job.get("status") in {"queued", "running", "awaiting_approval", "cancelling", "resume_pending"}:
             raise HTTPException(status_code=409, detail="运行中的运维任务不能删除，请先中断并等待终态")
         OPS_JOBS.pop(job_id, None)
-        _persist_ops_jobs()
+        _schedule_ops_jobs_persistence()
     _safe_audit_event("aiops.record.delete", _request_actor(request), job_id, "accepted")
     return {"status": "deleted", "id": job_id}
 
@@ -12633,7 +12767,9 @@ async def _enrich_infrastructure_findings_with_llm(payload: dict, model_profile_
     try:
         from agents.llm_client import get_llm
         llm = get_llm(temperature=0.05, max_tokens=1800, profile_id=model_profile_id or None)
-        response = await asyncio.to_thread(lambda: llm.invoke(prompt))
+        response = await asyncio.to_thread(
+            lambda: llm.invoke(prompt, response_format={"type": "json_object"})
+        )
         parsed = _extract_json_object(getattr(response, "content", str(response)))
     except Exception as exc:
         payload["llm_planner_error"] = f"{type(exc).__name__}: {_redact_text(str(exc))}"
@@ -12779,7 +12915,7 @@ async def _append_ops_job_event(job_id: str, stage: str, message: str, **values)
             job["stage"] = stage
             job["message"] = message
         job["updated_at"] = now
-        _persist_ops_jobs()
+        _schedule_ops_jobs_persistence()
 
 
 async def _update_ops_job(job_id: str, **values):
@@ -12789,7 +12925,7 @@ async def _update_ops_job(job_id: str, **values):
             return
         job.update(values)
         job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _persist_ops_jobs()
+        _schedule_ops_jobs_persistence()
 
 
 def _ensure_effectiveness_record(plan: dict, result: dict) -> dict:
@@ -13609,6 +13745,8 @@ async def _enqueue_ops_job(plan_input: dict, actor: str, *, autonomous: bool, co
         "max_attempts": 0,
         "strategy_window": max(1, min(20, int(os.getenv("AUTO_OPS_MAX_ATTEMPTS", "3")))),
         "continuous_until_recovered": True,
+        "worker_build_version": APP_BUILD_VERSION,
+        "worker_code_signature": APP_CODE_SIGNATURE,
         "history": [],
         "events": [{"timestamp": now, "stage": "queued", "message": "等待执行", "level": "info"}],
         "created_at": now,
@@ -13623,7 +13761,7 @@ async def _enqueue_ops_job(plan_input: dict, actor: str, *, autonomous: bool, co
         OPS_JOBS[job_id] = job
         OPS_JOB_CANCEL_EVENTS[job_id] = cancel_event
         OPS_JOB_TASKS[job_id] = asyncio.create_task(_run_ops_job(job_id, plan, autonomous, cancel_event))
-        _persist_ops_jobs()
+        _schedule_ops_jobs_persistence()
     audit_warning = _safe_audit_event(
         "aiops.job.create",
         actor,
