@@ -24,7 +24,7 @@ const ACTIVE_STATUSES = new Set(["queued", "running", "awaiting_approval", "resu
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "unresolved", "blocked"]);
 const ACTIVE_EVENT_STAGES = new Set([
   "queued", "starting", "attempt", "collecting_evidence", "step_start", "step_waiting",
-  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "skill_routed", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
+  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "skill_routed", "execution_preflight", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
   "continuation_wait", "resume_pending",
 ]);
 const EXECUTION_PHASES = ["采集证据", "根因诊断", "提交变更", "恢复验证"];
@@ -65,6 +65,9 @@ function stageLabel(stage: unknown) {
     step_waiting: "诊断进行中",
     step_start: "诊断开始",
     step_done: "诊断完成",
+    execution_preflight: "执行权限预检",
+    execution_preflight_done: "执行权限已确认",
+    execution_permission_blocked: "执行权限阻断",
     change_waiting: "等待变更回执",
     change_start: "提交变更",
     change_done: "变更回执",
@@ -127,7 +130,7 @@ function phaseIndex(stage: unknown) {
   const value = String(stage || "");
   if (["queued", "starting", "attempt", "release_gate", "collecting_evidence", "collecting_evidence_done"].includes(value)) return 0;
   if (["log_triage_done", "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "root_cause_diagnosed", "diagnosis_done", "skill_routed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
-  if (["awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting", "change_done"].includes(value)) return 2;
+  if (["execution_preflight", "execution_preflight_done", "execution_permission_blocked", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting", "change_done"].includes(value)) return 2;
   if (["verifying", "verification_done", "recovered"].includes(value)) return 3;
   return 1;
 }
@@ -137,7 +140,7 @@ function completedPhase(stage: unknown) {
   if (["verification_done", "recovered"].includes(value)) return 3;
   if (["change_done", "verifying"].includes(value)) return 2;
   if (value === "collecting_evidence_done") return 0;
-  if (["root_cause_diagnosed", "diagnosis_done", "strategy_switch", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting"].includes(value)) return 1;
+  if (["root_cause_diagnosed", "diagnosis_done", "strategy_switch", "execution_preflight", "execution_preflight_done", "execution_permission_blocked", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting"].includes(value)) return 1;
   return -1;
 }
 

@@ -11,7 +11,7 @@ namespaceOverride: k8s-agent
 
 image:
   repository: ghcr.dockerproxy.net/your-org/flawless
-  tag: 3.2.9
+  tag: 3.2.10
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -139,7 +139,8 @@ config:
   LLM_MODEL: your-model
   LLM_PROFILE_ID: primary
   LLM_PROVIDER: openai-compatible
-  LLM_READ_TIMEOUT_SECONDS: "45"
+  LLM_READ_TIMEOUT_SECONDS: "120"
+  SRE_DIAGNOSIS_TIMEOUT_SECONDS: "135"
   LLM_VERIFY_SSL: "true"
   MODEL_PROFILE_RUNTIME_WRITE_ENABLED: "true"
   MODEL_PROFILES_JSON: '[{"id":"primary","provider":"openai-compatible","model":"your-model","base_url":"https://llm-gateway.example.com/v1","auth_type":"oauth_client_credentials","role":"primary","weight":100,"max_tokens":4096,"verify_ssl":true}]'
@@ -165,6 +166,8 @@ config:
   OPS_CHANGE_TIMEOUT_SECONDS: "45"
   OPS_EVIDENCE_TIMEOUT_SECONDS: "70"
   OPS_HEARTBEAT_SECONDS: "5"
+  OPS_PERMISSION_PREFLIGHT_ENABLED: "true"
+  OPS_ROOT_CAUSE_TIMEOUT_SECONDS: "120"
   OPS_MAX_CONCURRENT_JOBS: "4"
   OPS_CONTINUATION_INTERVAL_SECONDS: "30"
   OPS_STEP_APPROVAL_TIMEOUT_SECONDS: "0"

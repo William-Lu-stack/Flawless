@@ -187,8 +187,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.9")
-APP_CODE_SIGNATURE = "preemptible-root-cause-recovery-v14"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.10")
+APP_CODE_SIGNATURE = "rbac-preflight-root-recovery-v15"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -1762,10 +1762,29 @@ async def _chat_response_data(req: ChatRequest, intent: dict | None = None) -> d
                 "workload_type": req.workload_type,
                 "evidence": request_payload.get("k8s_context") or {},
             })
-            async with _client(120) as c:
-                resp = await c.post(f"{SERVICES['adapter']}/chat", json=request_payload)
-                resp.raise_for_status()
-                data = resp.json()
+            try:
+                async with _client(180) as c:
+                    resp = await c.post(f"{SERVICES['adapter']}/chat", json=request_payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+            except Exception as adapter_exc:
+                # The adapter is a stateless SRE Graph HTTP boundary. If that
+                # one service is restarting, run the exact same graph locally
+                # in the API process instead of dropping the user into a
+                # generic dependency-failure plan after evidence was already
+                # collected. This path remains diagnosis-only; mutations still
+                # require an OpsJob and per-change human approval.
+                from openwebui.openwebui_adapter import (
+                    ChatRequest as AdapterChatRequest,
+                    chat as adapter_chat,
+                )
+
+                data = await adapter_chat(AdapterChatRequest(**request_payload))
+                if isinstance(data, dict):
+                    data["adapter_fallback"] = {
+                        "used": True,
+                        "reason": f"{type(adapter_exc).__name__}: {_redact_text(str(adapter_exc))}",
+                    }
         except Exception as e:
             # 依赖不可用时只返回可执行的取证计划，绝不编造根因或修复成功。
             data = _fallback_diagnosis_response(req)
@@ -6589,7 +6608,13 @@ def _permission_guidance(error_payload: dict | str, plan: dict, change: dict | N
         "create_configmap": (["get", "create"], ["configmaps"]),
     }
     verbs, resources = requirements.get(action, (["get", "patch", "update"], ["目标 Kubernetes 资源"]))
-    permission_owner = "Rancher Token" if plan.get("source") == "rancher" else "ServiceAccount k8s-agent/k8s-agent-sa"
+    service_account_namespace = os.getenv("PLATFORM_NAMESPACE", "k8s-agent")
+    service_account_name = os.getenv("K8S_SERVICE_ACCOUNT_NAME", "k8s-agent-sa")
+    permission_owner = (
+        "Rancher Token"
+        if plan.get("source") == "rancher"
+        else f"ServiceAccount {service_account_namespace}/{service_account_name}"
+    )
     return {
         "summary": f"{permission_owner} 没有执行 {action} 所需的最小权限，本轮没有继续提交变更。",
         "do_this": [
@@ -6602,6 +6627,277 @@ def _permission_guidance(error_payload: dict | str, plan: dict, change: dict | N
         "minimal_resources": resources,
         "action": action,
         "target": workload_type,
+    }
+
+
+def _ops_namespace_guard(plan: dict) -> dict:
+    """Apply the mutation namespace allowlist consistently to every backend.
+
+    MCP already enforces this boundary for the in-cluster ServiceAccount, but
+    Rancher and uploaded-kubeconfig execution do not pass through MCP. Keeping
+    the same guard in the canonical OpsJob executor prevents those sources from
+    bypassing ALLOWED_NAMESPACES and makes a rejected target visible before an
+    operator is asked to approve an impossible change.
+    """
+    namespace = str(plan.get("namespace") or "").strip()
+    allowed = _csv_env("ALLOWED_NAMESPACES", "default")
+    if not namespace or "all" in allowed or namespace in allowed:
+        return {
+            "allowed": True,
+            "namespace": namespace,
+            "allowed_namespaces": allowed,
+        }
+    return {
+        "allowed": False,
+        "namespace": namespace,
+        "allowed_namespaces": allowed,
+        "reason": (
+            f"namespace={namespace} 不在 ALLOWED_NAMESPACES 中；本轮不会提交任何变更。"
+        ),
+        "operator_steps": [
+            (
+                "把目标 namespace 加入 ConfigMap k8s-agent-config 的 "
+                "ALLOWED_NAMESPACES（逗号分隔），或在明确接受全局纳管边界时设为 all。"
+            ),
+            "重启 flawless Agents/MCP 与 k8s-agent-api，使新的白名单同时生效。",
+            "重新运行同一运维任务；原人工审批不会跨配置变更复用。",
+        ],
+    }
+
+
+def _workload_access_resource(workload_type: str) -> tuple[str, str]:
+    normalized = str(workload_type or "Deployment").strip().lower()
+    return {
+        "deployment": ("apps", "deployments"),
+        "statefulset": ("apps", "statefulsets"),
+        "daemonset": ("apps", "daemonsets"),
+        "replicaset": ("apps", "replicasets"),
+        "job": ("batch", "jobs"),
+        "cronjob": ("batch", "cronjobs"),
+        "pod": ("", "pods"),
+    }.get(normalized, ("apps", f"{normalized}s"))
+
+
+def _change_access_requirement(change: dict, plan: dict) -> dict | None:
+    action = str(change.get("type") or "").strip()
+    namespace = str(change.get("namespace") or plan.get("namespace") or "default")
+    workload_type = str(
+        change.get("workload_type")
+        or _workload_identity_from_plan(plan)[1]
+        or "Deployment"
+    )
+    workload_name = str(
+        change.get("workload_name")
+        or _workload_identity_from_plan(plan)[2]
+        or ""
+    )
+    workload_group, workload_resource = _workload_access_resource(workload_type)
+    if action in {
+        "restart", "patch_workload", "patch_workload_volume",
+        "patch_workload_runtime_security", "patch", "scale_out",
+        "rollback_workload", "rollback_permission_hardening",
+    }:
+        return {
+            "namespace": namespace,
+            "verb": "patch",
+            "group": workload_group,
+            "resource": workload_resource,
+            "name": workload_name,
+            "action": action,
+        }
+    if action == "replace_immutable_workload":
+        verb = "delete"
+        kind = str(change.get("kind") or workload_type)
+        group, resource = _workload_access_resource(kind)
+        return {
+            "namespace": namespace, "verb": verb, "group": group,
+            "resource": resource, "name": str(change.get("name") or workload_name),
+            "action": action,
+        }
+    static = {
+        "recreate_pod": ("delete", "", "pods", change.get("pod_name") or _target_pod_from_plan(plan)),
+        "evict_pod": ("create", "", "pods/eviction", change.get("pod_name") or _target_pod_from_plan(plan)),
+        "patch_service": ("patch", "", "services", change.get("service_name")),
+        "patch_service_account": ("patch", "", "serviceaccounts", change.get("service_account") or "default"),
+        "create_configmap": ("create", "", "configmaps", ((change.get("manifest") or {}).get("metadata") or {}).get("name")),
+        "patch_pdb": ("patch", "policy", "poddisruptionbudgets", change.get("pdb_name")),
+        "patch_hpa": ("patch", "autoscaling", "horizontalpodautoscalers", change.get("hpa_name")),
+        "expand_pvc": ("patch", "", "persistentvolumeclaims", change.get("pvc_name")),
+        "create_pvc": ("create", "", "persistentvolumeclaims", ((change.get("manifest") or {}).get("metadata") or {}).get("name")),
+        "create_pv": ("create", "", "persistentvolumes", ((change.get("manifest") or {}).get("metadata") or {}).get("name")),
+        "cordon_node": ("patch", "", "nodes", change.get("node_name")),
+        "uncordon_node": ("patch", "", "nodes", change.get("node_name")),
+    }
+    if action in static:
+        verb, group, resource, name = static[action]
+        return {
+            "namespace": "" if resource in {"persistentvolumes", "nodes"} else namespace,
+            "verb": verb,
+            "group": group,
+            "resource": resource,
+            "name": str(name or ""),
+            "action": action,
+        }
+    if action in {"apply_manifest", "patch_resource", "delete_resource", "create_workload"}:
+        manifest = change.get("manifest") or {}
+        kind = str(change.get("kind") or manifest.get("kind") or workload_type)
+        api_version = str(
+            change.get("api_version")
+            or change.get("apiVersion")
+            or manifest.get("apiVersion")
+            or "v1"
+        )
+        group = "" if "/" not in api_version else api_version.split("/", 1)[0]
+        access_by_kind = {
+            "deployment": ("apps", "deployments", True),
+            "statefulset": ("apps", "statefulsets", True),
+            "daemonset": ("apps", "daemonsets", True),
+            "replicaset": ("apps", "replicasets", True),
+            "job": ("batch", "jobs", True),
+            "cronjob": ("batch", "cronjobs", True),
+            "service": ("", "services", True),
+            "serviceaccount": ("", "serviceaccounts", True),
+            "configmap": ("", "configmaps", True),
+            "secret": ("", "secrets", True),
+            "persistentvolumeclaim": ("", "persistentvolumeclaims", True),
+            "persistentvolume": ("", "persistentvolumes", False),
+            "namespace": ("", "namespaces", False),
+            "poddisruptionbudget": ("policy", "poddisruptionbudgets", True),
+            "horizontalpodautoscaler": ("autoscaling", "horizontalpodautoscalers", True),
+            "networkpolicy": ("networking.k8s.io", "networkpolicies", True),
+            "ingress": ("networking.k8s.io", "ingresses", True),
+            "storageclass": ("storage.k8s.io", "storageclasses", False),
+        }
+        access = access_by_kind.get(kind.lower())
+        # CustomResource plurals cannot be derived safely from Kind. Let the
+        # dynamic executor's discovery and API response remain authoritative
+        # instead of generating a false RBAC denial.
+        if access is None:
+            return None
+        expected_group, resource, namespaced = access
+        group = expected_group or group
+        verb = {
+            "apply_manifest": "patch",
+            "patch_resource": "patch",
+            "delete_resource": "delete",
+            "create_workload": "create",
+        }[action]
+        metadata = manifest.get("metadata") or {}
+        return {
+            "namespace": (
+                str(change.get("namespace") or metadata.get("namespace") or namespace)
+                if namespaced else ""
+            ),
+            "verb": verb,
+            "group": group,
+            "resource": resource,
+            "name": str(change.get("name") or metadata.get("name") or workload_name),
+            "action": action,
+        }
+    return None
+
+
+async def _ops_mutation_access_preflight(plan: dict, changes: list[dict]) -> dict:
+    if os.getenv("OPS_PERMISSION_PREFLIGHT_ENABLED", "true").lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return {"status": "disabled", "allowed": None, "checks": []}
+    cluster_id = str(plan.get("cluster_id") or "local")
+    managed_cluster_ids = {str(item.get("id") or "") for item in CLUSTER_REGISTRY.list()}
+    use_managed = cluster_id in managed_cluster_ids
+    use_rancher = (
+        plan.get("source") == "rancher"
+        and cluster_id not in {"", "local", "local-cluster"}
+    )
+    checks: list[dict] = []
+    for change in changes:
+        requirement = _change_access_requirement(change, plan)
+        if not requirement:
+            continue
+        if use_managed:
+            checks.append({
+                **requirement,
+                "allowed": None,
+                "reason": "uploaded kubeconfig access is verified by the change executor",
+            })
+            continue
+        try:
+            if use_rancher:
+                attributes = {
+                    key: requirement[key]
+                    for key in ("namespace", "verb", "group", "resource")
+                    if requirement.get(key) not in (None, "")
+                }
+                if requirement.get("name"):
+                    attributes["name"] = requirement["name"]
+                response = await _rancher_k8s_post(
+                    cluster_id,
+                    "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                    {
+                        "apiVersion": "authorization.k8s.io/v1",
+                        "kind": "SelfSubjectAccessReview",
+                        "spec": {"resourceAttributes": attributes},
+                    },
+                    timeout=15,
+                )
+                status = response.get("status") or {}
+                check = {
+                    **requirement,
+                    "allowed": bool(status.get("allowed")),
+                    "denied": bool(status.get("denied")),
+                    "reason": status.get("reason") or "",
+                    "evaluation_error": status.get("evaluationError") or "",
+                    "identity": "Rancher Token",
+                }
+            else:
+                response = await _call_mcp_tool(
+                    "check_access",
+                    {
+                        key: requirement[key]
+                        for key in ("namespace", "verb", "group", "resource", "name")
+                    },
+                )
+                check = {
+                    **requirement,
+                    **response,
+                    "identity": (
+                        "ServiceAccount "
+                        f"{os.getenv('PLATFORM_NAMESPACE', 'k8s-agent')}/"
+                        f"{os.getenv('K8S_SERVICE_ACCOUNT_NAME', 'k8s-agent-sa')}"
+                    ),
+                }
+        except Exception as exc:
+            check = {
+                **requirement,
+                "allowed": None,
+                "error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
+            }
+        checks.append(_redact_sensitive(check))
+        if check.get("allowed") is False:
+            guidance = _permission_guidance(
+                {"error": "RBAC forbidden by mutation preflight"},
+                plan,
+                change,
+            ) or {}
+            return {
+                "status": "blocked",
+                "allowed": False,
+                "checks": checks,
+                "blocked_change": _redact_sensitive(change),
+                "permission_guidance": guidance,
+                "reason": guidance.get("summary") or "执行身份缺少 Kubernetes 最小写权限。",
+                "operator_steps": guidance.get("do_this") or [],
+            }
+    known = [item.get("allowed") for item in checks if item.get("allowed") is not None]
+    return {
+        "status": "allowed" if known and all(known) else "unknown",
+        "allowed": True if known and all(known) else None,
+        "checks": checks,
+        "reason": (
+            "所有待审批变更的 Kubernetes 最小权限均已通过只读预检。"
+            if known and all(known)
+            else "部分执行后端不支持预检；仍会由实际变更 API 和恢复验证给出最终结果。"
+        ),
     }
 
 
@@ -8824,6 +9120,17 @@ def _ops_release_gate(plan: dict) -> dict:
     changes = plan.get("changes") or []
     if not changes:
         return {"status": "skipped", "reason": "本次计划没有 Kubernetes 变更。"}
+    namespace_guard = _ops_namespace_guard(plan)
+    if namespace_guard.get("allowed") is False:
+        return {
+            "status": "blocked",
+            "allowed": False,
+            "verdict": "blocked",
+            "action": "namespace_guard",
+            "reason": namespace_guard.get("reason"),
+            "namespace_guard": namespace_guard,
+            "operator_steps": namespace_guard.get("operator_steps") or [],
+        }
     change = changes[0]
     selected = {
         "id": f"{change.get('workload_type','Workload')}/{change.get('workload_name','')}",
@@ -10614,6 +10921,8 @@ async def _execute_ops_plan_once(
             "status": "blocked",
             "executed": False,
             "release_gate": release_gate,
+            "blocked_reason": release_gate.get("reason"),
+            "operator_steps": release_gate.get("operator_steps") or [],
             "message": release_gate.get("reason") or "变更被错误预算门禁阻断。",
         }
     await emit("collecting_evidence", "采集 current/previous logs、Events、Workload、Service、存储与节点证据")
@@ -11019,9 +11328,58 @@ async def _execute_ops_plan_once(
             "message": verification["message"],
         }
 
+    changes = [change if isinstance(change, dict) else {"type": str(change)} for change in plan.get("changes", [])]
+    permission_preflight = {"status": "skipped", "allowed": None, "checks": []}
+    if changes:
+        await emit(
+            "execution_preflight",
+            "提交审批前检查 namespace 白名单和执行身份的 Kubernetes 最小写权限。",
+            changes_total=len(changes),
+        )
+        permission_preflight = await _ops_mutation_access_preflight(plan, changes)
+        if permission_preflight.get("allowed") is False:
+            verification = {
+                "status": "blocked",
+                "recovered": False,
+                "message": permission_preflight.get("reason"),
+                "proof": "SelfSubjectAccessReview 在提交变更前返回不允许；Deployment YAML 未修改。",
+                "blocked_reason": permission_preflight.get("reason"),
+                "operator_steps": permission_preflight.get("operator_steps") or [],
+            }
+            verification["next_steps"] = _ops_terminal_next_steps(
+                plan,
+                verification,
+                [],
+                verification["operator_steps"],
+            )
+            await emit(
+                "execution_permission_blocked",
+                permission_preflight.get("reason") or "执行身份缺少 Kubernetes 写权限。",
+                permission_preflight=permission_preflight,
+                level="error",
+            )
+            return {
+                "status": "blocked",
+                "executed": False,
+                "steps": executed_steps,
+                "changes": changes,
+                "results": [],
+                "release_gate": release_gate,
+                "permission_preflight": permission_preflight,
+                "verification": verification,
+                "blocked_reason": verification["blocked_reason"],
+                "operator_steps": verification["operator_steps"],
+                "next_steps": verification["next_steps"],
+                "message": verification["message"],
+            }
+        await emit(
+            "execution_preflight_done",
+            permission_preflight.get("reason") or "执行权限预检完成。",
+            permission_preflight=permission_preflight,
+            level="success" if permission_preflight.get("allowed") is True else "warning",
+        )
     results = []
     executed_skill_ids: set[str] = set()
-    changes = [change if isinstance(change, dict) else {"type": str(change)} for change in plan.get("changes", [])]
     for index, change in enumerate(changes, start=1):
         if cancel_event and cancel_event.is_set():
             break
@@ -11387,6 +11745,7 @@ async def _execute_ops_plan_once(
                 "changes": plan.get("changes") or [],
                 "results": results,
                 "release_gate": release_gate,
+                "permission_preflight": permission_preflight,
                 "verification": rollback_verification,
                 "before_snapshot": plan.get("_audit_before_snapshot") or {},
                 "alternative_plans": [],
@@ -11615,6 +11974,7 @@ async def _execute_ops_plan_once(
         "changes": plan.get("changes", []),
         "results": results,
         "release_gate": release_gate,
+        "permission_preflight": permission_preflight,
         "verification": verification,
         "before_snapshot": plan.get("_audit_before_snapshot") or {},
         "skill_routing_record": {

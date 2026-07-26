@@ -509,9 +509,21 @@ Deep evidence: {json.dumps(safe_diagnostics, ensure_ascii=False)[:14000]}
 只返回 JSON，不要任何其他内容。"""
 
     try:
+        configured_timeout = os.getenv("SRE_DIAGNOSIS_TIMEOUT_SECONDS", "").strip()
+        # The graph timeout must be longer than the model client's read
+        # timeout. Otherwise the outer asyncio guard can cancel a valid
+        # DeepSeek response while the HTTP client is still waiting, which
+        # makes the UI look stuck between evidence collection and diagnosis.
+        default_timeout = max(
+            75.0,
+            float(os.getenv("LLM_READ_TIMEOUT_SECONDS", "45")) + 15.0,
+        )
         diagnosis_timeout = max(
             0.05,
-            min(float(os.getenv("SRE_DIAGNOSIS_TIMEOUT_SECONDS", "35")), 180.0),
+            min(
+                float(configured_timeout) if configured_timeout else default_timeout,
+                180.0,
+            ),
         )
         response = await asyncio.wait_for(
             asyncio.to_thread(

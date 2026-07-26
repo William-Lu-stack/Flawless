@@ -1138,6 +1138,83 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             server.OPS_JOBS.pop(job_id, None)
 
+    def test_namespace_guard_blocks_mutation_outside_allowlist(self):
+        with patch.dict(os.environ, {"ALLOWED_NAMESPACES": "platform,observability"}):
+            result = server._ops_namespace_guard({
+                "namespace": "business-prod",
+                "changes": [{"type": "patch_workload"}],
+            })
+        self.assertFalse(result["allowed"])
+        self.assertIn("business-prod", result["reason"])
+        self.assertIn("ALLOWED_NAMESPACES", result["operator_steps"][0])
+
+    async def test_local_mutation_preflight_detects_service_account_rbac(self):
+        plan = {
+            "cluster_id": "local",
+            "namespace": "business-prod",
+            "target": "Deployment/orders",
+        }
+        changes = [{
+            "type": "patch_workload",
+            "namespace": "business-prod",
+            "workload_type": "Deployment",
+            "workload_name": "orders",
+            "patch": {"spec": {"template": {"spec": {"securityContext": {"runAsUser": 0}}}}},
+        }]
+        denied = {
+            "namespace": "business-prod",
+            "verb": "patch",
+            "group": "apps",
+            "resource": "deployments",
+            "name": "orders",
+            "allowed": False,
+            "denied": False,
+            "reason": "",
+            "evaluation_error": "",
+        }
+        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[]), patch.object(
+            server, "_call_mcp_tool", AsyncMock(return_value=denied)
+        ) as call:
+            result = await server._ops_mutation_access_preflight(plan, changes)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("ServiceAccount", result["reason"])
+        call.assert_awaited_once_with("check_access", {
+            "namespace": "business-prod",
+            "verb": "patch",
+            "group": "apps",
+            "resource": "deployments",
+            "name": "orders",
+        })
+
+    async def test_local_mutation_preflight_allows_approved_rbac(self):
+        plan = {
+            "cluster_id": "local",
+            "namespace": "business-prod",
+            "target": "Deployment/orders",
+        }
+        changes = [{
+            "type": "patch_workload_runtime_security",
+            "namespace": "business-prod",
+            "workload_type": "Deployment",
+            "workload_name": "orders",
+        }]
+        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[]), patch.object(
+            server,
+            "_call_mcp_tool",
+            AsyncMock(return_value={
+                "namespace": "business-prod",
+                "verb": "patch",
+                "group": "apps",
+                "resource": "deployments",
+                "name": "orders",
+                "allowed": True,
+            }),
+        ):
+            result = await server._ops_mutation_access_preflight(plan, changes)
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["status"], "allowed")
+
     def test_workload_permission_denied_is_not_misclassified_as_rbac_blocker(self):
         result = {
             "status": "failed",

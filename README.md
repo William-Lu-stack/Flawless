@@ -16,9 +16,11 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.9**.
+Current release: **3.2.10**.
 
-Release 3.2.9 makes root-cause planning preemptible and observable, including
+Release 3.2.10 adds namespace and RBAC mutation preflight, resilient local
+SRE-graph fallback, and model-aware diagnosis timeouts. Root-cause planning is
+preemptible and observable, including
 explicit diagnosis stages, bounded model/persistence calls, DeepSeek/vLLM
 structured routing, and deterministic Skill fallback. The progressive volume
 permission Skill now keeps the incident open through non-root remediation,
