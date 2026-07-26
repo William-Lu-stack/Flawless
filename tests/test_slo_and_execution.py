@@ -1,4 +1,5 @@
 import asyncio
+import httpx
 import os
 import tempfile
 import unittest
@@ -270,6 +271,186 @@ class ErrorBudgetTests(unittest.TestCase):
 
 
 class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_deep_diagnosis_reaches_permission_change_approval(self):
+        """Exercise the browser's real POST -> background job -> GET polling path.
+
+        A shallow chat plan initially matches the generic CrashLoop Skill. Live
+        logs then prove a writable-path fault and generate the executable volume
+        permission Skill. The second evidence pass must retain that executable
+        Skill instead of being displaced by the generic router and looping at
+        ``collecting_evidence_done`` forever.
+        """
+        evidence = {
+            "namespace": "monitoring",
+            "pod_name": "grafana-abc",
+            "pod": {
+                "name": "grafana-abc",
+                "namespace": "monitoring",
+                "ready": False,
+                "phase": "Running",
+                "restart_count": 5,
+                "workload": {"kind": "Deployment", "name": "grafana"},
+                "security_context": {"runAsUser": 472, "runAsGroup": 472, "fsGroup": 472},
+                "containers": [{
+                    "name": "grafana",
+                    "ready": False,
+                    "state": "waiting",
+                    "reason": "CrashLoopBackOff",
+                    "security_context": {"runAsUser": 472, "runAsGroup": 472},
+                    "volume_mounts": [{"name": "data", "mount_path": "/var/lib/grafana"}],
+                }],
+            },
+            "events": [],
+            "logs": {
+                "grafana": {
+                    "current": (
+                        "GF_PATHS_DATA=/var/lib/grafana is not writable\n"
+                        "Error: unable to open database file"
+                    ),
+                },
+            },
+            "workload": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "grafana", "namespace": "monitoring"},
+                "spec": {
+                    "replicas": 1,
+                    "template": {
+                        "spec": {
+                            "securityContext": {"runAsUser": 472, "runAsGroup": 472, "fsGroup": 472},
+                            "containers": [{
+                                "name": "grafana",
+                                "securityContext": {"runAsUser": 472, "runAsGroup": 472},
+                                "volumeMounts": [{"name": "data", "mountPath": "/var/lib/grafana"}],
+                            }],
+                            "volumes": [{
+                                "name": "data",
+                                "persistentVolumeClaim": {"claimName": "grafana-data"},
+                            }],
+                        },
+                    },
+                },
+                "status": {"readyReplicas": 0},
+            },
+            "storage": [{"pvc": "grafana-data", "pvc_phase": "Bound", "pv": "grafana-pv"}],
+            "services": [],
+        }
+        plan = {
+            "title": "深度诊断 Grafana",
+            "target": "Deployment/grafana",
+            "namespace": "monitoring",
+            "cluster_id": "c-test",
+            "cluster": "test",
+            "source": "rancher",
+            "summary": "Pod CrashLoopBackOff，读取日志定位根因",
+            "steps": [
+                {"title": "读取 ERROR 日志", "probe": "current_logs"},
+                {"title": "核对安全上下文", "probe": "pod_security_context"},
+                {"title": "追踪 CMDB 依赖链", "probe": "dependency_topology", "optional": True},
+            ],
+            "changes": [],
+        }
+        job_id = ""
+        transport = httpx.ASGITransport(app=server.app)
+        with patch.object(server, "_ops_release_gate", return_value={"allowed": True}), patch.object(
+            server,
+            "_collect_plan_deep_evidence",
+            AsyncMock(return_value=evidence),
+        ), patch.object(
+            server,
+            "_probe_plan_recovery",
+            AsyncMock(return_value={"status": "completed", "recovered": False, "message": "still failing"}),
+        ), patch.object(
+            server,
+            "_execute_change",
+            AsyncMock(return_value={
+                "status": "completed",
+                "change": {"type": "patch_workload_runtime_security"},
+                "result": {"accepted": True},
+            }),
+        ), patch.object(
+            server,
+            "_verify_plan_recovery",
+            AsyncMock(return_value={
+                "status": "completed",
+                "recovered": True,
+                "message": "新 Pod 已 Ready，错误日志消失，重启次数稳定。",
+            }),
+        ), patch.object(
+            server,
+            "_llm_ops_summary",
+            AsyncMock(return_value={
+                "source": "test",
+                "content": "权限变更已执行并验证恢复。",
+                "followup_plans": [],
+            }),
+        ):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post("/api/ops/jobs", json={
+                    "plan": plan,
+                    "confirm": True,
+                    "autonomous": False,
+                    "operator_force_execute": True,
+                })
+                self.assertEqual(response.status_code, 200, response.text)
+                job_id = response.json()["id"]
+                job = response.json()
+                for _ in range(150):
+                    await asyncio.sleep(0.02)
+                    job_response = await client.get(f"/api/ops/jobs/{job_id}")
+                    self.assertEqual(job_response.status_code, 200, job_response.text)
+                    job = job_response.json()
+                    if job.get("status") in {"awaiting_approval", "failed", "completed"}:
+                        break
+                self.assertEqual(job["status"], "awaiting_approval")
+                self.assertEqual(job["stage"], "awaiting_change_approval")
+                self.assertEqual(
+                    (job.get("pending_approval") or {}).get("action"),
+                    "patch_workload_runtime_security",
+                )
+                stages = [event.get("stage") for event in job.get("events") or []]
+                self.assertIn("diagnosing", stages)
+                self.assertIn("diagnosis_done", stages)
+                self.assertIn("awaiting_change_approval", stages)
+                pending = job["pending_approval"]
+                approval_response = await client.post(
+                    f"/api/ops/jobs/{job_id}/approve-step",
+                    json={
+                        "change_index": pending["change_index"],
+                        "approval_id": pending["approval_id"],
+                        "change_fingerprint": pending["change_fingerprint"],
+                        "confirm": True,
+                        "comment": "HTTP E2E confirms the exact generated patch",
+                    },
+                )
+                self.assertEqual(approval_response.status_code, 200, approval_response.text)
+                for _ in range(150):
+                    await asyncio.sleep(0.02)
+                    job = (await client.get(f"/api/ops/jobs/{job_id}")).json()
+                    if job.get("status") in {"completed", "failed", "cancelled"}:
+                        break
+                self.assertEqual(job["status"], "completed")
+                self.assertEqual(job["stage"], "recovered")
+                self.assertTrue(((job.get("result") or {}).get("verification") or {}).get("recovered"))
+                stages = [event.get("stage") for event in job.get("events") or []]
+                for expected_stage in (
+                    "change_approved",
+                    "change_start",
+                    "change_done",
+                    "verifying",
+                    "verification_done",
+                    "recovered",
+                ):
+                    self.assertIn(expected_stage, stages)
+        if job_id:
+            cancel_event = server.OPS_JOB_CANCEL_EVENTS.get(job_id)
+            if cancel_event:
+                cancel_event.set()
+            task = server.OPS_JOB_TASKS.get(job_id)
+            if task:
+                await asyncio.wait_for(asyncio.shield(task), timeout=2)
+            server.OPS_JOBS.pop(job_id, None)
+
     def _request(self):
         return Request({
             "type": "http",

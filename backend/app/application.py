@@ -187,7 +187,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.6")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.7")
 APP_CODE_SIGNATURE = "severity-first-progressive-recovery-v12"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -7226,7 +7226,11 @@ async def _collect_ops_step(step: dict, plan: dict) -> dict:
     artifacts: dict = {}
     status = "completed"
 
-    probe_id = str(step.get("id") or "")
+    # AI expert plans use ``probe`` while deterministic runbooks historically
+    # used ``id``. Treat both as the same execution contract; otherwise a
+    # perfectly valid ``dependency_topology``/``current_logs`` step falls
+    # through to title matching and loses the already collected evidence.
+    probe_id = str(step.get("id") or step.get("probe") or "")
     deep = plan.get("_runtime_evidence") or {}
     if probe_id and deep and not deep.get("error"):
         artifacts["probe_id"] = probe_id
@@ -10620,6 +10624,11 @@ async def _execute_ops_plan_once(
             priority_excerpts=priority_excerpts,
             level="warning" if log_triage.get("actionable") else "info",
         )
+    await emit(
+        "diagnosing",
+        "进入根因诊断：关联高优先级日志、Pod 状态、Workload YAML、Events、存储链并动态匹配 Skill。",
+        evidence_summary=evidence_summary,
+    )
     submitted_change_fingerprints = {
         _change_item_fingerprint(change)
         for change in (plan.get("changes") or [])
@@ -10633,8 +10642,12 @@ async def _execute_ops_plan_once(
             [current_skill_id]
             if (
                 current_skill_id
-                and plan.get("skill_handler_invoked")
                 and OPS_SKILL_RUNTIME.continuation_capable(current_skill_id)
+                and (
+                    plan.get("skill_handler_invoked")
+                    or plan.get("skill_runtime")
+                    or plan.get("change_source") == "executable_skill"
+                )
             )
             else None
         )
@@ -10910,9 +10923,10 @@ async def _execute_ops_plan_once(
         next_steps = _ops_terminal_next_steps(plan, verification, preflight_replans, verification["operator_steps"])
         verification["next_steps"] = next_steps
         await emit(
-            "verification_done",
+            "diagnosis_done",
             verification["message"],
-            verification=verification,
+            diagnosis=verification,
+            alternative_plan_count=len(preflight_replans),
             level="success" if has_candidate else "warning",
         )
         return {
@@ -11059,7 +11073,39 @@ async def _execute_ops_plan_once(
     attempted_actions.update(str(action) for action in (plan.get("_attempted_actions") or []) if action)
     evidence_replans: list[dict] = []
     if not plan.get("changes"):
-        current_health = await _probe_plan_recovery(plan, [])
+        health_timeout = max(10, int(os.getenv("OPS_DIAGNOSIS_HEALTH_TIMEOUT_SECONDS", "45")))
+        await emit(
+            "diagnosis_waiting",
+            "根因诊断正在核对目标当前健康状态，避免对已经恢复的 Workload 继续生成变更。",
+        )
+        try:
+            current_health = await run_with_heartbeat(
+                _probe_plan_recovery(plan, []),
+                stage="diagnosis_waiting",
+                timeout_seconds=health_timeout,
+                heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
+                cancel_event=cancel_event,
+                on_heartbeat=heartbeat("diagnosis_waiting", "目标 Pod/Workload 当前健康状态"),
+            )
+        except StageTimeoutError:
+            current_health = {
+                "status": "unknown",
+                "recovered": None,
+                "message": f"当前健康状态读取超过 {health_timeout} 秒；继续使用已采集证据重规划，不会卡在此处。",
+            }
+            await emit(
+                "stage_timeout",
+                current_health["message"],
+                timed_out_stage="diagnosis_health_check",
+                timeout_seconds=health_timeout,
+                level="warning",
+            )
+        except Exception as exc:
+            current_health = {
+                "status": "unknown",
+                "recovered": None,
+                "message": f"当前健康状态读取失败：{type(exc).__name__}: {_redact_text(str(exc))}",
+            }
         if current_health.get("recovered") is True:
             current_health.update({
                 "status": "completed",
@@ -11087,7 +11133,61 @@ async def _execute_ops_plan_once(
                 "next_steps": next_steps,
                 "message": current_health["message"],
             }
-        evidence_replans = await _evidence_based_replan(plan, executed_steps, attempted_actions)
+        root_cause_timeout = max(10, int(os.getenv("OPS_ROOT_CAUSE_TIMEOUT_SECONDS", "75")))
+        await emit(
+            "replanning",
+            "根因诊断正在根据实时证据重排候选根因，并选择最高匹配的可执行 Skill。",
+            waiting_on="EvidenceRunbookEngine/LLM/Skill Router",
+        )
+        try:
+            evidence_replans = await run_with_heartbeat(
+                _evidence_based_replan(plan, executed_steps, attempted_actions),
+                stage="replanning",
+                timeout_seconds=root_cause_timeout,
+                heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
+                cancel_event=cancel_event,
+                on_heartbeat=heartbeat("replanning", "EvidenceRunbookEngine/LLM/Skill Router"),
+            )
+        except StageTimeoutError:
+            await emit(
+                "stage_timeout",
+                f"AI 根因规划超过 {root_cause_timeout} 秒，已切换到确定性 EvidenceRunbookEngine 继续生成安全方案。",
+                timed_out_stage="root_cause_planning",
+                timeout_seconds=root_cause_timeout,
+                level="warning",
+            )
+            try:
+                evidence_replans = await _evidence_based_replan(
+                    plan,
+                    executed_steps,
+                    attempted_actions,
+                    include_llm=False,
+                )
+            except Exception as exc:
+                evidence_replans = []
+                plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
+                    f"确定性根因规划也失败：{type(exc).__name__}: {_redact_text(str(exc))}"
+                )
+        except Exception as exc:
+            await emit(
+                "stage_timeout",
+                "AI 根因规划异常，已切换到确定性 EvidenceRunbookEngine。",
+                timed_out_stage="root_cause_planning",
+                error=f"{type(exc).__name__}: {_redact_text(str(exc))}",
+                level="warning",
+            )
+            try:
+                evidence_replans = await _evidence_based_replan(
+                    plan,
+                    executed_steps,
+                    attempted_actions,
+                    include_llm=False,
+                )
+            except Exception as fallback_exc:
+                evidence_replans = []
+                plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
+                    f"确定性根因规划失败：{type(fallback_exc).__name__}: {_redact_text(str(fallback_exc))}"
+                )
         evidence_gap = str(
             ((plan.get("planning") or {}).get("evidence_gap"))
             or (plan.get("_runtime_replan") or {}).get("evidence_gap")
@@ -11110,14 +11210,15 @@ async def _execute_ops_plan_once(
         verification["next_steps"] = next_steps
         await emit(
             "replanning",
-            "LLM 与 EvidenceRunbookEngine 已基于真实证据重新规划",
+            "根因诊断与 Skill 重规划完成。",
             alternative_plan_count=len(evidence_replans),
             level="success" if evidence_replans else "warning",
         )
         await emit(
-            "verification_done",
+            "diagnosis_done",
             verification["message"],
-            verification=verification,
+            diagnosis=verification,
+            alternative_plan_count=len(evidence_replans),
             level="warning" if not evidence_replans else "success",
         )
         await emit(

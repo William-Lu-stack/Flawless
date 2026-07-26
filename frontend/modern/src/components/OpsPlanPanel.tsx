@@ -24,7 +24,7 @@ const ACTIVE_STATUSES = new Set(["queued", "running", "awaiting_approval", "resu
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "unresolved", "blocked"]);
 const ACTIVE_EVENT_STAGES = new Set([
   "queued", "starting", "attempt", "collecting_evidence", "step_start", "step_waiting",
-  "skill_routed", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
+  "diagnosing", "diagnosis_waiting", "skill_routed", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
   "continuation_wait", "resume_pending",
 ]);
 const EXECUTION_PHASES = ["采集证据", "根因诊断", "提交变更", "恢复验证"];
@@ -55,6 +55,10 @@ function stageLabel(stage: unknown) {
     release_blocked: "门禁阻断",
     collecting_evidence: "采集证据",
     collecting_evidence_done: "证据完成",
+    log_triage_done: "日志分级完成",
+    diagnosing: "根因诊断",
+    diagnosis_waiting: "根因诊断进行中",
+    diagnosis_done: "根因诊断完成",
     skill_routed: "Skill 动态路由",
     step_waiting: "诊断进行中",
     step_start: "诊断开始",
@@ -99,6 +103,15 @@ function compactJson(value: unknown, limit = 1600) {
   return text.length > limit ? `${text.slice(0, limit)}\n...` : text;
 }
 
+function targetLabel(value: any, fallback = "-") {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (!value || typeof value !== "object") return fallback;
+  if (value.workload_name) return `${value.workload_type || value.kind || "Workload"}/${value.workload_name}`;
+  if (value.pod_name) return `Pod/${value.pod_name}`;
+  if (value.name) return `${value.kind || value.type || "Resource"}/${value.name}`;
+  return fallback;
+}
+
 function eventIcon(event: any, active: boolean) {
   const tone = event?.level || statusTone(event?.change_status || event?.step_status || event?.stage);
   if (active && ACTIVE_EVENT_STAGES.has(String(event?.stage))) return <Loader2 className="spin" size={12} />;
@@ -111,9 +124,19 @@ function eventIcon(event: any, active: boolean) {
 function phaseIndex(stage: unknown) {
   const value = String(stage || "");
   if (["queued", "starting", "attempt", "release_gate", "collecting_evidence", "collecting_evidence_done"].includes(value)) return 0;
-  if (["skill_routed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "continuation_wait", "resume_pending"].includes(value)) return 1;
+  if (["log_triage_done", "diagnosing", "diagnosis_waiting", "diagnosis_done", "skill_routed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
   if (["awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting", "change_done"].includes(value)) return 2;
-  return 3;
+  if (["verifying", "verification_done", "recovered"].includes(value)) return 3;
+  return 1;
+}
+
+function completedPhase(stage: unknown) {
+  const value = String(stage || "");
+  if (["verification_done", "recovered"].includes(value)) return 3;
+  if (["change_done", "verifying"].includes(value)) return 2;
+  if (value === "collecting_evidence_done") return 0;
+  if (["diagnosis_done", "strategy_switch", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting"].includes(value)) return 1;
+  return -1;
 }
 
 function permissionGuidance(value: any) {
@@ -197,7 +220,7 @@ function renderEventDetails(event: any) {
       )}
       {change && (
         <div className="ops-event-details">
-          <span>{change.type || "change"} · {change.target || change.namespace || "-"}</span>
+          <span>{change.type || "change"} · {targetLabel(change.target, change.namespace || "-")}</span>
           {change.patch && <pre>{compactJson(change.patch, 900)}</pre>}
           {change.manifest && <pre>{compactJson(change.manifest, 1400)}</pre>}
           {change.command && <pre>{compactJson(change.command, 1400)}</pre>}
@@ -277,7 +300,15 @@ export function OpsJobProgress({
   const latestEvents = events.slice(compact ? -10 : -24);
   const percent = progressPercent(currentJob);
   const statusClass = statusTone(currentJob?.status);
-  const currentPhase = phaseIndex(currentJob?.stage || latestEvents.at(-1)?.stage);
+  // A remediation can legitimately start a second evidence pass after the
+  // first diagnosis creates a safer plan. The four-step tracker represents
+  // overall closure, so it must never jump backwards to step 1 merely because
+  // the current strategy is recollecting evidence.
+  const currentPhase = Math.max(
+    phaseIndex(currentJob?.stage || latestEvents.at(-1)?.stage),
+    ...events.map((event: any) => phaseIndex(event?.stage)),
+  );
+  const completedThrough = Math.max(-1, ...events.map((event: any) => completedPhase(event?.stage)));
   const pendingApproval = currentJob?.pending_approval;
 
   useEffect(() => {
@@ -334,7 +365,7 @@ export function OpsJobProgress({
       cluster: plan.cluster || currentJob?.cluster,
       cluster_id: plan.cluster_id || currentJob?.cluster_id,
       namespace: plan.namespace || currentJob?.namespace,
-      target: plan.target || currentJob?.target,
+      target: targetLabel(plan.target || currentJob?.target),
       source: plan.source || currentJob?.source,
       high_risk_confirmed: highRisk ? Boolean(followupApprovals[approvalKey]) : Boolean(plan.high_risk_confirmed),
       operator_force_execute: true,
@@ -392,7 +423,7 @@ export function OpsJobProgress({
       </div>
       <div className="ops-phase-track" aria-label="运维执行阶段">
         {EXECUTION_PHASES.map((label, index) => {
-          const finished = index < currentPhase || (TERMINAL_STATUSES.has(String(currentJob?.status)) && index <= currentPhase);
+          const finished = index < currentPhase || index <= completedThrough || (TERMINAL_STATUSES.has(String(currentJob?.status)) && index <= currentPhase);
           return <div className={classNames(finished && "done", index === currentPhase && active && "active")} key={label}>
             <i>{finished ? <CheckCircle2 size={11} /> : index + 1}</i><span>{label}</span>
           </div>;
@@ -400,7 +431,7 @@ export function OpsJobProgress({
       </div>
       {pendingApproval && currentJob?.status === "awaiting_approval" && <div className="ops-step-approval-card">
         <header><span>故障链第 {pendingApproval.lineage_attempt || currentJob?.lineage_attempt || 1} 轮 · 第 {pendingApproval.change_index}/{pendingApproval.changes_total} 步</span><strong>{changeLabel({ type: pendingApproval.action })}</strong><em>{pendingApproval.risk || "medium"}</em></header>
-        <div className="ops-step-approval-target"><span>将要修改</span><b>{pendingApproval.target}</b></div>
+        <div className="ops-step-approval-target"><span>将要修改</span><b>{targetLabel(pendingApproval.target)}</b></div>
         <p>{pendingApproval.reason || "等待操作员确认本步骤。"}</p>
         <div className="ops-step-rollback"><span>回滚方式</span><b>{pendingApproval.rollback || "恢复变更前配置"}</b></div>
         {(pendingApproval.patch || pendingApproval.manifest) && <details open><summary>查看本步骤配置差异</summary><pre>{compactJson(pendingApproval.patch || pendingApproval.manifest, 5000)}</pre></details>}
@@ -411,7 +442,7 @@ export function OpsJobProgress({
         {stepApprovalError && <div className="error-box">{stepApprovalError}</div>}
       </div>}
       <div className="ops-live-grid">
-        <div><span>目标</span><strong>{currentJob?.target || currentJob?.id || "-"}</strong></div>
+        <div><span>目标</span><strong>{targetLabel(currentJob?.target, currentJob?.id || "-")}</strong></div>
         <div><span>集群/命名空间</span><strong>{currentJob?.cluster || "-"} / {currentJob?.namespace || "-"}</strong></div>
         <div><span>操作员</span><strong>{currentJob?.operator || "system"}</strong></div>
         <div><span>更新时间</span><strong>{formatTime(currentJob?.updated_at)}</strong></div>
@@ -513,7 +544,7 @@ export function OpsJobProgress({
 	                <div><strong>{plan.title || `替代策略 ${index + 1}`}</strong><span>{risk} · {planChanges.length} 项变更</span></div>
 	                <p>{plan.summary || plan.reason || "基于上一轮证据生成的差异化修复策略。"}</p>
 	                {previousAttempt && <div className="ops-followup-difference"><b>为什么换方案</b><span>上一轮：{previousAttempt.strategy || "上一策略"}</span><small>{previousAttempt.outcome || "恢复验证未通过；本轮必须更换动作、目标参数或根因假设。"}</small></div>}
-	                {planChanges.length > 0 ? <div className="ops-followup-change-list">{planChanges.map((change: any, changeIndex: number) => <span key={`${change.type}-${changeIndex}`}><i>{changeIndex + 1}</i><b>{changeLabel(change)}</b><em>{change.workload_type || change.kind || "resource"}/{change.workload_name || change.name || change.pvc_name || plan.target || "-"}</em><small>{change.reason || "执行后按恢复判据验证。"}</small></span>)}</div> : <div className="ops-followup-verification"><b>下一步诊断</b>{asList(plan.steps || plan.operator_steps).slice(0, 4).map((step: any, stepIndex: number) => <span key={`${step?.title || step}-${stepIndex}`}><i>{stepIndex + 1}</i>{String(step?.description || step?.title || step)}</span>)}</div>}
+	                {planChanges.length > 0 ? <div className="ops-followup-change-list">{planChanges.map((change: any, changeIndex: number) => <span key={`${change.type}-${changeIndex}`}><i>{changeIndex + 1}</i><b>{changeLabel(change)}</b><em>{change.workload_type || change.kind || "resource"}/{change.workload_name || change.name || change.pvc_name || targetLabel(plan.target)}</em><small>{change.reason || "执行后按恢复判据验证。"}</small></span>)}</div> : <div className="ops-followup-verification"><b>下一步诊断</b>{asList(plan.steps || plan.operator_steps).slice(0, 4).map((step: any, stepIndex: number) => <span key={`${step?.title || step}-${stepIndex}`}><i>{stepIndex + 1}</i>{String(step?.description || step?.title || step)}</span>)}</div>}
 	                {asList(plan.verification_plan).length > 0 && <div className="ops-followup-verification"><b>执行后验证</b>{asList(plan.verification_plan).slice(0, 4).map((item: any, verifyIndex: number) => <span key={`${item}-${verifyIndex}`}><i>{verifyIndex + 1}</i>{String(item)}</span>)}</div>}
 	                {highRisk && <label className="toggle danger-toggle"><input type="checkbox" checked={Boolean(followupApprovals[approvalKey])} onChange={(event) => setFollowupApprovals((current) => ({ ...current, [approvalKey]: event.target.checked }))} />即使高风险也确认执行</label>}
 	                <button className="primary" onClick={() => runFollowup(plan, highRisk, approvalKey)} disabled={highRisk && !followupApprovals[approvalKey]}><ShieldCheck size={13} />{planChanges.length ? "确认并执行" : "开始下一轮诊断"}</button>
@@ -549,6 +580,7 @@ export function OpsPlanPanel({ plan, autonomous = false }: { plan: OpsPlan; auto
   );
   const operatorSkills = useMemo(() => asList(plan?.operator_skills), [plan]);
   const strategyDecision = plan?.permission_strategy_decision || {};
+  const planTarget = targetLabel(plan?.target, "目标对象");
   const requiresHighRisk = useMemo(
     () => serverRequiresHighRisk || Boolean(plan?.requires_high_risk_confirmation) || changes.some((change: any) => change.risk === "high" || change.auto_allowed === false || change.requires_high_risk_confirmation || HIGH_RISK_ACTIONS.has(String(change.type || change.action || ""))),
     [changes, plan?.requires_high_risk_confirmation, serverRequiresHighRisk],
@@ -571,6 +603,7 @@ export function OpsPlanPanel({ plan, autonomous = false }: { plan: OpsPlan; auto
     setSubmitting(true);
     const executionPlan = {
       ...plan,
+      target: planTarget,
       stepwise_confirmation: changes.length > 0,
       high_risk_confirmed: requiresHighRisk ? forceApproved : Boolean(plan?.high_risk_confirmed),
       operator_force_execute: true,
@@ -605,17 +638,17 @@ export function OpsPlanPanel({ plan, autonomous = false }: { plan: OpsPlan; auto
   }
 
   return <div className="ops-plan-card">
-    <div className="ops-plan-heading"><div><span>受控运维计划</span><strong>{plan.title || plan.target}</strong>{plan.planning_engine && <small>{plan.step_source === "llm_evidence_expert" ? "AI 专家动态路径" : "确定性 Runbook 兜底"} · {plan.planning_engine}</small>}</div><span className={classNames("severity", changes.length ? "hot" : "")}>{changes.length ? `${changes.length} 项变更` : "只读诊断"}</span></div>
+    <div className="ops-plan-heading"><div><span>受控运维计划</span><strong>{plan.title || planTarget}</strong>{plan.planning_engine && <small>{plan.step_source === "llm_evidence_expert" ? "AI 专家动态路径" : "确定性 Runbook 兜底"} · {plan.planning_engine}</small>}</div><span className={classNames("severity", changes.length ? "hot" : "")}>{changes.length ? `${changes.length} 项变更` : "只读诊断"}</span></div>
     <p className="ops-plan-summary">{plan.summary}</p>
     {plan.preview_mode === "live_evidence_ai" && <div className="ops-live-preview-proof">
       <div><span>预演来源</span><strong>实时证据 + AI 动态规划 + Skill 记忆</strong></div>
       <div><span>证据覆盖</span><strong>{Number(plan.evidence_summary?.events || 0)} Events · {Number(plan.evidence_summary?.log_streams || 0)} 日志流 · {Number(plan.evidence_summary?.storage_objects || 0)} 存储对象</strong></div>
       <div><span>首要根因</span><strong>{asList(plan.root_cause_hypotheses)[0]?.title || plan.planning?.selected_runbook || "仍在收敛证据"}</strong></div>
-      <div><span>目标锁</span><strong>{plan.target} · 不允许跨对象变更</strong></div>
+      <div><span>目标锁</span><strong>{planTarget} · 不允许跨对象变更</strong></div>
     </div>}
     <div className={classNames("ops-risk-note", requiresHighRisk && "hot")}>
       <b>{changes.length ? "算法变更预览" : "为什么暂不直接变更"}</b>
-      <span>{changes.length ? `将修改 ${changes.map((change: any) => `${change.workload_type || change.kind || "resource"}/${change.workload_name || change.name || plan.target}`).join("、")}。${riskPreview}。执行后会继续验证 Ready、重启次数、Events 和错误率。` : `${evidenceReason} 原理：SRE 门禁要求“根因证据 -> 最小变更 -> 可回滚 -> 可验证”闭环；证据不足时直接改配置会扩大故障半径，所以先执行深度诊断并让系统重规划。`}</span>
+      <span>{changes.length ? `将修改 ${changes.map((change: any) => `${change.workload_type || change.kind || "resource"}/${change.workload_name || change.name || planTarget}`).join("、")}。${riskPreview}。执行后会继续验证 Ready、重启次数、Events 和错误率。` : `${evidenceReason} 原理：SRE 门禁要求“根因证据 -> 最小变更 -> 可回滚 -> 可验证”闭环；证据不足时直接改配置会扩大故障半径，所以先执行深度诊断并让系统重规划。`}</span>
     </div>
     {operatorSkills.length > 0 && <div className="ops-skill-strip">
       <b>匹配到的运维 Skill</b>
@@ -636,12 +669,12 @@ export function OpsPlanPanel({ plan, autonomous = false }: { plan: OpsPlan; auto
     </div>}
     <div className="ops-plan-columns">
       <div><b>执行流程</b>{asList(plan.steps).map((step: any, index: number) => <div className="ops-plan-step" key={`${step.id || "step"}-${index}`}><i>{index + 1}</i><span><strong>{step.title || step.name || step}</strong><small>{step.description || step.detail || "收集证据并记录结果"}</small>{step.probe && <em>证据探针 · {step.probe}</em>}{step.decision_rule && <small className="ops-step-decision">判断：{step.decision_rule}</small>}</span></div>)}</div>
-      <div><b>拟变更内容</b>{changes.length ? changes.map((change: any, index: number) => <div className="change-preview" key={`${change.type}-${index}`}><strong>{changeLabel(change)}</strong><span>{change.node_name ? `Node/${change.node_name}` : change.pod_name ? `Pod/${change.pod_name}` : `${change.workload_type || change.kind || "resource"}/${change.workload_name || change.name || plan.target}`}</span><code>{typeof change.command === "string" ? change.command : JSON.stringify(change.patch || change.manifest || change.value || change.storage || change.replicas || {}, null, 2)}</code>{change.skill_id && <small>动态 Skill：{change.skill_id}</small>}</div>) : <div className="quiet-empty">本轮先采集日志、事件和配置证据，不修改集群。</div>}</div>
+      <div><b>拟变更内容</b>{changes.length ? changes.map((change: any, index: number) => <div className="change-preview" key={`${change.type}-${index}`}><strong>{changeLabel(change)}</strong><span>{change.node_name ? `Node/${change.node_name}` : change.pod_name ? `Pod/${change.pod_name}` : `${change.workload_type || change.kind || "resource"}/${change.workload_name || change.name || planTarget}`}</span><code>{typeof change.command === "string" ? change.command : JSON.stringify(change.patch || change.manifest || change.value || change.storage || change.replicas || {}, null, 2)}</code>{change.skill_id && <small>动态 Skill：{change.skill_id}</small>}</div>) : <div className="quiet-empty">本轮先采集日志、事件和配置证据，不修改集群。</div>}</div>
     </div>
     {asList(plan.success_criteria).length > 0 && <div className="success-criteria"><b>恢复判据</b>{asList(plan.success_criteria).map((item: any) => <span key={String(item)}><CheckCircle2 size={13} />{typeof item === "string" ? item : item.description || item.name}</span>)}</div>}
     {!job && <div className="ops-approval">
       <div className="ops-approval-steps">
-        <label className={classNames("ops-approval-step", reviewed && "checked")}><i>1</i><input type="checkbox" checked={reviewed} onChange={(event) => { setReviewed(event.target.checked); setError(""); }} /><span><b>确认目标与变更</b><small>我已核对 {plan.target || "目标对象"}、执行步骤、配置差异和恢复判据。</small></span></label>
+        <label className={classNames("ops-approval-step", reviewed && "checked")}><i>1</i><input type="checkbox" checked={reviewed} onChange={(event) => { setReviewed(event.target.checked); setError(""); }} /><span><b>确认目标与变更</b><small>我已核对 {planTarget}、执行步骤、配置差异和恢复判据。</small></span></label>
         {requiresHighRisk && <label className={classNames("ops-approval-step high-risk", forceApproved && "checked")}><i>2</i><input type="checkbox" checked={forceApproved} onChange={(event) => { setForceApproved(event.target.checked); setError(""); }} /><span><b>高风险二次确认</b><small>我理解该动作可能触发滚动、存储或流量影响，即使高风险也确认执行。</small></span></label>}
       </div>
       {changes.length > 0 && <label className="ops-stepwise-option"><input type="checkbox" checked readOnly /><span><b>逐步确认模式（强制）</b><small>只读诊断自动完成；每项真实 Kubernetes 写操作提交前都会暂停，逐项展示目标、差异、风险、指纹和回滚方式，由我确认后继续。</small></span></label>}

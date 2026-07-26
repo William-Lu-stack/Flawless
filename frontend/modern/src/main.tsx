@@ -783,13 +783,22 @@ function chatPlanFromResponse(data: any) {
   const changes = hasCanonicalRemediation ? asList(remediation.changes) : asList(decision.proposed_changes).length ? decision.proposed_changes : diagnosis.proposed_changes;
   const steps = hasCanonicalRemediation ? asList(remediation.steps) : asList(diagnosis.immediate_actions).map((item: any, index: number) => ({ id: `diagnostic-${index}`, title: typeof item === "string" ? item : item.title || item.action || `诊断步骤 ${index + 1}`, description: typeof item === "string" ? item : item.description || "" }));
   if (!steps.length && !asList(changes).length) return null;
+  const fallbackTarget = `${raw.k8s_context?.pod?.workload_kind || alert.workload_type || "Workload"}/${raw.k8s_context?.pod?.workload_name || alert.workload_name || alert.deployment || "selected-target"}`;
+  const remediationTarget = remediation.target;
+  const target = typeof remediationTarget === "string"
+    ? remediationTarget
+    : remediationTarget?.workload_name
+      ? `${remediationTarget.workload_type || "Workload"}/${remediationTarget.workload_name}`
+      : remediationTarget?.pod_name
+        ? `Pod/${remediationTarget.pod_name}`
+        : fallbackTarget;
   return {
     id: `chat-${makeId()}`,
     title: "SRE 对话处置计划",
     cluster: remediation.cluster || raw.k8s_context?.cluster || alert.cluster || "all",
     cluster_id: remediation.cluster_id || raw.k8s_context?.cluster_id || alert.cluster_id || alert.cluster || "all",
     namespace: remediation.namespace || raw.k8s_context?.pod?.namespace || alert.namespace || "default",
-    target: remediation.target || `${raw.k8s_context?.pod?.workload_kind || alert.workload_type || "Workload"}/${raw.k8s_context?.pod?.workload_name || alert.workload_name || alert.deployment || "selected-target"}`,
+    target,
     pod_name: remediation.pod_name || raw.k8s_context?.pod?.name || alert.pod || "",
     summary: diagnosis.root_cause || diagnosis.summary || "基于 SRE 对话证据生成的处置计划。",
     reason: remediation.reason || decision.reason || diagnosis.root_cause || "",

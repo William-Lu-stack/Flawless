@@ -41,8 +41,8 @@ if ($LASTEXITCODE -ne 0) {
 $images = @(
     @{
         Name = "Kubernetes Agent"
-        Source = "m.daocloud.io/ghcr.io/your-org/flawless:3.2.6"
-        Target = "k8s-agent:3.2.6"
+        Source = "m.daocloud.io/ghcr.io/your-org/flawless:3.2.7"
+        Target = "k8s-agent:3.2.7"
     },
     @{
         Name = "Approved Node Executor"
