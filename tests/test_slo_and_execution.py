@@ -61,6 +61,7 @@ class ErrorBudgetTests(unittest.TestCase):
             }],
             "usage": {},
         }
+        response.status_code = 200
         with patch.object(llm_client._gateway_client, "post", return_value=response) as post:
             model = llm_client.GatewayChatModel(
                 model_name="deepseek-v4-flash",
@@ -75,6 +76,69 @@ class ErrorBudgetTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["thinking"], {"type": "disabled"})
         self.assertEqual(payload["response_format"], {"type": "json_object"})
+
+    def test_deepseek_vllm_structured_json_uses_vllm_thinking_control(self):
+        from agents import llm_client
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": '{"status":"ok"}'},
+            }],
+            "usage": {},
+        }
+        with patch.object(llm_client._gateway_client, "post", return_value=response) as post:
+            model = llm_client.GatewayChatModel(
+                model_name="deepseek-v4-flash",
+                provider_name="internal-vllm",
+                base_url="https://model.example/engines/vllm",
+                auth_type="none",
+            )
+            model.invoke(
+                "只返回 JSON",
+                response_format={"type": "json_object"},
+            )
+        payload = post.call_args.kwargs["json"]
+        self.assertNotIn("thinking", payload)
+        self.assertEqual(
+            payload["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+    def test_unsupported_structured_thinking_control_retries_without_extension(self):
+        from agents import llm_client
+
+        rejected = MagicMock(status_code=400)
+        accepted = MagicMock(status_code=200)
+        accepted.json.return_value = {
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": '{"status":"ok"}'},
+            }],
+            "usage": {},
+        }
+        with patch.object(
+            llm_client._gateway_client,
+            "post",
+            side_effect=[rejected, accepted],
+        ) as post:
+            model = llm_client.GatewayChatModel(
+                model_name="deepseek-v4-flash",
+                base_url="https://compatible.example/v1",
+                auth_type="none",
+            )
+            result = model.invoke(
+                "只返回 JSON",
+                response_format={"type": "json_object"},
+            )
+        self.assertEqual(result.content, '{"status":"ok"}')
+        self.assertEqual(post.call_count, 2)
+        retry_payload = post.call_args_list[1].kwargs["json"]
+        self.assertNotIn("thinking", retry_payload)
+        self.assertNotIn("chat_template_kwargs", retry_payload)
 
     def test_default_production_slo_is_99_9(self):
         budget = evaluate_error_budget({"service": "svc", "window_days": 30})

@@ -158,6 +158,7 @@ class GatewayChatModel(BaseChatModel):
     model_name: str
     base_url: str
     profile_id: str = ""
+    provider_name: str = ""
     auth_type: str = "api_key"
     api_key: str = ""
     headers: dict[str, str] = {}
@@ -185,10 +186,10 @@ class GatewayChatModel(BaseChatModel):
         if stop:
             payload["stop"] = stop
         payload.update(kwargs)
+        structured_thinking_control = ""
         if (
             payload.get("response_format") == {"type": "json_object"}
             and "deepseek" in self.model_name.lower()
-            and "thinking" not in payload
         ):
             # Structured routers need a short, complete JSON contract. DeepSeek
             # v4 enables thinking by default, which can consume the completion
@@ -200,18 +201,56 @@ class GatewayChatModel(BaseChatModel):
                 "disabled",
             ).strip().lower()
             if thinking_mode in {"enabled", "disabled"}:
-                payload["thinking"] = {"type": thinking_mode}
+                protocol = os.getenv(
+                    "LLM_STRUCTURED_THINKING_PROTOCOL",
+                    "auto",
+                ).strip().lower()
+                provider_hint = f"{self.provider_name} {self.base_url}".lower()
+                if (
+                    protocol == "vllm"
+                    or (protocol == "auto" and "vllm" in provider_hint)
+                ):
+                    chat_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
+                    if "enable_thinking" not in chat_template_kwargs:
+                        chat_template_kwargs["enable_thinking"] = thinking_mode == "enabled"
+                        payload["chat_template_kwargs"] = chat_template_kwargs
+                        structured_thinking_control = "vllm"
+                elif "thinking" not in payload:
+                    payload["thinking"] = {"type": thinking_mode}
+                    structured_thinking_control = "deepseek"
 
         base = self.base_url.rstrip("/")
         url = base if base.endswith("/chat/completions") else base + "/chat/completions"
         headers = {"Content-Type": "application/json", **(self.headers or {})}
         if (self.auth_type or "api_key").lower() not in {"none", "noauth", "anonymous"}:
             headers["Authorization"] = f"Bearer {self.api_key or _token_cache.get()}"
-        if self.verify_ssl == LLM_VERIFY_SSL:
-            response = _gateway_client.post(url, headers=headers, json=payload)
-        else:
+        def post(request_payload: dict[str, Any]):
+            if self.verify_ssl == LLM_VERIFY_SSL:
+                return _gateway_client.post(url, headers=headers, json=request_payload)
             with httpx.Client(timeout=_gateway_client.timeout, verify=self.verify_ssl, limits=_HTTP_LIMITS) as client:
-                response = client.post(url, headers=headers, json=payload)
+                return client.post(url, headers=headers, json=request_payload)
+
+        response = post(payload)
+        if (
+            structured_thinking_control
+            and response.status_code in {400, 422}
+        ):
+            # Some OpenAI-compatible gateways do not expose the upstream
+            # reasoning controls. Retry once without the provider extension;
+            # the hard stage timeout still bounds the request.
+            compatible_payload = dict(payload)
+            if structured_thinking_control == "deepseek":
+                compatible_payload.pop("thinking", None)
+            elif structured_thinking_control == "vllm":
+                chat_template_kwargs = dict(
+                    compatible_payload.get("chat_template_kwargs") or {}
+                )
+                chat_template_kwargs.pop("enable_thinking", None)
+                if chat_template_kwargs:
+                    compatible_payload["chat_template_kwargs"] = chat_template_kwargs
+                else:
+                    compatible_payload.pop("chat_template_kwargs", None)
+            response = post(compatible_payload)
         response.raise_for_status()
         data = response.json()
 
@@ -329,6 +368,7 @@ def get_llm(
         model_name=profile.model,
         base_url=profile.base_url or LLM_API_BASE,
         profile_id=profile.id,
+        provider_name=profile.provider,
         auth_type=profile.auth_type,
         api_key=_profile_token(profile),
         headers=profile.headers,
