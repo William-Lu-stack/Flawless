@@ -75,6 +75,7 @@ from backend.app.services.resource_catalog import build_resource_catalog
 from backend.app.services.cluster_registry import ClusterRegistry
 from cmdb.local_cmdb import _collect_cluster_topology
 from backend.app.services.ops_execution import StageTimeoutError, run_with_heartbeat
+from backend.app.services.log_evidence import triage_kubernetes_logs
 from backend.app.services.ops_skill_registry import OpsSkillRegistry, approved_script_catalog, skill_option_catalog
 from backend.app.services.ops_skill_runtime import (
     OPS_SKILL_RUNTIME,
@@ -185,8 +186,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.5")
-APP_CODE_SIGNATURE = "semantic-root-cause-strategy-memory-v11"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.6")
+APP_CODE_SIGNATURE = "severity-first-progressive-recovery-v12"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -362,6 +363,49 @@ def _audit_event(action: str, actor: str, target: str, outcome: str, **details):
         "details": _redact_sensitive(details),
     }
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def _change_result_audit_receipt(result: Any) -> dict:
+    """Keep an auditable mutation receipt without logging the whole live object."""
+    if not isinstance(result, dict):
+        return {"value": _redact_text(str(result))[:500]}
+    receipt: dict[str, Any] = {}
+    for key in (
+        "error", "type", "status", "message", "code", "operation",
+        "api_version", "kind", "name", "namespace",
+    ):
+        value = result.get(key)
+        if value not in {None, ""}:
+            receipt[key] = value
+    resource_payload = (
+        result.get("resource")
+        if isinstance(result.get("resource"), dict)
+        else result
+    )
+    metadata = resource_payload.get("metadata") or {}
+    if isinstance(metadata, dict):
+        resource_identity = {
+            key: metadata.get(key)
+            for key in ("name", "namespace", "uid", "resourceVersion", "generation")
+            if metadata.get(key) not in {None, ""}
+        }
+        if resource_identity:
+            receipt["resource"] = resource_identity
+    if resource_payload.get("kind"):
+        receipt["kind"] = resource_payload.get("kind")
+    if resource_payload.get("apiVersion"):
+        receipt["apiVersion"] = resource_payload.get("apiVersion")
+    status = resource_payload.get("status")
+    if isinstance(status, dict):
+        receipt["resource_status"] = {
+            key: status.get(key)
+            for key in (
+                "phase", "observedGeneration", "replicas", "readyReplicas",
+                "availableReplicas", "updatedReplicas", "unavailableReplicas",
+            )
+            if status.get(key) not in {None, ""}
+        }
+    return _redact_sensitive(receipt or {"completed": True})
 
 
 def _safe_audit_event(audit_action: str, actor: str, audit_target: str, outcome: str, **details) -> dict | None:
@@ -6458,7 +6502,10 @@ def _permission_guidance(error_payload: dict | str, plan: dict, change: dict | N
     else:
         text = str(error_payload or "")
     lowered = text.lower()
-    if not any(term in lowered for term in ["forbidden", "rbac", "403", "permission", "unauthorized", "not permitted"]):
+    if not any(term in lowered for term in [
+        "forbidden", "rbac", "403", "permission denied", "unauthorized",
+        "operation not permitted", "is not permitted to",
+    ]):
         return None
     namespace = plan.get("namespace") or "目标 namespace"
     workload_type = plan.get("target") or plan.get("workload_type") or "目标 Workload"
@@ -6812,6 +6859,53 @@ def _validate_service_account_patch(patch: dict) -> tuple[bool, str]:
     return True, ""
 
 
+async def _collect_rancher_pod_logs(
+    cluster_id: str,
+    namespace: str,
+    pod_name: str,
+    pod: dict,
+) -> dict:
+    """Fetch current/previous logs immediately after Pod state is available."""
+    ns = quote(namespace, safe="")
+    pod_q = quote(pod_name, safe="")
+    logs: dict[str, dict] = {}
+    for container in (pod.get("containers") or [])[:8]:
+        name = container.get("name")
+        if not name:
+            continue
+        query = urlencode({"tailLines": 180, "container": name})
+        current = ""
+        current_error = ""
+        try:
+            current_payload = await _rancher_k8s_get(
+                cluster_id,
+                f"/api/v1/namespaces/{ns}/pods/{pod_q}/log?{query}",
+                timeout=25,
+            )
+            current = current_payload if isinstance(current_payload, str) else json.dumps(current_payload, ensure_ascii=False)
+        except Exception as exc:
+            current_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
+        previous = ""
+        previous_error = ""
+        if container.get("restart_count", 0):
+            try:
+                previous_payload = await _rancher_k8s_get(
+                    cluster_id,
+                    f"/api/v1/namespaces/{ns}/pods/{pod_q}/log?{query}&previous=true",
+                    timeout=25,
+                )
+                previous = previous_payload if isinstance(previous_payload, str) else json.dumps(previous_payload, ensure_ascii=False)
+            except Exception as exc:
+                previous_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
+        logs[str(name)] = {
+            "current": _clip_text(current, 5000),
+            "current_error": current_error,
+            "previous": _clip_text(previous, 5000),
+            "previous_error": previous_error,
+        }
+    return logs
+
+
 async def _collect_plan_deep_evidence(plan: dict) -> dict:
     namespace = plan.get("namespace") or "default"
     pod_name = _target_pod_from_plan(plan)
@@ -6953,6 +7047,9 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
     pod = _normalize_k8s_pod(raw_pod, replica_owner)
     if resolved_batch_owner:
         pod["workload_kind"], pod["workload_name"] = resolved_batch_owner
+    # Application failure text is the cheapest and usually the most direct
+    # signal. Fetch it before storage, services, nodes or CMDB-style evidence.
+    logs = await _collect_rancher_pod_logs(cluster_id, namespace, pod_name, pod)
     selector = quote(f"involvedObject.name={pod_name}", safe="=,")
     event_payload = await _rancher_k8s_get(cluster_id, f"/api/v1/namespaces/{ns}/events?fieldSelector={selector}", timeout=20)
     events = _normalize_k8s_events(event_payload.get("items", []) if isinstance(event_payload, dict) else [])
@@ -7065,33 +7162,6 @@ async def _collect_plan_deep_evidence(plan: dict) -> dict:
             }
         except Exception as exc:
             node = {"name": node_name, "error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
-    logs = {}
-    for container in (pod.get("containers") or [])[:8]:
-        name = container.get("name")
-        if not name:
-            continue
-        query = urlencode({"tailLines": 180, "container": name})
-        current = ""
-        current_error = ""
-        try:
-            current_payload = await _rancher_k8s_get(cluster_id, f"/api/v1/namespaces/{ns}/pods/{pod_q}/log?{query}", timeout=25)
-            current = current_payload if isinstance(current_payload, str) else json.dumps(current_payload, ensure_ascii=False)
-        except Exception as exc:
-            current_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
-        previous = ""
-        previous_error = ""
-        if container.get("restart_count", 0):
-            try:
-                previous_payload = await _rancher_k8s_get(cluster_id, f"/api/v1/namespaces/{ns}/pods/{pod_q}/log?{query}&previous=true", timeout=25)
-                previous = previous_payload if isinstance(previous_payload, str) else json.dumps(previous_payload, ensure_ascii=False)
-            except Exception as exc:
-                previous_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
-        logs[name] = {
-            "current": _clip_text(current, 5000),
-            "current_error": current_error,
-            "previous": _clip_text(previous, 5000),
-            "previous_error": previous_error,
-        }
     workload_type = pod.get("workload_kind") or workload_type or (plan.get("changes") or [{}])[0].get("workload_type") or "Deployment"
     workload_name = pod.get("workload_name") or workload_name
     workload = {}
@@ -7173,9 +7243,25 @@ async def _collect_ops_step(step: dict, plan: dict) -> dict:
             artifacts[f"{key}_logs"] = excerpts
             if errors:
                 artifacts[f"{key}_log_errors"] = errors
+            triaged = [
+                item
+                for item in ((deep.get("log_triage") or {}).get("priority") or [])
+                if isinstance(item, dict) and item.get("stream") == key
+            ]
+            if triaged:
+                artifacts[f"{key}_priority_logs"] = triaged
             for name, excerpt in excerpts.items():
                 logs.append(f"[{key}-logs] container={name} chars={len(excerpt)}")
-                logs.extend(f"[log] {line}" for line in excerpt.splitlines()[-10:] if line.strip())
+                priority_for_container = next(
+                    (item for item in triaged if item.get("container") == name),
+                    None,
+                )
+                visible_excerpt = (
+                    str(priority_for_container.get("excerpt") or "")
+                    if priority_for_container else excerpt
+                )
+                prefix = "priority-log" if priority_for_container else "log"
+                logs.extend(f"[{prefix}] {line}" for line in visible_excerpt.splitlines()[-14:] if line.strip())
             for name, error in errors.items():
                 status = "warning"
                 logs.append(f"[warn] {key} logs unavailable for container={name}: {error}")
@@ -7504,6 +7590,36 @@ async def _execute_change(change: dict, plan: dict) -> dict:
                     api_version=api_version,
                     kind=manifest_kind,
                     name=workload_name,
+                    namespace=namespace,
+                    patch=patch,
+                )
+        elif use_managed_cluster and ctype in {"create_pvc", "create_pv", "create_configmap"}:
+            manifest = change.get("manifest") or {}
+            if ctype == "create_pvc":
+                valid, reason = _validate_storage_manifest(manifest, "PersistentVolumeClaim", namespace)
+                rejection_label = "PVC"
+            elif ctype == "create_pv":
+                valid, reason = _validate_storage_manifest(manifest, "PersistentVolume", namespace)
+                rejection_label = "PV"
+            else:
+                valid, reason = _validate_configmap_manifest(manifest, namespace)
+                rejection_label = "ConfigMap"
+            if not valid:
+                result = {"error": f"{rejection_label} manifest rejected by safety policy: {reason}"}
+            else:
+                result = await asyncio.to_thread(CLUSTER_REGISTRY.apply_manifest, cluster_id, manifest)
+        elif use_managed_cluster and ctype == "patch_service_account":
+            patch = change.get("patch") or {"imagePullSecrets": [{"name": change.get("image_pull_secret", "")}]}
+            valid, reason = _validate_service_account_patch(patch)
+            if not valid:
+                result = {"error": f"ServiceAccount patch rejected by safety policy: {reason}"}
+            else:
+                result = await asyncio.to_thread(
+                    CLUSTER_REGISTRY.patch_resource,
+                    cluster_id,
+                    api_version="v1",
+                    kind="ServiceAccount",
+                    name=str(change.get("service_account") or "default"),
                     namespace=namespace,
                     patch=patch,
                 )
@@ -7869,7 +7985,7 @@ async def _execute_change(change: dict, plan: dict) -> dict:
             outcome["status"],
             change_type=ctype,
             patch=change.get("patch") or {},
-            result=outcome["result"],
+            result=_change_result_audit_receipt(outcome["result"]),
         )
     except Exception as audit_exc:
         # 审计输出失败不能把真实运维结果伪装成 HTTP 500。失败信息仍回传给前端，
@@ -7920,6 +8036,7 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     if change_type in {"patch_hpa", "expand_pvc", "create_pvc", "create_pv", "cordon_node", "patch_service_account", "create_configmap"}:
         namespace = first_change.get("namespace") or plan.get("namespace") or "default"
         cluster_id = plan.get("cluster_id") or "local"
+        use_managed_resource = cluster_id in {item.get("id") for item in CLUSTER_REGISTRY.list()}
         use_rancher = plan.get("source") == "rancher" and cluster_id not in {"", "local", "local-cluster"}
         if change_type == "patch_hpa":
             kind, name = "HPA", first_change.get("hpa_name", "")
@@ -7943,8 +8060,31 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
             kind, name = "Node", first_change.get("node_name", "")
             path = f"/api/v1/nodes/{quote(name, safe='')}"
         try:
-            if use_rancher:
-                raw = await _rancher_k8s_get(cluster_id, path, timeout=25)
+            if use_rancher or use_managed_resource:
+                if use_rancher:
+                    raw = await _rancher_k8s_get(cluster_id, path, timeout=25)
+                else:
+                    api_version_by_kind = {
+                        "HPA": "autoscaling/v2",
+                        "PVC": "v1",
+                        "PV": "v1",
+                        "ConfigMap": "v1",
+                        "ServiceAccount": "v1",
+                        "Node": "v1",
+                    }
+                    kubernetes_kind = {
+                        "HPA": "HorizontalPodAutoscaler",
+                        "PVC": "PersistentVolumeClaim",
+                        "PV": "PersistentVolume",
+                    }.get(kind, kind)
+                    raw = await asyncio.to_thread(
+                        CLUSTER_REGISTRY.read_resource,
+                        cluster_id,
+                        api_version=api_version_by_kind[kind],
+                        kind=kubernetes_kind,
+                        name=name,
+                        namespace=namespace,
+                    )
                 if kind == "HPA":
                     state = {"spec": raw.get("spec") or {}, "status": raw.get("status") or {}}
                 elif kind == "PVC":
@@ -8987,7 +9127,13 @@ def _permission_recovery_followup(
     pod_name = str(deep.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan) or "")
     change: dict | None = None
     stage = ""
-    force_root = preferred_strategy == "root_workload_security_context"
+    # A fresh incident always proves the least-privilege group repair
+    # insufficient before root is allowed, even if the model or a prior
+    # recovery record ranks root highest.
+    force_root = (
+        preferred_strategy == "root_workload_security_context"
+        and "nonroot_group" in attempted
+    )
 
     if (
         not force_root
@@ -9802,6 +9948,9 @@ async def _evidence_based_replan(
                 "你是 Kubernetes 故障修复规划器，当前模型可能是 deepseek-v4-flash。先从日志、Pod 状态 YAML、Events、"
                 "volumeMount/PVC/PV 和 securityContext 生成多个候选根因及置信度，再根据最高证据一致性动态匹配 Skill，"
                 "最后从给定动作目录中只选择一个结构化动作。"
+                "必须先读取真实证据中的 log_triage.priority（ERROR/FATAL/PANIC/WARNING 和语义致命错误），再读原始 "
+                "previous/current 日志；只有仍无法闭合根因时才把 Pod YAML、Events、存储和 dependency_topology/CMDB 逐层加入。"
+                "高优先级日志已与实时 YAML 证明本地根因时，CMDB 不能成为修复前置条件。"
                 "证据不足时 changes=[]。高风险动作可以提出但必须标 risk=high，所有动作都必须人工审批。"
                 "上一轮方案已经执行且恢复验证失败；不得只改写理由后重复相同动作、目标和参数。只有参数发生实质变化且新证据明确支持时，"
                 "才允许继续使用同一动作类型，否则必须换根因假设、换动作，或明确进入管理员人工处理。"
@@ -9814,6 +9963,8 @@ async def _evidence_based_replan(
                 "Pod/容器 securityContext、挂载、PVC/PV、最近配置与匹配 Skill，再给出实际 YAML Patch、重新发布方式或受审批命令。"
                 "不要只识别 permission denied 字面量。unable/can't open database file、readonly database、lock/WAL/PID/temp file "
                 "创建或打开失败都可能是写路径权限、错误路径/挂载、磁盘满或数据库损坏；必须列出支持与反证，并用 YAML/Events 关联后再选 Skill。"
+                "写路径权限类新故障必须先保持业务容器非 root 并对齐 UID/GID/fsGroup；只有该阶段执行后新 Pod 验证仍失败，"
+                "才允许在下一张独立审批单中把实际失败容器升级为 root。不能在首次方案中跳过非 root 阶段。"
                 "只有匹配 Skill 允许时才可提出 run_shell/exec_pod/exec_node，并必须给 command、明确目标、timeout_seconds、reason、rollback。"
                 "通常只执行最高匹配的一个 Skill；只有两个根因跨域且后一个明确依赖前一个结果时，才串行给 secondary_skill_ids，不能并行乱用多个。"
                 "只返回 {root_cause,candidate_root_causes:[{id,hypothesis,confidence,supporting_evidence,contradicting_evidence,"
@@ -10416,11 +10567,17 @@ async def _execute_ops_plan_once(
         plan["_runtime_evidence"] = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
     deep_evidence = plan.get("_runtime_evidence") or {}
     if not deep_evidence.get("error"):
+        deep_evidence["log_triage"] = _redact_sensitive(
+            triage_kubernetes_logs(deep_evidence.get("logs") or {})
+        )
         plan["_audit_before_snapshot"] = _ops_evidence_snapshot(deep_evidence)
+    log_triage = deep_evidence.get("log_triage") or {}
     evidence_summary = {
         "status": "warning" if deep_evidence.get("error") else "completed",
         "logs": len(deep_evidence.get("logs") or {}),
         "log_errors": sum(len(value or {}) for value in (deep_evidence.get("log_errors") or {}).values()),
+        "priority_log_errors": int(log_triage.get("error_count") or 0),
+        "priority_log_warnings": int(log_triage.get("warning_count") or 0),
         "events": len(deep_evidence.get("events") or []),
         "services": len(deep_evidence.get("services") or []),
         "storage": len(deep_evidence.get("storage") or []),
@@ -10436,6 +10593,32 @@ async def _execute_ops_plan_once(
         evidence_summary=evidence_summary,
         level="warning" if deep_evidence.get("error") else "success",
     )
+    if log_triage:
+        priority_excerpts = [
+            {
+                "container": item.get("container"),
+                "stream": item.get("stream"),
+                "error_count": item.get("error_count"),
+                "warning_count": item.get("warning_count"),
+                "excerpt": _clip_text(str(item.get("excerpt") or ""), 1200),
+            }
+            for item in (log_triage.get("priority") or [])[:6]
+            if isinstance(item, dict)
+        ]
+        await emit(
+            "log_triage_done",
+            (
+                f"日志优先级筛选完成：发现 {int(log_triage.get('error_count') or 0)} 条错误、"
+                f"{int(log_triage.get('warning_count') or 0)} 条警告，优先用这些证据定位根因。"
+                if log_triage.get("actionable") or log_triage.get("warning_count") else
+                "日志中未发现明确 ERROR/WARNING，后续将使用完整日志尾部、Pod 状态、Events 和 Workload YAML 深入排查。"
+            ),
+            strategy="error_warning_first",
+            error_count=int(log_triage.get("error_count") or 0),
+            warning_count=int(log_triage.get("warning_count") or 0),
+            priority_excerpts=priority_excerpts,
+            level="warning" if log_triage.get("actionable") else "info",
+        )
     submitted_change_fingerprints = {
         _change_item_fingerprint(change)
         for change in (plan.get("changes") or [])
@@ -10444,6 +10627,16 @@ async def _execute_ops_plan_once(
     runtime_skill_replacement: dict | None = None
     if not deep_evidence.get("error"):
         changes_before_skill_route = len(plan.get("changes") or [])
+        current_skill_id = str(plan.get("selected_skill_id") or "")
+        continuation_preference = (
+            [current_skill_id]
+            if (
+                current_skill_id
+                and plan.get("skill_handler_invoked")
+                and OPS_SKILL_RUNTIME.continuation_capable(current_skill_id)
+            )
+            else None
+        )
         _attach_operator_skills_to_plan(
             plan,
             _skill_signal_payload(
@@ -10465,6 +10658,12 @@ async def _execute_ops_plan_once(
                 evidence=deep_evidence,
                 plan=plan,
             ),
+            # A fresh evidence pass may still contain the generic symptom
+            # "CrashLoopBackOff". Do not let that generic router displace an
+            # already selected executable root-cause Skill while its direct
+            # evidence remains valid. The handler reruns against live evidence
+            # and still owns the final allowlist/plan materialization.
+            preferred_skill_ids=continuation_preference,
         )
         selected_skills = [
             {"id": item.get("id"), "name": item.get("name"), "confidence": item.get("confidence")}
@@ -10546,6 +10745,28 @@ async def _execute_ops_plan_once(
             )
     executed_steps = []
     steps = [step if isinstance(step, dict) else {"title": str(step)} for step in plan.get("steps", [])]
+    probe_priority = {
+        "current_logs": 0, "previous_logs": 1, "pod_security_context": 2, "workload_spec": 3,
+        "pvc_binding": 4, "storage_chain": 5, "events": 6, "recent_changes": 7,
+        "dependency_latency": 90, "traffic_baseline": 91, "mesh_routes": 92, "dependency_topology": 99,
+    }
+    steps.sort(
+        key=lambda item: (
+            probe_priority.get(str(item.get("id") or item.get("probe") or ""), 50),
+            int(item.get("sequence") or 0),
+        )
+    )
+    optional_probes = {"dependency_topology", "dependency_latency", "traffic_baseline", "mesh_routes"}
+    if runtime_skill_replacement is not None:
+        for step in steps:
+            executed_steps.append({
+                **step,
+                "status": "skipped",
+                "logs": ["[skip] 实时 ERROR/Workload 证据已生成新的可执行 Skill，先重新审批变更，不再执行无关诊断。"],
+                "artifacts": {"skip_reason": "runtime_skill_requires_fresh_approval"},
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+        steps = []
     for index, step in enumerate(steps, start=1):
         if cancel_event and cancel_event.is_set():
             return {
@@ -10556,6 +10777,33 @@ async def _execute_ops_plan_once(
                 "message": "任务已在诊断阶段中断，未继续提交变更。",
             }
         step_title = step.get("title") or step.get("name") or f"诊断步骤 {index}"
+        step_probe = str(step.get("id") or step.get("probe") or "")
+        if step_probe in optional_probes and log_triage.get("actionable"):
+            step_result = {
+                **step,
+                "title": step_title,
+                "status": "skipped",
+                "logs": ["[skip] ERROR/WARNING 日志与实时 YAML 已提供可操作根因，CMDB/依赖拓扑不再作为本轮恢复前置条件。"],
+                "artifacts": {"skip_reason": "actionable_log_evidence", "probe_id": step_probe},
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            executed_steps.append(step_result)
+            await emit(
+                "step_done",
+                f"跳过：{step_title}（已有直接错误证据）",
+                step_index=index,
+                steps_total=len(steps),
+                step_status="skipped",
+                step_result={
+                    "title": step_title,
+                    "status": "skipped",
+                    "finished_at": step_result["finished_at"],
+                    "logs_tail": step_result["logs"],
+                    "artifacts": ["probe_id", "skip_reason"],
+                },
+                level="info",
+            )
+            continue
         await emit(
             "step_start",
             f"开始：{step_title}",
@@ -10591,6 +10839,27 @@ async def _execute_ops_plan_once(
                 timed_out_stage="diagnostic_step",
                 step_index=index,
                 timeout_seconds=step_timeout,
+                level="warning",
+            )
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {_redact_text(str(exc))}"
+            step_result = {
+                **step,
+                "title": step_title,
+                "status": "warning",
+                "logs": [
+                    f"[error] 诊断探针执行失败：{error_text}",
+                    "[next] 已隔离该探针失败，流程将继续使用现有日志、Pod、Events 和 Workload 证据。",
+                ],
+                "artifacts": {"probe_error": error_text, "probe_id": step_probe},
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await emit(
+                "step_failed",
+                f"{step_title} 执行失败，已隔离异常并继续后续恢复流程。",
+                step_index=index,
+                steps_total=len(steps),
+                error=error_text,
                 level="warning",
             )
         executed_steps.append(step_result)
@@ -11027,6 +11296,20 @@ async def _execute_ops_plan_once(
     for candidate in raw_alternatives:
         if not isinstance(candidate, dict):
             continue
+        candidate_skill_id = str(candidate.get("selected_skill_id") or "")
+        candidate_continuation_preference = (
+            [candidate_skill_id]
+            if (
+                candidate_skill_id
+                and (
+                    candidate.get("skill_handler_invoked")
+                    or candidate.get("skill_runtime")
+                    or candidate.get("change_source") == "executable_skill"
+                )
+                and OPS_SKILL_RUNTIME.continuation_capable(candidate_skill_id)
+            )
+            else None
+        )
         candidate = _attach_operator_skills_to_plan(
             candidate,
             _skill_signal_payload(
@@ -11045,6 +11328,7 @@ async def _execute_ops_plan_once(
                 evidence=plan.get("_runtime_evidence") or plan.get("evidence") or {},
                 plan=candidate,
             ),
+            preferred_skill_ids=candidate_continuation_preference,
         )
         candidate["stepwise_confirmation"] = bool(candidate.get("changes"))
         candidate["high_risk_confirmed"] = False
@@ -11785,22 +12069,23 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
             evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
             pod = evidence.get("pod") if isinstance(evidence.get("pod"), dict) else {}
             log_signals = []
-            for container_name, log_payload in (evidence.get("logs") or {}).items():
-                if isinstance(log_payload, dict):
-                    for stream_name in ("current", "previous"):
-                        content = str(log_payload.get(stream_name) or "").strip()
-                        if content:
-                            log_signals.append({
-                                "container": str(container_name),
-                                "stream": stream_name,
-                                "content": _clip_text(content, 1200),
-                            })
-                elif str(log_payload).strip():
-                    log_signals.append({
-                        "container": str(container_name),
-                        "stream": "current",
-                        "content": _clip_text(log_payload, 1200),
-                    })
+            finding_log_triage = triage_kubernetes_logs(evidence.get("logs") or {})
+            selected_log_evidence = (
+                finding_log_triage.get("priority")
+                or finding_log_triage.get("fallback")
+                or []
+            )
+            for log_item in selected_log_evidence:
+                if not isinstance(log_item, dict) or not str(log_item.get("excerpt") or "").strip():
+                    continue
+                log_signals.append({
+                    "container": str(log_item.get("container") or ""),
+                    "stream": str(log_item.get("stream") or "current"),
+                    "content": _clip_text(log_item.get("excerpt"), 1200),
+                    "priority": bool(finding_log_triage.get("priority")),
+                    "error_count": int(log_item.get("error_count") or 0),
+                    "warning_count": int(log_item.get("warning_count") or 0),
+                })
             container_runtime = [{
                 "name": container.get("name"),
                 "security_context": container.get("security_context") or container.get("securityContext") or {},
@@ -11860,7 +12145,8 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
             llm = get_llm(temperature=0.0, max_tokens=1400, profile_id=model_profile_id or None)
             prompt = (
                 "你是企业 AIOps 的根因与运维 Skill 路由器，当前模型可能是 deepseek-v4-flash。"
-                "必须同时阅读 current/previous logs、Pod/Workload securityContext、volumeMount、PVC/PV 和 Events，"
+                "先阅读 log_signals 中 priority=true 的 ERROR/FATAL/PANIC/WARNING 和语义致命错误，再阅读其他日志；"
+                "随后用 Pod/Workload securityContext、volumeMount、PVC/PV 和 Events 交叉验证，"
                 "先生成候选根因及支持/反证，再为每个 finding 选择最多 3 个最相关的 Skill。"
                 "只能选择目录中已有 id，不得生成命令或新 Skill。通常只把最高证据一致性的 Skill 作为第一项；"
                 "只有跨域依赖时才保留后续 Skill。"
@@ -11868,6 +12154,7 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
                 "要核对路径是否位于 volumeMount、当前 UID/GID、fsGroup、只读挂载、容量、I/O、数据库损坏和 root_squash。"
                 "若明确不可写路径、同路径数据库启动失败、挂载关联和非 root 约束四类证据闭合，"
                 "可以建议 strategy_id=root_workload_security_context；否则不得仅凭一个相似词建议 root。"
+                "该 strategy 只是候选排序：新故障执行时仍须先尝试非 root UID/GID/fsGroup 对齐，验证失败后才可另行审批 root。"
                 "优先选择能覆盖根因证据、对象类型和恢复判据的 Skill；证据不足时保留确定性候选并降低 confidence。"
                 "只返回 JSON：{routes:[{finding_id,skill_ids,confidence,strategy_id,strategy_confidence,"
                 "root_cause_candidates:[{hypothesis,confidence,supporting_evidence,contradicting_evidence,"

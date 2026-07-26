@@ -33,8 +33,12 @@ if REQUIRE_LLM:
         "LLM_API_BASE": str(model_config["base_url"]),
         "LLM_API_KEY": str(model_config["api_key"]),
         "LLM_MODEL": str(model_config["model"]),
+        "LLM_PROFILE_ID": "e2e-openclaw",
         "LLM_AUTH_TYPE": "api_key",
         "LLM_MAX_TOKENS": str(model_config.get("max_tokens") or 4096),
+        "LLM_READ_TIMEOUT_SECONDS": str(model_config.get("read_timeout_seconds") or 90),
+        "MODEL_PROFILES_JSON": "",
+        "OAUTH_TOKEN_URL": "",
     })
     override_ip = str(model_config.get("dns_override_ip") or "").strip()
     override_host = urlparse(str(model_config["base_url"])).hostname or ""
@@ -52,6 +56,7 @@ os.environ.update({
     "CLUSTER_REGISTRY_PATH": str(STATE_DIR / "clusters.db"),
     "OPS_SKILL_ROOT": str(STATE_DIR / "ops-skills"),
     "OPS_SKILL_STORE_PATH": str(STATE_DIR / "ops-skills.json"),
+    "MODEL_PROFILES_STORE": str(STATE_DIR / "model-profiles.json"),
     "OPS_MUTATION_ENABLED": "true",
     "SKILL_EXECUTION_REQUIRED": "true",
     "OPS_VERIFY_INITIAL_GRACE_SECONDS": "8",
@@ -64,12 +69,21 @@ os.environ.update({
 from backend.app import main as application  # noqa: E402
 
 
-NAMESPACE = "flawless-e2e"
+SCENARIO = os.getenv("E2E_PERMISSION_SCENARIO", "mkdir").strip().lower()
+NAMESPACE = f"flawless-e2e-{SCENARIO[:8]}-{os.getpid()}"
 WORKLOAD = "permission-check"
 IMAGE = os.getenv("E2E_WORKLOAD_IMAGE", "flawless-local:latest")
 
 
 def deployment(init_command: str) -> dict:
+    app_command = (
+        "python -c \"import sqlite3,time; "
+        "db=sqlite3.connect('/work/runtime.db'); "
+        "db.execute('create table if not exists health(id integer)'); "
+        "db.commit(); print('database-ready', flush=True); time.sleep(3600)\""
+        if SCENARIO == "database" else
+        "mkdir -p /work/runtime && echo ready && sleep 3600"
+    )
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -93,7 +107,7 @@ def deployment(init_command: str) -> dict:
                         "name": "app",
                         "image": IMAGE,
                         "imagePullPolicy": "Never",
-                        "command": ["/bin/sh", "-c", "mkdir -p /work/runtime && echo ready && sleep 3600"],
+                        "command": ["/bin/sh", "-c", app_command],
                         "securityContext": {
                             "runAsNonRoot": True,
                             "runAsUser": 10001,
@@ -128,7 +142,12 @@ def wait_for_fault(cluster_id: str) -> tuple[str, dict]:
                 tail_lines=100,
             )
             text = str(last.get("logs") or {}).lower()
-            if "permission denied" in text and "mkdir" in text:
+            fault_observed = (
+                "unable to open database file" in text
+                if SCENARIO == "database" else
+                "permission denied" in text and "mkdir" in text
+            )
+            if fault_observed:
                 return pod_name, last
         time.sleep(2)
     raise AssertionError(f"fault evidence not observed: {last}")
@@ -144,9 +163,21 @@ async def run() -> None:
     )
     assert saved["status"] == "connected", saved
     registry.apply_manifest(cluster_id, {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE}})
-    registry.apply_manifest(cluster_id, deployment("mkdir -p /work && chmod 0500 /work"))
+    init_command = (
+        "mkdir -p /work && chown 0:20002 /work && chmod 0770 /work"
+        if SCENARIO == "gid" else
+        "mkdir -p /work && chmod 0500 /work"
+    )
+    registry.apply_manifest(cluster_id, deployment(init_command))
     try:
         pod_name, diagnostics = await asyncio.to_thread(wait_for_fault, cluster_id)
+        summary = (
+            "sqlite3.OperationalError: unable to open database file；失败路径位于 /work 挂载卷，业务 UID/GID=10001。"
+            if SCENARIO == "database" else
+            "mkdir /work/runtime permission denied；目录属组 20002 与业务 runAsGroup 10001 不一致。"
+            if SCENARIO == "gid" else
+            "mkdir /work/runtime permission denied；initContainer chmod 0500 与业务 UID 10001 冲突。"
+        )
         plan = {
             "id": "permission-recovery-e2e",
             "cluster": "isolated-e2e",
@@ -155,53 +186,91 @@ async def run() -> None:
             "namespace": NAMESPACE,
             "target": f"Deployment/{WORKLOAD}",
             "pod_name": pod_name,
-            "summary": "mkdir /work/runtime permission denied；initContainer chmod 0500 与业务 UID 10001 冲突。",
-            "root_cause": "错误 initContainer 权限配置导致业务容器无法写 emptyDir。",
-            "evidence": {"state_text": "mkdir permission denied", "pod": diagnostics.get("raw_pod") or {}},
+            "summary": summary,
+            "root_cause": "错误 initContainer 权限配置导致业务容器无法写 emptyDir，应用将底层权限错误包装为文件打开失败。",
+            "evidence": {"state_text": summary, "pod": diagnostics.get("raw_pod") or {}},
             "steps": [{"id": "previous_logs", "title": "复核失败日志"}],
             "changes": [],
             "success_criteria": ["rollout_complete", "pod_ready", "restart_count_stable"],
             "requires_confirmation": True,
         }
         if REQUIRE_LLM:
-            plan["_runtime_evidence"] = await application._collect_plan_deep_evidence(plan)
-            replans = await application._evidence_based_replan(plan, [], include_llm=True)
-            assert replans, {"error": "DeepSeek did not produce an executable replan", "runtime_replan": plan.get("_runtime_replan")}
-            plan = replans[0]
-            planning = plan.get("planning") or {}
-            assert str(planning.get("source") or "").startswith("llm+"), planning
-            assert not planning.get("llm_error"), planning
+            from agents.llm_client import get_llm
+
+            deep_evidence = await application._collect_plan_deep_evidence(plan)
+            assert not deep_evidence.get("error"), deep_evidence
+            deep_evidence["log_triage"] = application.triage_kubernetes_logs(
+                deep_evidence.get("logs") or {}
+            )
+            plan["evidence"] = deep_evidence
+            signal = application._skill_signal_payload(
+                question=plan["summary"],
+                diagnosis={"root_cause": plan["root_cause"]},
+                evidence=deep_evidence,
+                plan=plan,
+            )
+            available_skills = application.OPS_SKILL_REGISTRY.agent_context(signal, top_k=3)
+            prompt = (
+                "你是 Kubernetes SRE Skill 路由器。优先阅读 log_triage.priority 的 ERROR/WARNING，"
+                "把应用包装错误还原为底层根因，并用 Pod/Workload securityContext、volumeMount、"
+                "PVC/PV、Events 交叉验证。unable to open database file 不能只做关键词匹配。"
+                "通常只选一个最高匹配 Skill。写路径权限新故障的 first_stage 必须是 nonroot_group；"
+                "只有它执行后验证失败才可升级 root。只返回 JSON："
+                "{root_cause,root_cause_candidates:[{hypothesis,confidence,supporting_evidence,"
+                "contradicting_evidence}],skill_routing:{primary_skill_id,secondary_skill_ids,"
+                "strategy_id,confidence,rationale},first_stage}。\n"
+                f"Skills={json.dumps(available_skills, ensure_ascii=False)[:9000]}\n"
+                f"Evidence={json.dumps(application._redact_sensitive(deep_evidence), ensure_ascii=False)[:12000]}"
+            )
+            # Reasoning-capable DeepSeek profiles may spend a substantial part
+            # of the completion budget before emitting the final JSON.
+            llm = get_llm(temperature=0.0, max_tokens=4096, profile_id="e2e-openclaw")
+            response = await asyncio.to_thread(llm.invoke, prompt)
+            diagnosis = application._extract_json_object(
+                getattr(response, "content", str(response))
+            )
+            routing = diagnosis.get("skill_routing") or {}
+            assert routing.get("primary_skill_id") == "skill-volume-permission-recovery", diagnosis
+            first_stage = str(diagnosis.get("first_stage") or "").lower()
+            assert (
+                "nonroot_group" in first_stage
+                or ("fsgroup" in first_stage and "root" not in first_stage.replace("non-root", ""))
+            ), diagnosis
+            plan = application._attach_operator_skills_to_plan(
+                plan,
+                {
+                    "question": plan["summary"],
+                    "diagnosis": diagnosis,
+                    "evidence": deep_evidence,
+                    "plan": plan,
+                },
+                preferred_skill_ids=[routing["primary_skill_id"]],
+                routing={
+                    "source": "deepseek-e2e",
+                    "selected_skill_ids": [routing["primary_skill_id"]],
+                    "strategy_id": routing.get("strategy_id") or "",
+                    "confidence": routing.get("confidence"),
+                    "rationale": routing.get("rationale") or "",
+                },
+            )
+            plan["planning"] = {
+                "source": "llm+DynamicSkillRouterE2E",
+                "model": str(model_config["model"]),
+                "first_stage": first_stage,
+            }
         else:
             # Dynamic Skills authorize mutations only after their complete
             # evidence_required set has been collected from the live cluster.
             deep_evidence = await application._collect_plan_deep_evidence(plan)
             assert not deep_evidence.get("error"), deep_evidence
             plan["evidence"] = deep_evidence
-            plan["changes"] = [{
-                "type": "patch_resource",
-                "api_version": "apps/v1",
-                "kind": "Deployment",
-                "name": WORKLOAD,
-                "namespace": NAMESPACE,
-                "patch": {
-                    "spec": {"template": {"spec": {"initContainers": [{
-                        "name": "prepare-volume",
-                        "image": IMAGE,
-                        "imagePullPolicy": "Never",
-                        "command": ["/bin/sh", "-c", "mkdir -p /work && chown 10001:10001 /work && chmod 0770 /work"],
-                        "securityContext": {"runAsUser": 0, "runAsGroup": 0},
-                        "volumeMounts": [{"name": "work", "mountPath": "/work"}],
-                    }]}}},
-                },
-                "reason": "实时日志证明 prepare-volume 把 emptyDir 改成 0500，业务 UID 10001 无法 mkdir；修正错误初始化命令后重新发布。",
-                "rollback": "恢复审批前 Deployment revision。",
-            }]
+            plan["changes"] = []
             plan = application._attach_operator_skills_to_plan(plan, {
                 "question": plan["summary"],
                 "diagnosis": {"root_cause": plan["root_cause"]},
                 "evidence": deep_evidence,
                 "plan": plan,
-            })
+            }, preferred_skill_ids=["skill-volume-permission-recovery"])
         assert plan["changes"][0]["skill_id"] == "skill-volume-permission-recovery", plan
 
         blocked = await application._execute_change(copy.deepcopy(plan["changes"][0]), copy.deepcopy(plan))
@@ -215,12 +284,29 @@ async def run() -> None:
             approvals.append({"index": index, "total": total, "target": target, "command": approved_change.get("command")})
             return True
 
-        result = await application._execute_ops_plan_once(
-            plan,
-            summarize=False,
-            change_approval=approve,
-        )
-        assert approvals and approvals[0]["index"] == 1, approvals
+        stages: list[str] = []
+        result: dict = {}
+        for _attempt in range(4):
+            stages.append(str(plan.get("permission_recovery_stage") or "initial"))
+            result = await application._execute_ops_plan_once(
+                plan,
+                summarize=False,
+                change_approval=approve,
+            )
+            if (result.get("verification") or {}).get("recovered") is True:
+                break
+            candidates = [
+                item
+                for item in (result.get("alternative_plans") or [])
+                if isinstance(item, dict)
+                and item.get("changes")
+                and item.get("selected_skill_id") == "skill-volume-permission-recovery"
+            ]
+            assert candidates, {"error": "no next permission strategy", "result": result}
+            plan = candidates[0]
+            plan["high_risk_confirmed"] = True
+            plan["operator_force_execute"] = True
+        assert approvals and approvals[0]["index"] == 1, {"approvals": approvals, "result": result, "plan": plan}
         assert result["status"] == "completed", result
         assert not (result.get("results") or [{}])[0].get("permission_guidance"), result
         assert (result.get("verification") or {}).get("recovered") is True, result
@@ -228,12 +314,19 @@ async def run() -> None:
         assert candidate.get("lifecycle") == "candidate" and candidate.get("enabled") is False, candidate
         print({
             "status": result["status"],
-            "fault": "mkdir permission denied",
+            "fault": (
+                "unable to open database file"
+                if SCENARIO == "database" else
+                "directory GID mismatch"
+                if SCENARIO == "gid" else
+                "mkdir permission denied"
+            ),
             "planner": (plan.get("planning") or {}).get("source") or "deterministic-test-plan",
             "action": plan["changes"][0].get("type"),
             "skill": plan["changes"][0]["skill_id"],
             "approval_blocked_before_confirm": True,
             "approved_steps": len(approvals),
+            "permission_stages": stages,
             "recovered": result["verification"]["recovered"],
             "candidate_skill": candidate.get("id"),
         })

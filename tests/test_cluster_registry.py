@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from kubernetes import client
 
@@ -35,6 +35,33 @@ users:
 
 
 class ClusterRegistryTests(unittest.TestCase):
+    def test_workload_patch_uses_strategic_merge_for_named_container_lists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ClusterRegistry(Path(directory) / "clusters.db")
+            resource = MagicMock(namespaced=True)
+            resource.patch.return_value = {}
+            dynamic = MagicMock()
+            dynamic.resources.get.return_value = resource
+            with (
+                patch.object(registry, "api_client", return_value=MagicMock()),
+                patch("backend.app.services.cluster_registry.DynamicClient", return_value=dynamic),
+            ):
+                registry.patch_resource(
+                    "cluster-a",
+                    api_version="apps/v1",
+                    kind="Deployment",
+                    name="api",
+                    namespace="default",
+                    patch={"spec": {"template": {"spec": {"containers": [{
+                        "name": "api",
+                        "securityContext": {"runAsUser": 0},
+                    }]}}}},
+                )
+            self.assertEqual(
+                resource.patch.call_args.kwargs["content_type"],
+                "application/strategic-merge-patch+json",
+            )
+
     def test_sqlite_open_failure_uses_configured_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             primary = Path(directory) / "readonly" / "clusters.db"

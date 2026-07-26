@@ -34,6 +34,7 @@ from agents.aiops_observability import (
 )
 from agents.llm_client import get_llm
 from agents.remediation_engine import ACTION_CATALOG, build_remediation_plan, expert_steps_from_diagnosis
+from backend.app.services.log_evidence import triage_kubernetes_logs
 
 load_dotenv()
 
@@ -435,7 +436,11 @@ async def diagnose(state: SREState) -> SREState:
     safe_alert = _redact_sensitive(alert)
     safe_pods = _redact_sensitive(scoped_pods)
     safe_events = _redact_sensitive(context.get("events", {}).get("events", [])[:20])
+    log_triage = triage_kubernetes_logs(context.get("logs", {}))
     safe_diagnostics = _redact_sensitive({
+        # Keep the compact high-severity evidence before raw logs so it is not
+        # lost when a long model prompt is clipped.
+        "log_triage": log_triage,
         "target_pod": context.get("pod", {}),
         "logs": context.get("logs", {}),
         "workload": context.get("workload", {}),
@@ -487,6 +492,8 @@ Deep evidence: {json.dumps(safe_diagnostics, ensure_ascii=False)[:14000]}
 10. 不得只做字面关键词匹配。先把应用/框架包装后的错误还原成底层资源操作，再与 Pod YAML 交叉验证。例如 `unable/can't open database file` 可能是父目录不存在、volumeMount/subPath 错误、只读根文件系统、容器 UID/GID 无写权限、磁盘满或数据库文件损坏；只有日志路径、volumeMount、securityContext、PVC/PV/Events 中至少一类旁证支持时，才提高“写路径权限”置信度并匹配卷权限 Skill。lock/WAL/PID/temp file 创建失败使用同一推理方法。
 11. 对每个候选根因列出支持证据和反证。不要因为 Skill 名称、用户描述或单个相似词强行命中；先输出候选根因，再选择主 Skill。主 Skill 的某一阶段验证失败不等于整个 Skill 失败，可连续 Skill 应基于失败后新证据进入下一阶段。
 12. 如果日志同时明确给出某个配置路径 `is not writable`、数据库/lock/WAL 在该路径启动失败，且 Pod YAML 证明该路径位于 volumeMount、securityContext 强制非 root，必须把 `root_workload_security_context` 列为候选策略；若其证据强度最高可作为 strategy_id。它仍是高风险提案，必须由服务端复核实时 YAML 并人工审批，不能直接执行。若存在 no space、I/O、数据库损坏或 NFS root_squash 证据，应降低该策略并列出反证。
+13. 严格按证据成本排序：先读 log_triage.priority 中的 ERROR/FATAL/PANIC 和 WARNING，再读 previous/current 原始日志尾部；仍不能闭合根因时才扩展到 Pod 状态、Workload YAML、Events、存储链和依赖拓扑。若高优先级日志已经与实时 YAML 闭合出本地根因，不得把 dependency_topology/CMDB 作为恢复前置步骤。
+14. 对写路径权限类新故障，即便 root 候选评分最高，也必须先提出保持业务容器非 root 的 UID/GID/fsGroup 对齐阶段；只有该阶段已经执行且新 Pod 验证仍失败，才进入另一次人工审批的 root 阶段。每个阶段后都要验证新 Pod Ready、错误日志消失且重启数稳定，未恢复就依据新证据继续同一 Skill 的下一阶段。
 
 只返回 JSON，不要任何其他内容。"""
 

@@ -228,6 +228,7 @@ def _infer_expert_probe(text: str) -> str:
     lowered = str(text or "").lower()
     mappings = [
         (("previous", "上一次", "退出日志", "laststate"), "previous_logs"),
+        (("log", "日志", "错误栈", "error", "warning", "warn"), "current_logs"),
         (("event", "事件", "failedscheduling", "failedmount"), "events"),
         (("pvc", "pv", "storageclass", "csi", "存储", "挂载"), "storage_chain"),
         (("service", "endpoint", "selector", "流量入口"), "service_endpoints"),
@@ -241,7 +242,6 @@ def _infer_expert_probe(text: str) -> str:
         (("cmdb", "依赖", "调用链", "kafka"), "dependency_topology"),
         (("registry", "imagepull", "镜像仓库", "拉取"), "registry_connectivity"),
         (("workload", "deployment", "statefulset", "daemonset", "模板", "配置"), "workload_spec"),
-        (("log", "日志", "错误栈"), "current_logs"),
     ]
     for terms, probe in mappings:
         if any(term in lowered for term in terms):
@@ -278,12 +278,31 @@ def expert_steps_from_diagnosis(diagnosis: dict) -> list[dict[str, Any]]:
             expected = []
         if not title:
             continue
+        optional = probe in {"dependency_topology", "dependency_latency", "traffic_baseline", "mesh_routes"}
         steps.append({
             "id": probe, "sequence": index, "title": title[:120], "description": description[:500],
             "probe": probe, "expected_evidence": expected if isinstance(expected, list) else [str(expected)],
             "decision_rule": decision_rule[:500], "on_match": on_match[:500], "on_miss": on_miss[:500],
-            "source": "llm_evidence_expert", "status": "pending",
+            "source": "llm_evidence_expert", "status": "pending", "optional": optional,
         })
+    probe_priority = {
+        "current_logs": 0,
+        "previous_logs": 1,
+        "pod_security_context": 2,
+        "workload_spec": 3,
+        "pvc_binding": 4,
+        "storage_chain": 5,
+        "events": 6,
+        "recent_changes": 7,
+        "service_endpoints": 20,
+        "dependency_latency": 90,
+        "traffic_baseline": 91,
+        "mesh_routes": 92,
+        "dependency_topology": 99,
+    }
+    steps.sort(key=lambda item: (probe_priority.get(str(item.get("probe") or ""), 50), int(item.get("sequence") or 0)))
+    for sequence, item in enumerate(steps, start=1):
+        item["sequence"] = sequence
     return steps
 
 

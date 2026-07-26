@@ -106,6 +106,17 @@ class RemediationEngineTests(unittest.TestCase):
         self.assertEqual(steps[1]["probe"], "service_endpoints")
         self.assertEqual(steps[0]["source"], "llm_evidence_expert")
 
+    def test_ai_expert_steps_run_logs_before_optional_cmdb(self):
+        steps = expert_steps_from_diagnosis({"immediate_actions": [
+            {"title": "追踪 CMDB 依赖链", "probe": "dependency_topology"},
+            {"title": "读取 ERROR 日志", "probe": "current_logs"},
+            {"title": "核对安全上下文", "probe": "pod_security_context"},
+        ]})
+        self.assertEqual([item["probe"] for item in steps], [
+            "current_logs", "pod_security_context", "dependency_topology",
+        ])
+        self.assertTrue(steps[-1]["optional"])
+
     def test_oom_plan_grows_memory_without_shell(self):
         plan = build_remediation_plan(
             self.alert,
@@ -240,6 +251,19 @@ class RemediationEngineTests(unittest.TestCase):
             },
             {"cluster": "managed", "namespace": "default"},
             {"type": "patch_resource"},
+        )
+        self.assertIsNone(guidance)
+
+    def test_validation_error_for_permission_named_workload_is_not_rbac(self):
+        guidance = server._permission_guidance(
+            {
+                "error": (
+                    '422 Unprocessable Entity: Deployment.apps "permission-check" '
+                    "is invalid: spec.template.spec.containers[0].image: Required value"
+                ),
+            },
+            {"cluster": "managed", "namespace": "default"},
+            {"type": "patch_workload_runtime_security"},
         )
         self.assertIsNone(guidance)
 

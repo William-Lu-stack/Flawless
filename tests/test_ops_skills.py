@@ -21,10 +21,60 @@ from backend.app.services.ops_skill_registry import (
     skill_option_catalog,
 )
 from backend.app.services.ops_skill_runtime import classify_volume_write_failure
+from backend.app.services.log_evidence import triage_kubernetes_logs
 
 
 class OpsSkillCatalogTests(unittest.TestCase):
-    def test_explicit_grafana_data_path_error_selects_root_security_context(self):
+    def test_log_triage_prioritizes_semantic_write_errors_over_info_noise(self):
+        triage = triage_kubernetes_logs({
+            "grafana": {
+                "current": "\n".join([
+                    "logger=settings level=info msg=\"Starting Grafana\"",
+                    "logger=settings level=info msg=\"Config loaded\"",
+                    "GF_PATHS_DATA='/var/lib/grafana' is not writable.",
+                    "logger=sqlstore level=info msg=\"Connecting to DB\"",
+                    "Error: unable to open database file (14)",
+                    "logger=cleanup level=warn msg=\"retrying startup\"",
+                ]),
+            },
+        })
+        self.assertTrue(triage["actionable"])
+        self.assertGreaterEqual(triage["error_count"], 2)
+        self.assertEqual(triage["warning_count"], 1)
+        excerpt = triage["priority"][0]["excerpt"]
+        self.assertIn("not writable", excerpt)
+        self.assertIn("unable to open database", excerpt)
+
+    def test_log_triage_falls_back_to_tail_when_no_error_or_warning(self):
+        triage = triage_kubernetes_logs({"app": {"current": "booting\nready\nserving"}})
+        self.assertFalse(triage["actionable"])
+        self.assertEqual(triage["priority"], [])
+        self.assertIn("serving", triage["fallback"][0]["excerpt"])
+
+    def test_change_audit_receipt_keeps_identity_without_full_resource(self):
+        receipt = server._change_result_audit_receipt({
+            "operation": "created",
+            "resource": {
+                "apiVersion": "v1",
+                "kind": "PersistentVolume",
+                "metadata": {
+                    "name": "data-pv",
+                    "uid": "resource-uid",
+                    "resourceVersion": "42",
+                    "managedFields": [{"large": "internal-structure"}],
+                },
+                "spec": {"hostPath": {"path": "/internal/path"}},
+                "status": {"phase": "Available"},
+            },
+        })
+        self.assertEqual(receipt["operation"], "created")
+        self.assertEqual(receipt["kind"], "PersistentVolume")
+        self.assertEqual(receipt["resource"]["name"], "data-pv")
+        self.assertEqual(receipt["resource_status"]["phase"], "Available")
+        self.assertNotIn("spec", receipt)
+        self.assertNotIn("managedFields", json.dumps(receipt))
+
+    def test_explicit_grafana_data_path_error_ranks_root_but_starts_nonroot(self):
         logs = "\n".join([
             "GF_PATHS_DATA='/var/lib/grafana' is not writable.",
             "logger=sqlstore msg=\"Connecting to DB\" dbtype=sqlite3",
@@ -98,20 +148,20 @@ class OpsSkillCatalogTests(unittest.TestCase):
             },
             preferred_skill_ids=["skill-volume-permission-recovery"],
         )
-        self.assertEqual(attached["permission_recovery_stage"], "root")
+        self.assertEqual(attached["permission_recovery_stage"], "nonroot_group")
         self.assertEqual(
             attached["permission_strategy_decision"]["source"],
             "deepseek_candidate_reasoning+server_evidence_guard",
         )
         spec = attached["changes"][0]["patch"]["spec"]["template"]["spec"]
-        self.assertEqual(spec["securityContext"]["runAsUser"], 0)
-        self.assertEqual(spec["securityContext"]["runAsGroup"], 0)
-        self.assertEqual(spec["securityContext"]["fsGroup"], 0)
-        self.assertEqual(spec["securityContext"]["supplementalGroups"], [0])
-        self.assertFalse(spec["securityContext"]["runAsNonRoot"])
-        self.assertEqual(spec["containers"][0]["securityContext"]["runAsUser"], 0)
-        self.assertEqual(spec["containers"][0]["securityContext"]["runAsGroup"], 0)
-        self.assertFalse(spec["containers"][0]["securityContext"]["runAsNonRoot"])
+        self.assertEqual(spec["securityContext"]["runAsUser"], 472)
+        self.assertEqual(spec["securityContext"]["runAsGroup"], 472)
+        self.assertEqual(spec["securityContext"]["fsGroup"], 472)
+        self.assertEqual(spec["securityContext"]["supplementalGroups"], [472])
+        self.assertTrue(spec["securityContext"]["runAsNonRoot"])
+        self.assertEqual(spec["containers"][0]["securityContext"]["runAsUser"], 472)
+        self.assertEqual(spec["containers"][0]["securityContext"]["runAsGroup"], 472)
+        self.assertTrue(spec["containers"][0]["securityContext"]["runAsNonRoot"])
 
     def test_capacity_evidence_prevents_direct_root_strategy(self):
         plan = {
@@ -727,6 +777,63 @@ Collect evidence and explain the result. Do not mutate infrastructure.
 
 
 class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_actionable_log_skips_optional_cmdb_probe(self):
+        events = []
+
+        async def progress(stage, message, **extra):
+            events.append({"stage": stage, "message": message, **extra})
+
+        plan = {
+            "target": "Deployment/grafana",
+            "namespace": "monitoring",
+            "steps": [{"id": "dependency_topology", "title": "追踪 CMDB 依赖链"}],
+            "changes": [],
+        }
+        evidence = {
+            "pod": {"name": "grafana-abc"},
+            "events": [],
+            "logs": {"grafana": {"current": "GF_PATHS_DATA is not writable\nError: unable to open database file"}},
+        }
+        collector = AsyncMock(side_effect=RuntimeError("CMDB transport closed"))
+        with (
+            patch.object(server, "_ops_release_gate", return_value={"allowed": True}),
+            patch.object(server, "_collect_plan_deep_evidence", new=AsyncMock(return_value=evidence)),
+            patch.object(server, "_attach_operator_skills_to_plan", side_effect=lambda current, _signal, **_kwargs: current),
+            patch.object(server, "_collect_ops_step", collector),
+            patch.object(server, "_verify_plan_recovery", new=AsyncMock(return_value={"status": "unknown", "recovered": None, "message": "diagnosis only"})),
+            patch.object(server, "record_remediation", return_value={"status": "recorded"}),
+        ):
+            result = await server._execute_ops_plan_once(plan, summarize=False, progress=progress)
+        collector.assert_not_awaited()
+        self.assertEqual(result["steps"][0]["status"], "skipped")
+        self.assertTrue(any(event["stage"] == "log_triage_done" for event in events))
+        self.assertFalse(any(event["stage"] == "step_start" for event in events))
+
+    async def test_diagnostic_probe_exception_is_closed_and_flow_continues(self):
+        events = []
+
+        async def progress(stage, message, **extra):
+            events.append({"stage": stage, "message": message, **extra})
+
+        plan = {
+            "target": "Deployment/web",
+            "namespace": "default",
+            "steps": [{"id": "workload_spec", "title": "读取 Workload YAML"}],
+            "changes": [],
+        }
+        with (
+            patch.object(server, "_ops_release_gate", return_value={"allowed": True}),
+            patch.object(server, "_collect_plan_deep_evidence", new=AsyncMock(return_value={"pod": {"name": "web-abc"}, "events": [], "logs": {}})),
+            patch.object(server, "_attach_operator_skills_to_plan", side_effect=lambda current, _signal, **_kwargs: current),
+            patch.object(server, "_collect_ops_step", new=AsyncMock(side_effect=RuntimeError("probe serialization failed"))),
+            patch.object(server, "_verify_plan_recovery", new=AsyncMock(return_value={"status": "unknown", "recovered": None, "message": "diagnosis only"})),
+            patch.object(server, "record_remediation", return_value={"status": "recorded"}),
+        ):
+            result = await server._execute_ops_plan_once(plan, summarize=False, progress=progress)
+        self.assertEqual(result["steps"][0]["status"], "warning")
+        self.assertTrue(any(event["stage"] == "step_failed" for event in events))
+        self.assertTrue(any(event["stage"] == "step_done" for event in events))
+
     async def test_job_request_merges_explicit_high_risk_approval_into_plan(self):
         request = Request({
             "type": "http",

@@ -353,8 +353,6 @@ class ClusterRegistry:
         batch = client.BatchV1Api(api_client)
         storage_api = client.StorageV1Api(api_client)
         raw_pod = encode(core.read_namespaced_pod(pod_name, namespace))
-        field_selector = f"involvedObject.name={pod_name}"
-        events = encode(core.list_namespaced_event(namespace, field_selector=field_selector, limit=500)).get("items", [])
         logs: dict[str, Any] = {}
         pod_status = raw_pod.get("status") or {}
         for status in [
@@ -375,6 +373,10 @@ class ClusterRegistry:
                 except Exception as exc:
                     previous_error = f"{type(exc).__name__}: {exc}"
             logs[name] = {"current": current[-10000:], "previous": previous[-10000:], "current_error": current_error, "previous_error": previous_error}
+        # Fetch logs before broad Events/storage/service/node discovery so a
+        # slow optional API cannot hide the direct application error.
+        field_selector = f"involvedObject.name={pod_name}"
+        events = encode(core.list_namespaced_event(namespace, field_selector=field_selector, limit=500)).get("items", [])
         workload: dict[str, Any] = {}
         owners = (raw_pod.get("metadata") or {}).get("ownerReferences") or []
         owner = owners[0] if owners else {}
@@ -554,10 +556,31 @@ class ClusterRegistry:
 
     def patch_resource(self, cluster_id: str, *, api_version: str, kind: str, name: str, namespace: str, patch: dict[str, Any]) -> dict[str, Any]:
         resource = DynamicClient(self.api_client(cluster_id)).resources.get(api_version=api_version, kind=kind)
-        kwargs = {"name": name, "body": patch, "content_type": "application/merge-patch+json"}
+        # Workload pod templates contain named lists (containers,
+        # initContainers, volumes). JSON Merge Patch replaces those lists and
+        # can accidentally erase required fields such as image. Kubernetes
+        # strategic merge patches merge built-in resources by their list keys.
+        strategic_kinds = {
+            "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet",
+            "Pod", "Job", "CronJob", "Service",
+        }
+        content_type = (
+            "application/strategic-merge-patch+json"
+            if kind in strategic_kinds
+            else "application/merge-patch+json"
+        )
+        kwargs = {"name": name, "body": patch, "content_type": content_type}
         if resource.namespaced:
             kwargs["namespace"] = namespace or "default"
         result = resource.patch(**kwargs)
+        return result.to_dict() if hasattr(result, "to_dict") else dict(result)
+
+    def read_resource(self, cluster_id: str, *, api_version: str, kind: str, name: str, namespace: str = "") -> dict[str, Any]:
+        resource = DynamicClient(self.api_client(cluster_id)).resources.get(api_version=api_version, kind=kind)
+        kwargs: dict[str, Any] = {"name": name}
+        if resource.namespaced:
+            kwargs["namespace"] = namespace or "default"
+        result = resource.get(**kwargs)
         return result.to_dict() if hasattr(result, "to_dict") else dict(result)
 
     def delete_resource(self, cluster_id: str, *, api_version: str, kind: str, name: str, namespace: str) -> dict[str, Any]:
