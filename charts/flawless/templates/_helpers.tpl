@@ -48,8 +48,6 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- define "flawless.volumeMounts" -}}
 - name: runtime-store
   mountPath: /var/lib/flawless
-- name: runtime-store
-  mountPath: /var/lib/flawless
 - name: private-algorithms
   mountPath: /var/lib/flawless-custom
   readOnly: true
