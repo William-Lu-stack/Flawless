@@ -35,6 +35,37 @@ users:
 
 
 class ClusterRegistryTests(unittest.TestCase):
+    def test_priority_log_bundle_reads_declared_container_without_status_entry(self):
+        core = MagicMock()
+        core.read_namespaced_pod_log.side_effect = (
+            lambda _pod, _namespace, **kwargs:
+            f"{kwargs.get('container')}:{'previous' if kwargs.get('previous') else 'current'}"
+        )
+        logs = ClusterRegistry._pod_log_bundle(
+            core,
+            {
+                "spec": {
+                    "containers": [
+                        {"name": "app"},
+                        {"name": "sidecar"},
+                    ],
+                },
+                "status": {
+                    "containerStatuses": [{
+                        "name": "app",
+                        "restartCount": 2,
+                    }],
+                },
+            },
+            namespace="default",
+            pod_name="app-abc",
+            tail_lines=180,
+        )
+        self.assertEqual(logs["app"]["current"], "app:current")
+        self.assertEqual(logs["app"]["previous"], "app:previous")
+        self.assertEqual(logs["sidecar"]["current"], "sidecar:current")
+        self.assertEqual(logs["sidecar"]["previous"], "")
+
     def test_workload_patch_uses_strategic_merge_for_named_container_lists(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = ClusterRegistry(Path(directory) / "clusters.db")

@@ -187,8 +187,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.11")
-APP_CODE_SIGNATURE = "adaptive-skill-evidence-utility-v17"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.12")
+APP_CODE_SIGNATURE = "priority-pod-log-skill-escalation-v18"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -3780,6 +3780,46 @@ def _rancher_enabled() -> bool:
     return bool(_rancher_base() and _rancher_token())
 
 
+def _ops_cluster_transport(plan: dict) -> str:
+    """Resolve the execution transport from cluster identity, not UI provenance.
+
+    SRE chat and inspection plans may preserve their surface name in
+    ``source`` (for example ``sre_chat``) while still targeting a Rancher
+    cluster. Requiring ``source == rancher`` silently redirected those plans to
+    the local MCP server, so the selected remote Pod's logs were never read.
+    """
+    cluster_id = str(
+        plan.get("cluster_id")
+        or plan.get("rancher_cluster_id")
+        or ""
+    ).strip()
+    source = str(plan.get("source") or "").strip().lower()
+    try:
+        managed_cluster_ids = {
+            str(item.get("id") or "").strip()
+            for item in CLUSTER_REGISTRY.list()
+        }
+    except Exception:
+        managed_cluster_ids = set()
+    if cluster_id in managed_cluster_ids:
+        return "kubeconfig"
+    if cluster_id in {"local", "local-cluster"}:
+        return "local"
+    if not cluster_id and "rancher" not in source:
+        return "local"
+    if "kubeconfig" in source:
+        # A missing/deleted managed-cluster record must fail visibly instead
+        # of accidentally using Rancher credentials for a different cluster.
+        return "managed_unavailable"
+    if "rancher" in source or _rancher_enabled():
+        return "rancher"
+    return "local"
+
+
+def _ops_uses_rancher(plan: dict) -> bool:
+    return _ops_cluster_transport(plan) == "rancher"
+
+
 def _rancher_verify_ssl() -> bool:
     return _env_bool("RANCHER_VERIFY_SSL", "true")
 
@@ -6141,8 +6181,10 @@ def _normalize_k8s_pod(raw: dict, replica_owner: dict[str, tuple[str, str]] | No
             "volume_mounts": [],
         })
     for spec_container in [*(spec.get("containers") or []), *(spec.get("initContainers") or [])]:
+        matched = False
         for item in containers:
             if item.get("name") == spec_container.get("name"):
+                matched = True
                 item["security_context"] = spec_container.get("securityContext") or {}
                 item["volume_mounts"] = spec_container.get("volumeMounts") or []
                 item["resources"] = spec_container.get("resources") or {}
@@ -6150,6 +6192,27 @@ def _normalize_k8s_pod(raw: dict, replica_owner: dict[str, tuple[str, str]] | No
                 item["liveness_probe"] = spec_container.get("livenessProbe") or {}
                 item["readiness_probe"] = spec_container.get("readinessProbe") or {}
                 item["startup_probe"] = spec_container.get("startupProbe") or {}
+        # A container can fail before Kubernetes creates a status entry.  Keep
+        # declared containers visible so priority log collection still tries
+        # the exact log endpoint and can show the API/RBAC error if unavailable.
+        if not matched and spec_container.get("name"):
+            containers.append({
+                "name": spec_container.get("name", ""),
+                "is_init": spec_container in (spec.get("initContainers") or []),
+                "ready": False,
+                "restart_count": 0,
+                "state": "",
+                "reason": "",
+                "state_detail": {},
+                "image": spec_container.get("image", ""),
+                "resources": spec_container.get("resources") or {},
+                "liveness_probe": spec_container.get("livenessProbe") or {},
+                "readiness_probe": spec_container.get("readinessProbe") or {},
+                "startup_probe": spec_container.get("startupProbe") or {},
+                "security_context": spec_container.get("securityContext") or {},
+                "volume_mounts": spec_container.get("volumeMounts") or [],
+                "env": spec_container.get("env") or [],
+            })
     workload_kind, workload_name = _owner_from_k8s_pod(raw, replica_owner)
     completed = status.get("phase") in {"Succeeded", "Completed"} or (
         bool(containers) and all(str((c.get("state_detail") or {}).get("reason") or "") == "Completed" for c in containers)
@@ -6612,7 +6675,7 @@ def _permission_guidance(error_payload: dict | str, plan: dict, change: dict | N
     service_account_name = os.getenv("K8S_SERVICE_ACCOUNT_NAME", "k8s-agent-sa")
     permission_owner = (
         "Rancher Token"
-        if plan.get("source") == "rancher"
+        if _ops_uses_rancher(plan)
         else f"ServiceAccount {service_account_namespace}/{service_account_name}"
     )
     return {
@@ -6805,10 +6868,7 @@ async def _ops_mutation_access_preflight(plan: dict, changes: list[dict]) -> dic
     cluster_id = str(plan.get("cluster_id") or "local")
     managed_cluster_ids = {str(item.get("id") or "") for item in CLUSTER_REGISTRY.list()}
     use_managed = cluster_id in managed_cluster_ids
-    use_rancher = (
-        plan.get("source") == "rancher"
-        and cluster_id not in {"", "local", "local-cluster"}
-    )
+    use_rancher = _ops_uses_rancher(plan)
     checks: list[dict] = []
     for change in changes:
         requirement = _change_access_requirement(change, plan)
@@ -7228,50 +7288,295 @@ async def _collect_rancher_pod_logs(
     """Fetch current/previous logs immediately after Pod state is available."""
     ns = quote(namespace, safe="")
     pod_q = quote(pod_name, safe="")
-    logs: dict[str, dict] = {}
-    for container in (pod.get("containers") or [])[:8]:
-        name = container.get("name")
-        if not name:
-            continue
-        query = urlencode({"tailLines": 180, "container": name})
-        current = ""
-        current_error = ""
+    timeout = max(5, min(20, int(os.getenv("OPS_PRIORITY_LOG_REQUEST_TIMEOUT_SECONDS", "12"))))
+
+    async def fetch_stream(name: str, previous: bool) -> tuple[str, str]:
+        query_values = {"tailLines": 180, "container": name}
+        if previous:
+            query_values["previous"] = "true"
         try:
-            current_payload = await _rancher_k8s_get(
+            payload = await _rancher_k8s_get(
                 cluster_id,
-                f"/api/v1/namespaces/{ns}/pods/{pod_q}/log?{query}",
-                timeout=25,
+                f"/api/v1/namespaces/{ns}/pods/{pod_q}/log?{urlencode(query_values)}",
+                timeout=timeout,
             )
-            current = current_payload if isinstance(current_payload, str) else json.dumps(current_payload, ensure_ascii=False)
+            content = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+            return _clip_text(content, 10000), ""
         except Exception as exc:
-            current_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
-        previous = ""
-        previous_error = ""
-        if container.get("restart_count", 0):
-            try:
-                previous_payload = await _rancher_k8s_get(
-                    cluster_id,
-                    f"/api/v1/namespaces/{ns}/pods/{pod_q}/log?{query}&previous=true",
-                    timeout=25,
-                )
-                previous = previous_payload if isinstance(previous_payload, str) else json.dumps(previous_payload, ensure_ascii=False)
-            except Exception as exc:
-                previous_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
-        logs[str(name)] = {
-            "current": _clip_text(current, 5000),
+            return "", f"{type(exc).__name__}: {_redact_text(str(exc))}"
+
+    async def fetch_container(container: dict) -> tuple[str, dict]:
+        name = str(container.get("name") or "")
+        current_task = fetch_stream(name, False)
+        previous_task = (
+            fetch_stream(name, True)
+            if int(container.get("restart_count") or 0) > 0
+            else asyncio.sleep(0, result=("", ""))
+        )
+        (current, current_error), (previous, previous_error) = await asyncio.gather(
+            current_task,
+            previous_task,
+        )
+        return name, {
+            "current": current,
             "current_error": current_error,
-            "previous": _clip_text(previous, 5000),
+            "previous": previous,
             "previous_error": previous_error,
         }
-    return logs
+
+    containers = [
+        item
+        for item in (pod.get("containers") or [])[:16]
+        if isinstance(item, dict) and item.get("name")
+    ]
+    rows = await asyncio.gather(*(fetch_container(item) for item in containers))
+    return {name: content for name, content in rows if name}
+
+
+def _ops_log_errors(logs: dict) -> dict:
+    return {
+        str(name): {
+            key: value
+            for key, value in (content or {}).items()
+            if key.endswith("_error") and value
+        }
+        for name, content in (logs or {}).items()
+        if isinstance(content, dict)
+        and any((content or {}).get(key) for key in ("current_error", "previous_error"))
+    }
+
+
+async def _collect_plan_priority_evidence(plan: dict) -> dict:
+    """Persist Pod YAML and logs before any optional deep-evidence probe.
+
+    This bounded pass deliberately excludes Service, node, storage backend and
+    CMDB discovery. A slow optional API may enrich a diagnosis later, but can
+    no longer erase a successfully read application error.
+    """
+    namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
+    cluster_id = str(plan.get("cluster_id") or plan.get("rancher_cluster_id") or "local")
+    transport = _ops_cluster_transport(plan)
+    requested_pod = _target_pod_from_plan(plan)
+    matching_pods: list[dict] = []
+
+    if transport == "managed_unavailable":
+        raise RuntimeError(
+            f"managed kubeconfig cluster {cluster_id!r} is no longer registered; "
+            "re-upload kubeconfig before diagnosis"
+        )
+
+    if transport == "kubeconfig":
+        replica_owner: dict[str, tuple[str, str]] = {}
+        if not requested_pod:
+            scope = await asyncio.to_thread(
+                CLUSTER_REGISTRY.namespace_pods,
+                cluster_id,
+                namespace=namespace,
+            )
+            for replica in scope.get("replicasets") or []:
+                metadata = replica.get("metadata") or {}
+                owners = metadata.get("ownerReferences") or []
+                if owners:
+                    replica_owner[str(metadata.get("name") or "")] = (
+                        str(owners[0].get("kind") or "Deployment"),
+                        str(owners[0].get("name") or ""),
+                    )
+            candidates = [
+                _normalize_k8s_pod(item, replica_owner)
+                for item in (scope.get("pods") or [])
+            ]
+            selected, matching_pods = _select_representative_pod(
+                candidates,
+                workload_name=workload_name,
+                workload_type=workload_type,
+            )
+            if not selected:
+                raise RuntimeError(
+                    f"no Pod owned by {workload_type}/{workload_name} in namespace {namespace}"
+                )
+            requested_pod = str(selected.get("name") or "")
+        payload = await asyncio.to_thread(
+            CLUSTER_REGISTRY.pod_priority_evidence,
+            cluster_id,
+            namespace=namespace,
+            pod_name=requested_pod,
+            tail_lines=180,
+        )
+        pod = _normalize_k8s_pod(payload.get("raw_pod") or {}, replica_owner)
+        if workload_name:
+            pod["workload_kind"] = workload_type
+            pod["workload_name"] = workload_name
+        logs = payload.get("logs") or {}
+        source = "kubeconfig"
+    elif transport == "rancher":
+        replica_owner: dict[str, tuple[str, str]] = {}
+        ns = quote(namespace, safe="")
+        if not requested_pod:
+            rs_result, pods_result = await asyncio.gather(
+                _rancher_k8s_get(
+                    cluster_id,
+                    f"/apis/apps/v1/namespaces/{ns}/replicasets",
+                    timeout=12,
+                ),
+                _rancher_k8s_get(
+                    cluster_id,
+                    f"/api/v1/namespaces/{ns}/pods",
+                    timeout=15,
+                ),
+                return_exceptions=True,
+            )
+            if isinstance(rs_result, dict):
+                for replica in rs_result.get("items") or []:
+                    metadata = replica.get("metadata") or {}
+                    owners = metadata.get("ownerReferences") or []
+                    if owners:
+                        replica_owner[str(metadata.get("name") or "")] = (
+                            str(owners[0].get("kind") or "Deployment"),
+                            str(owners[0].get("name") or ""),
+                        )
+            if isinstance(pods_result, Exception):
+                raise pods_result
+            candidates = [
+                _normalize_k8s_pod(item, replica_owner)
+                for item in ((pods_result or {}).get("items") or [])
+            ]
+            selected, matching_pods = _select_representative_pod(
+                candidates,
+                workload_name=workload_name,
+                workload_type=workload_type,
+            )
+            if not selected:
+                raise RuntimeError(
+                    f"no Pod owned by {workload_type}/{workload_name} in namespace {namespace}"
+                )
+            requested_pod = str(selected.get("name") or "")
+        raw_pod = await _rancher_k8s_get(
+            cluster_id,
+            f"/api/v1/namespaces/{ns}/pods/{quote(requested_pod, safe='')}",
+            timeout=15,
+        )
+        pod = _normalize_k8s_pod(raw_pod, replica_owner)
+        if workload_name and pod.get("workload_kind") in {"", "ReplicaSet"}:
+            pod["workload_kind"] = workload_type
+            pod["workload_name"] = workload_name
+        logs = await _collect_rancher_pod_logs(
+            cluster_id,
+            namespace,
+            requested_pod,
+            pod,
+        )
+        source = "rancher"
+    else:
+        listed = await _call_mcp_tool("list_pods", {"namespace": namespace})
+        candidates = listed.get("pods") or [] if isinstance(listed, dict) else []
+        selected, matching_pods = _select_representative_pod(
+            candidates,
+            workload_name=workload_name,
+            workload_type=workload_type,
+            requested_pod=requested_pod,
+        )
+        if not selected:
+            raise RuntimeError(
+                f"no Pod owned by {workload_type}/{workload_name} in namespace {namespace}"
+            )
+        pod = selected
+        requested_pod = str(selected.get("name") or "")
+        container_rows = [
+            item
+            for item in (selected.get("containers") or [])
+            if isinstance(item, dict) and item.get("name")
+        ][:16]
+        if not container_rows:
+            container_rows = [{"name": "", "restart_count": 0}]
+        logs = {}
+        for container in container_rows:
+            name = str(container.get("name") or "")
+            current = await _call_mcp_tool("get_pod_logs", {
+                "namespace": namespace,
+                "pod_name": requested_pod,
+                "container": name or None,
+                "tail_lines": 180,
+                "previous": False,
+            })
+            previous = {}
+            if int(container.get("restart_count") or 0) > 0:
+                previous = await _call_mcp_tool("get_pod_logs", {
+                    "namespace": namespace,
+                    "pod_name": requested_pod,
+                    "container": name or None,
+                    "tail_lines": 180,
+                    "previous": True,
+                })
+            logs[name or "default"] = {
+                "current": _clip_text(str(current.get("logs") or ""), 10000),
+                "current_error": _redact_text(str(current.get("error") or "")),
+                "previous": _clip_text(str(previous.get("logs") or ""), 10000),
+                "previous_error": _redact_text(str(previous.get("error") or "")),
+            }
+        source = "mcp"
+
+    if not requested_pod:
+        raise RuntimeError("selected Pod has no name")
+    plan["pod_name"] = requested_pod
+    return _redact_sensitive({
+        "namespace": namespace,
+        "pod_name": requested_pod,
+        "pod": pod,
+        "logs": logs,
+        "log_errors": _ops_log_errors(logs),
+        "workload": (
+            ((plan.get("evidence") or {}).get("workload") or {})
+            if isinstance(plan.get("evidence"), dict)
+            else {}
+        ),
+        "matching_pods": matching_pods[:8],
+        "source": source,
+        "transport": transport,
+        "priority_evidence": True,
+    })
+
+
+def _merge_ops_evidence(priority: dict, deep: dict) -> dict:
+    """Merge optional enrichments without discarding priority Pod/log proof."""
+    priority = priority if isinstance(priority, dict) else {}
+    deep = deep if isinstance(deep, dict) else {}
+    merged = copy.deepcopy(priority)
+    for key, value in deep.items():
+        if key == "logs" and isinstance(value, dict):
+            merged_logs = merged.setdefault("logs", {})
+            for name, content in value.items():
+                existing = merged_logs.get(name) if isinstance(merged_logs.get(name), dict) else {}
+                merged_logs[name] = {**existing, **(content if isinstance(content, dict) else {})}
+            continue
+        if key == "log_errors" and isinstance(value, dict):
+            merged.setdefault("log_errors", {}).update(value)
+            continue
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    usable_evidence = bool(merged.get("pod") or merged.get("logs") or merged.get("workload"))
+    priority_error = str(priority.get("error") or "").strip()
+    deep_error = str(deep.get("error") or "").strip()
+    if usable_evidence and priority_error:
+        merged.pop("error", None)
+        merged["priority_collection_error"] = priority_error
+        merged["partial"] = True
+    if usable_evidence and deep_error:
+        merged.pop("error", None)
+        merged["enrichment_error"] = deep_error
+        merged["partial"] = True
+    elif deep_error:
+        merged["error"] = deep_error
+    merged["log_errors"] = _ops_log_errors(merged.get("logs") or {})
+    return merged
 
 
 async def _collect_plan_deep_evidence(plan: dict) -> dict:
     namespace = plan.get("namespace") or "default"
     pod_name = _target_pod_from_plan(plan)
     cluster_id = plan.get("cluster_id") or "local"
-    use_managed = cluster_id in {item.get("id") for item in CLUSTER_REGISTRY.list()}
-    use_rancher = plan.get("source") == "rancher" and cluster_id not in {"", "local", "local-cluster"}
+    transport = _ops_cluster_transport(plan)
+    use_managed = transport == "kubeconfig"
+    use_rancher = transport == "rancher"
     namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
     matching_pods: list[dict] = []
     replica_owner: dict[str, tuple[str, str]] = {}
@@ -7577,7 +7882,7 @@ async def _collect_ops_step(step: dict, plan: dict) -> dict:
     namespace = plan.get("namespace") or "default"
     pod_name = _target_pod_from_plan(plan)
     cluster_id = plan.get("cluster_id") or "local"
-    use_rancher = plan.get("source") == "rancher" and cluster_id not in {"", "local", "local-cluster"}
+    use_rancher = _ops_uses_rancher(plan)
     logs = [
         f"[{datetime.now(timezone.utc).isoformat()}] INIT {title}",
         f"[target] cluster={plan.get('cluster', 'local-cluster')} namespace={namespace} pod={pod_name or '-'} workload={plan.get('target', '-')}",
@@ -7740,7 +8045,7 @@ async def _execute_change(change: dict, plan: dict) -> dict:
     cluster_id = plan.get("cluster_id") or change.get("cluster_id") or "local"
     managed_cluster_ids = {item.get("id") for item in CLUSTER_REGISTRY.list()}
     use_managed_cluster = cluster_id in managed_cluster_ids
-    use_rancher = plan.get("source") == "rancher" and cluster_id not in {"", "local", "local-cluster"}
+    use_rancher = _ops_uses_rancher(plan)
     workload_change_types = {
         "restart", "patch_workload", "patch_workload_volume", "patch_workload_runtime_security",
         "patch", "scale_out", "rollback_workload",
@@ -8414,7 +8719,7 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
         namespace = first_change.get("namespace") or plan.get("namespace") or "default"
         cluster_id = plan.get("cluster_id") or "local"
         use_managed_resource = cluster_id in {item.get("id") for item in CLUSTER_REGISTRY.list()}
-        use_rancher = plan.get("source") == "rancher" and cluster_id not in {"", "local", "local-cluster"}
+        use_rancher = _ops_uses_rancher(plan)
         if change_type == "patch_hpa":
             kind, name = "HPA", first_change.get("hpa_name", "")
             path = f"/apis/autoscaling/v2/namespaces/{quote(namespace, safe='')}/horizontalpodautoscalers/{quote(name, safe='')}"
@@ -8533,7 +8838,7 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     pod_name = _target_pod_from_plan(plan)
     cluster_id = plan.get("cluster_id") or "local"
     use_managed = cluster_id in {item.get("id") for item in CLUSTER_REGISTRY.list()}
-    use_rancher = plan.get("source") == "rancher" and cluster_id not in {"", "local", "local-cluster"}
+    use_rancher = _ops_uses_rancher(plan)
     matched: list[dict] = []
     errors: list[str] = []
 
@@ -9838,12 +10143,53 @@ def _permission_recovery_followup(
     if identity_match:
         uid = uid if uid is not None else int(identity_match.group(1))
         gid = gid if gid is not None else int(identity_match.group(2))
+
+    # Do not propose the live securityContext as if it were a new repair.  A
+    # common production failure already runs as 10001:10001 with matching
+    # fsGroup/supplementalGroups, yet the mounted data directory remains
+    # unwritable. Re-applying those exact values creates a new ReplicaSet but
+    # cannot change the outcome. Treat the live, still-failing configuration as
+    # an attempted non-root stage so evidence scoring can advance to a bounded
+    # ownership repair or the separately approved complete root fallback.
+    supplemental_groups = {
+        parsed
+        for value in (pod_sc.get("supplementalGroups") or [])
+        if (parsed := observed_int(value)) is not None
+    }
+    current_nonroot_group_active = bool(
+        uid is not None
+        and gid is not None
+        and uid > 0
+        and observed_int(container_sc.get("runAsUser")) == uid
+        and observed_int(container_sc.get("runAsGroup")) == gid
+        and container_sc.get("runAsNonRoot") is True
+        and observed_int(pod_sc.get("fsGroup")) == gid
+        and observed_int(pod_sc.get("runAsUser")) == uid
+        and observed_int(pod_sc.get("runAsGroup")) == gid
+        and pod_sc.get("runAsNonRoot") is True
+        and gid in supplemental_groups
+        and _storage_permission_detected(plan)
+    )
+    if current_nonroot_group_active:
+        attempted.add("nonroot_group")
+        runtime_stages = plan.setdefault("_attempted_permission_recovery_stages", [])
+        if "nonroot_group" not in runtime_stages:
+            runtime_stages.append("nonroot_group")
+        plan["current_nonroot_context_already_active"] = True
+        plan.setdefault("permission_strategy_decision", {}).update({
+            "live_nonroot_patch_is_noop": True,
+            "live_nonroot_identity": f"{uid}:{gid}",
+            "noop_guard": (
+                "实时 Workload 已包含完整同值非 root securityContext，且当前日志仍报写路径失败；"
+                "禁止重复提交同值 Patch。"
+            ),
+        })
     pod_name = str(deep.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan) or "")
     change: dict | None = None
     stage = ""
-    # A fresh incident always proves the least-privilege group repair
-    # insufficient before root is allowed, even if the model or a prior
-    # recovery record ranks root highest.
+    # Root is only selectable when the non-root stage is known to have failed:
+    # either it was executed in this incident chain or the still-failing live
+    # YAML already contains the same complete non-root contract.
     force_root = (
         preferred_strategy == "root_workload_security_context"
         and "nonroot_group" in attempted
@@ -11286,10 +11632,100 @@ async def _execute_ops_plan_once(
             "operator_steps": release_gate.get("operator_steps") or [],
             "message": release_gate.get("reason") or "变更被错误预算门禁阻断。",
         }
-    await emit("collecting_evidence", "采集 current/previous logs、Events、Workload、Service、存储与节点证据")
-    evidence_timeout = max(10, int(os.getenv("OPS_EVIDENCE_TIMEOUT_SECONDS", "70")))
+    priority_evidence: dict = {}
+    priority_timeout = max(
+        8,
+        min(45, int(os.getenv("OPS_PRIORITY_EVIDENCE_TIMEOUT_SECONDS", "30"))),
+    )
+    await emit(
+        "collecting_priority_logs",
+        "优先读取目标 Pod YAML、current logs 和 previous logs；可选依赖接口不会阻塞这一步。",
+        transport=_ops_cluster_transport(plan),
+    )
     try:
-        plan["_runtime_evidence"] = await run_with_heartbeat(
+        priority_evidence = await run_with_heartbeat(
+            _collect_plan_priority_evidence(plan),
+            stage="collecting_priority_logs",
+            timeout_seconds=priority_timeout,
+            heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
+            cancel_event=cancel_event,
+            on_heartbeat=heartbeat("collecting_priority_logs", "目标 Pod YAML 与日志接口"),
+        )
+    except StageTimeoutError as exc:
+        priority_evidence = {
+            "error": str(exc),
+            "timeout": True,
+            "transport": _ops_cluster_transport(plan),
+        }
+        await emit(
+            "stage_timeout",
+            f"目标 Pod 日志读取超过 {priority_timeout} 秒；记录失败原因后继续尝试其他证据通道。",
+            timed_out_stage="collecting_priority_logs",
+            timeout_seconds=priority_timeout,
+            level="warning",
+        )
+    except Exception as exc:
+        priority_evidence = {
+            "error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
+            "transport": _ops_cluster_transport(plan),
+        }
+
+    priority_logs = priority_evidence.get("logs") or {}
+    priority_triage = _redact_sensitive(triage_kubernetes_logs(priority_logs))
+    priority_excerpts = [
+        {
+            "container": item.get("container"),
+            "stream": item.get("stream"),
+            "error_count": item.get("error_count"),
+            "warning_count": item.get("warning_count"),
+            "excerpt": _clip_text(str(item.get("excerpt") or ""), 1600),
+        }
+        for item in (priority_triage.get("priority") or [])[:8]
+        if isinstance(item, dict)
+    ]
+    log_content_bytes = sum(
+        len(str((content or {}).get(stream) or ""))
+        for content in priority_logs.values()
+        if isinstance(content, dict)
+        for stream in ("current", "previous")
+    )
+    if log_content_bytes > 0:
+        await emit(
+            "pod_logs_collected",
+            (
+                f"已读取 Pod/{priority_evidence.get('pod_name') or '-'} 日志："
+                f"{int(priority_triage.get('error_count') or 0)} 条错误、"
+                f"{int(priority_triage.get('warning_count') or 0)} 条警告。"
+            ),
+            selected_pod=priority_evidence.get("pod_name"),
+            transport=priority_evidence.get("transport"),
+            containers=sorted(priority_logs),
+            log_content_bytes=log_content_bytes,
+            error_count=int(priority_triage.get("error_count") or 0),
+            warning_count=int(priority_triage.get("warning_count") or 0),
+            priority_excerpts=priority_excerpts,
+            log_errors=priority_evidence.get("log_errors") or _ops_log_errors(priority_logs),
+            level="warning" if priority_triage.get("actionable") else "success",
+        )
+    else:
+        await emit(
+            "pod_logs_unavailable",
+            "没有读取到目标 Pod 日志正文；已保留具体 API/RBAC/目标选择错误，不会再用笼统的“证据不足”掩盖采集失败。",
+            selected_pod=priority_evidence.get("pod_name"),
+            transport=priority_evidence.get("transport"),
+            error=priority_evidence.get("error"),
+            log_errors=priority_evidence.get("log_errors") or _ops_log_errors(priority_logs),
+            level="warning",
+        )
+
+    await emit(
+        "collecting_evidence",
+        "Pod 日志优先通道已结束；继续补充 Events、Workload、Service、存储与节点证据。",
+    )
+    evidence_timeout = max(10, int(os.getenv("OPS_EVIDENCE_TIMEOUT_SECONDS", "70")))
+    deep_enrichment: dict = {}
+    try:
+        deep_enrichment = await run_with_heartbeat(
             _collect_plan_deep_evidence(plan),
             stage="collecting_evidence",
             timeout_seconds=evidence_timeout,
@@ -11298,7 +11734,7 @@ async def _execute_ops_plan_once(
             on_heartbeat=heartbeat("collecting_evidence", "Rancher/Kubernetes/MCP 证据接口"),
         )
     except StageTimeoutError as exc:
-        plan["_runtime_evidence"] = {
+        deep_enrichment = {
             "error": str(exc),
             "timeout": True,
             "operator_hint": "检查 Rancher API、MCP Server 网络和 RBAC；本轮会使用已有证据继续，不会永久卡住。",
@@ -11311,16 +11747,17 @@ async def _execute_ops_plan_once(
             level="warning",
         )
     except Exception as exc:
-        plan["_runtime_evidence"] = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
+        deep_enrichment = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
+    plan["_runtime_evidence"] = _merge_ops_evidence(priority_evidence, deep_enrichment)
     deep_evidence = plan.get("_runtime_evidence") or {}
-    if not deep_evidence.get("error"):
-        deep_evidence["log_triage"] = _redact_sensitive(
-            triage_kubernetes_logs(deep_evidence.get("logs") or {})
-        )
+    deep_evidence["log_triage"] = _redact_sensitive(
+        triage_kubernetes_logs(deep_evidence.get("logs") or {})
+    )
+    if deep_evidence.get("pod") or deep_evidence.get("logs") or deep_evidence.get("workload"):
         plan["_audit_before_snapshot"] = _ops_evidence_snapshot(deep_evidence)
     log_triage = deep_evidence.get("log_triage") or {}
     evidence_summary = {
-        "status": "warning" if deep_evidence.get("error") else "completed",
+        "status": "warning" if deep_evidence.get("error") or deep_evidence.get("enrichment_error") else "completed",
         "logs": len(deep_evidence.get("logs") or {}),
         "log_errors": sum(len(value or {}) for value in (deep_evidence.get("log_errors") or {}).values()),
         "priority_log_errors": int(log_triage.get("error_count") or 0),
@@ -11331,14 +11768,26 @@ async def _execute_ops_plan_once(
         "has_workload": bool(deep_evidence.get("workload")),
         "matching_pods": len(deep_evidence.get("matching_pods") or []),
         "selected_pod": deep_evidence.get("pod_name") or ((deep_evidence.get("pod") or {}).get("name")),
+        "transport": deep_evidence.get("transport") or priority_evidence.get("transport"),
+        "log_content_bytes": sum(
+            len(str((content or {}).get(stream) or ""))
+            for content in (deep_evidence.get("logs") or {}).values()
+            if isinstance(content, dict)
+            for stream in ("current", "previous")
+        ),
         "node": (deep_evidence.get("node") or {}).get("name"),
         "error": deep_evidence.get("error"),
+        "enrichment_error": deep_evidence.get("enrichment_error"),
     }
     await emit(
         "collecting_evidence_done",
-        "证据采集完成，可进入逐步诊断。",
+        (
+            "关键 Pod/日志证据已保留；部分可选补充接口失败，仍可进入根因诊断。"
+            if deep_evidence.get("enrichment_error") else
+            "证据采集完成，可进入逐步诊断。"
+        ),
         evidence_summary=evidence_summary,
-        level="warning" if deep_evidence.get("error") else "success",
+        level="warning" if deep_evidence.get("error") or deep_evidence.get("enrichment_error") else "success",
     )
     if log_triage:
         priority_excerpts = [
@@ -12192,9 +12641,62 @@ async def _execute_ops_plan_once(
             level="warning",
         )
         post_failure_timeout = max(10, int(os.getenv("OPS_POST_FAILURE_EVIDENCE_TIMEOUT_SECONDS", "45")))
+        plan["_previous_runtime_evidence"] = plan.get("_runtime_evidence") or {}
+        post_priority: dict = {}
         try:
-            plan["_previous_runtime_evidence"] = plan.get("_runtime_evidence") or {}
-            plan["_runtime_evidence"] = await run_with_heartbeat(
+            post_priority = await run_with_heartbeat(
+                _collect_plan_priority_evidence(plan),
+                stage="post_failure_priority_logs",
+                timeout_seconds=min(priority_timeout, post_failure_timeout),
+                heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
+                cancel_event=cancel_event,
+                on_heartbeat=heartbeat("collecting_priority_logs", "失败后新 Pod YAML 与日志接口"),
+            )
+            post_triage = _redact_sensitive(
+                triage_kubernetes_logs(post_priority.get("logs") or {})
+            )
+            post_priority["log_triage"] = post_triage
+            await emit(
+                "pod_logs_collected",
+                (
+                    f"已重新读取失败后 Pod/{post_priority.get('pod_name') or '-'} 日志："
+                    f"{int(post_triage.get('error_count') or 0)} 条错误、"
+                    f"{int(post_triage.get('warning_count') or 0)} 条警告。"
+                ),
+                selected_pod=post_priority.get("pod_name"),
+                transport=post_priority.get("transport"),
+                error_count=int(post_triage.get("error_count") or 0),
+                warning_count=int(post_triage.get("warning_count") or 0),
+                priority_excerpts=[
+                    {
+                        "container": item.get("container"),
+                        "stream": item.get("stream"),
+                        "error_count": item.get("error_count"),
+                        "warning_count": item.get("warning_count"),
+                        "excerpt": _clip_text(str(item.get("excerpt") or ""), 1600),
+                    }
+                    for item in (post_triage.get("priority") or [])[:8]
+                    if isinstance(item, dict)
+                ],
+                log_errors=post_priority.get("log_errors") or {},
+                level="warning" if post_triage.get("actionable") else "success",
+            )
+        except Exception as exc:
+            post_priority = {
+                "error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
+                "transport": _ops_cluster_transport(plan),
+            }
+            await emit(
+                "pod_logs_unavailable",
+                "失败后新 Pod 日志读取失败；保留错误并继续使用验证结果与补充证据重规划。",
+                selected_pod=plan.get("pod_name"),
+                transport=post_priority.get("transport"),
+                error=post_priority.get("error"),
+                level="warning",
+            )
+        post_deep: dict = {}
+        try:
+            post_deep = await run_with_heartbeat(
                 _collect_plan_deep_evidence(plan),
                 stage="post_failure_evidence",
                 timeout_seconds=post_failure_timeout,
@@ -12202,35 +12704,34 @@ async def _execute_ops_plan_once(
                 cancel_event=cancel_event,
                 on_heartbeat=heartbeat("collecting_evidence", "失败后新 Pod 证据接口"),
             )
-            await emit(
-                "collecting_evidence_done",
-                "失败后证据已更新，开始生成差异化下一轮方案。",
-                evidence_summary={
-                    "logs": len((plan.get("_runtime_evidence") or {}).get("logs") or {}),
-                    "events": len((plan.get("_runtime_evidence") or {}).get("events") or []),
-                    "storage": len((plan.get("_runtime_evidence") or {}).get("storage") or []),
-                    "selected_pod": (plan.get("_runtime_evidence") or {}).get("pod_name") or plan.get("pod_name"),
-                },
-                level="success",
-            )
-        except StageTimeoutError:
+        except StageTimeoutError as exc:
+            post_deep = {"error": str(exc), "timeout": True}
             await emit(
                 "stage_timeout",
-                f"失败后证据采集超过 {post_failure_timeout} 秒，使用已有验证结果生成下一轮方案。",
+                f"失败后补充证据采集超过 {post_failure_timeout} 秒；已保留优先日志并继续生成下一轮方案。",
                 timed_out_stage="post_failure_evidence",
                 timeout_seconds=post_failure_timeout,
                 level="warning",
             )
         except Exception as exc:
-            plan["_runtime_evidence"] = {
-                **(plan.get("_runtime_evidence") or {}),
-                "post_failure_error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
-            }
-            await emit(
-                "collecting_evidence_done",
-                f"失败后证据采集异常，使用已有证据继续规划：{type(exc).__name__}",
-                level="warning",
-            )
+            post_deep = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
+        plan["_runtime_evidence"] = _merge_ops_evidence(post_priority, post_deep)
+        plan["_runtime_evidence"]["log_triage"] = _redact_sensitive(
+            triage_kubernetes_logs((plan.get("_runtime_evidence") or {}).get("logs") or {})
+        )
+        await emit(
+            "collecting_evidence_done",
+            "失败后关键日志已固定保存，开始生成差异化下一轮方案。",
+            evidence_summary={
+                "logs": len((plan.get("_runtime_evidence") or {}).get("logs") or {}),
+                "events": len((plan.get("_runtime_evidence") or {}).get("events") or []),
+                "storage": len((plan.get("_runtime_evidence") or {}).get("storage") or []),
+                "selected_pod": (plan.get("_runtime_evidence") or {}).get("pod_name") or plan.get("pod_name"),
+                "transport": (plan.get("_runtime_evidence") or {}).get("transport"),
+                "enrichment_error": (plan.get("_runtime_evidence") or {}).get("enrichment_error"),
+            },
+            level="warning" if (plan.get("_runtime_evidence") or {}).get("error") else "success",
+        )
         root_cause_timeout = max(10, int(os.getenv("OPS_ROOT_CAUSE_TIMEOUT_SECONDS", "75")))
         try:
             evidence_replans = await run_with_heartbeat(

@@ -133,21 +133,22 @@ class OpsSkillCatalogTests(unittest.TestCase):
         self.assertTrue(hypothesis["path_on_mount"])
         self.assertEqual(hypothesis["recommended_strategy"], "root_workload_security_context")
 
-        attached = server._attach_operator_skills_to_plan(
-            plan,
-            {
-                "question": "Grafana data path is not writable",
-                "diagnosis": {
-                    "skill_routing": {
-                        "primary_skill_id": "skill-volume-permission-recovery",
-                        "strategy_id": "root_workload_security_context",
+        with patch.object(server, "successful_remediation_hint", return_value={}):
+            attached = server._attach_operator_skills_to_plan(
+                plan,
+                {
+                    "question": "Grafana data path is not writable",
+                    "diagnosis": {
+                        "skill_routing": {
+                            "primary_skill_id": "skill-volume-permission-recovery",
+                            "strategy_id": "root_workload_security_context",
+                        },
                     },
+                    "evidence": evidence,
+                    "plan": plan,
                 },
-                "evidence": evidence,
-                "plan": plan,
-            },
-            preferred_skill_ids=["skill-volume-permission-recovery"],
-        )
+                preferred_skill_ids=["skill-volume-permission-recovery"],
+            )
         self.assertEqual(attached["permission_recovery_stage"], "nonroot_group")
         self.assertEqual(
             attached["permission_strategy_decision"]["source"],
@@ -162,6 +163,92 @@ class OpsSkillCatalogTests(unittest.TestCase):
         self.assertEqual(spec["containers"][0]["securityContext"]["runAsUser"], 472)
         self.assertEqual(spec["containers"][0]["securityContext"]["runAsGroup"], 472)
         self.assertTrue(spec["containers"][0]["securityContext"]["runAsNonRoot"])
+
+    def test_live_complete_nonroot_context_is_not_reproposed_and_escalates_to_root(self):
+        security = {
+            "runAsUser": 10001,
+            "runAsGroup": 10001,
+            "runAsNonRoot": True,
+            "fsGroup": 10001,
+            "supplementalGroups": [10001],
+            "fsGroupChangePolicy": "OnRootMismatch",
+        }
+        evidence = {
+            "logs": {"grafana": {"current": "\n".join([
+                "GF_PATHS_DATA='/var/lib/grafana' is not writable.",
+                "Error: unable to open database file",
+            ])}},
+            "pod": {
+                "name": "grafana-abc",
+                "security_context": security,
+                "containers": [{
+                    "name": "grafana",
+                    "security_context": {
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "runAsNonRoot": True,
+                    },
+                    "volume_mounts": [{
+                        "name": "data",
+                        "mount_path": "/var/lib/grafana",
+                    }],
+                }],
+            },
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "grafana"},
+                "spec": {"template": {"spec": {
+                    "securityContext": security,
+                    "containers": [{
+                        "name": "grafana",
+                        "securityContext": {
+                            "runAsUser": 10001,
+                            "runAsGroup": 10001,
+                            "runAsNonRoot": True,
+                        },
+                    }],
+                }}},
+            },
+            "storage": [{"pvc": "grafana-data", "pvc_phase": "Bound"}],
+        }
+        plan = {
+            "_skill_incident_id": "grafana-live-nonroot-noop",
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "summary": "Grafana data path is not writable",
+            "evidence": evidence,
+            "_runtime_evidence": evidence,
+            "changes": [],
+        }
+        attached = server._attach_operator_skills_to_plan(
+            plan,
+            {
+                "question": plan["summary"],
+                "diagnosis": {
+                    "skill_routing": {
+                        "primary_skill_id": "skill-volume-permission-recovery",
+                        "strategy_id": "root_workload_security_context",
+                    },
+                },
+                "evidence": evidence,
+                "plan": plan,
+            },
+            preferred_skill_ids=["skill-volume-permission-recovery"],
+        )
+        self.assertEqual(attached["permission_recovery_stage"], "root")
+        self.assertTrue(
+            attached["permission_strategy_decision"]["live_nonroot_patch_is_noop"]
+        )
+        spec = attached["changes"][0]["patch"]["spec"]["template"]["spec"]
+        self.assertEqual(spec["securityContext"]["runAsUser"], 0)
+        self.assertEqual(spec["securityContext"]["runAsGroup"], 0)
+        self.assertEqual(spec["securityContext"]["fsGroup"], 0)
+        self.assertEqual(spec["securityContext"]["supplementalGroups"], [0])
+        self.assertIs(spec["securityContext"]["runAsNonRoot"], False)
+        container = spec["containers"][0]["securityContext"]
+        self.assertEqual(container["runAsUser"], 0)
+        self.assertEqual(container["runAsGroup"], 0)
+        self.assertIs(container["runAsNonRoot"], False)
 
     def test_capacity_evidence_prevents_direct_root_strategy(self):
         plan = {
@@ -975,6 +1062,115 @@ Collect evidence and explain the result. Do not mutate infrastructure.
 
 
 class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_sre_chat_plan_uses_rancher_transport_by_cluster_identity(self):
+        plan = {
+            "source": "sre_chat",
+            "cluster_id": "c-remote",
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+        }
+        with (
+            patch.object(server.CLUSTER_REGISTRY, "list", return_value=[]),
+            patch.dict(os.environ, {
+                "RANCHER_URL": "https://rancher.example.invalid",
+                "RANCHER_TOKEN": "redacted-test-token",
+            }),
+        ):
+            self.assertEqual(server._ops_cluster_transport(plan), "rancher")
+
+    async def test_priority_logs_survive_enrichment_error_and_generate_root_candidate(self):
+        events = []
+
+        async def progress(stage, message, **extra):
+            events.append({"stage": stage, "message": message, **extra})
+
+        pod_security = {
+            "runAsUser": 10001,
+            "runAsGroup": 10001,
+            "runAsNonRoot": True,
+            "fsGroup": 10001,
+            "supplementalGroups": [10001],
+            "fsGroupChangePolicy": "OnRootMismatch",
+        }
+        evidence = {
+            "pod_name": "grafana-abc",
+            "transport": "rancher",
+            "pod": {
+                "name": "grafana-abc",
+                "phase": "Running",
+                "ready": False,
+                "security_context": pod_security,
+                "containers": [{
+                    "name": "grafana",
+                    "ready": False,
+                    "restart_count": 4,
+                    "security_context": {
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "runAsNonRoot": True,
+                    },
+                    "volume_mounts": [{
+                        "name": "data",
+                        "mount_path": "/var/lib/grafana",
+                    }],
+                }],
+                "workload_kind": "Deployment",
+                "workload_name": "grafana",
+            },
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "grafana"},
+                "spec": {"template": {"spec": {
+                    "securityContext": pod_security,
+                    "containers": [{
+                        "name": "grafana",
+                        "securityContext": {
+                            "runAsUser": 10001,
+                            "runAsGroup": 10001,
+                            "runAsNonRoot": True,
+                        },
+                    }],
+                }}},
+            },
+            "logs": {"grafana": {"current": "\n".join([
+                "GF_PATHS_DATA='/var/lib/grafana' is not writable.",
+                "Error: unable to open database file",
+            ])}},
+            "storage": [{"pvc": "grafana-data", "pvc_phase": "Bound"}],
+        }
+        plan = {
+            "source": "sre_chat",
+            "cluster_id": "c-remote",
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "summary": "Grafana CrashLoopBackOff",
+            "steps": [],
+            "changes": [],
+        }
+        with (
+            patch.object(server, "_ops_release_gate", return_value={"allowed": True}),
+            patch.object(server, "_collect_plan_priority_evidence", new=AsyncMock(return_value=evidence)),
+            patch.object(server, "_collect_plan_deep_evidence", new=AsyncMock(return_value={"error": "optional CMDB timed out"})),
+            patch.object(server, "_attach_operator_skills_to_plan", side_effect=lambda current, _signal, **_kwargs: current),
+            patch.object(server, "_probe_plan_recovery", new=AsyncMock(return_value={"status": "unknown", "recovered": None, "message": "not ready"})),
+            patch.object(server, "record_remediation", return_value={"status": "recorded"}),
+        ):
+            result = await server._execute_ops_plan_once(
+                plan,
+                summarize=False,
+                progress=progress,
+            )
+        self.assertEqual(result["status"], "planned")
+        self.assertNotIn("证据仍不足", result["message"])
+        replacement = result["alternative_plans"][0]
+        self.assertEqual(replacement["permission_recovery_stage"], "root")
+        root_spec = replacement["changes"][0]["patch"]["spec"]["template"]["spec"]
+        self.assertEqual(root_spec["securityContext"]["runAsUser"], 0)
+        self.assertIs(root_spec["securityContext"]["runAsNonRoot"], False)
+        log_event = next(event for event in events if event["stage"] == "pod_logs_collected")
+        self.assertIn("not writable", log_event["priority_excerpts"][0]["excerpt"])
+        self.assertTrue(any(event["stage"] == "root_cause_diagnosed" for event in events))
+
     async def test_actionable_log_skips_optional_cmdb_probe(self):
         events = []
 
@@ -995,6 +1191,7 @@ class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
         collector = AsyncMock(side_effect=RuntimeError("CMDB transport closed"))
         with (
             patch.object(server, "_ops_release_gate", return_value={"allowed": True}),
+            patch.object(server, "_collect_plan_priority_evidence", new=AsyncMock(return_value=evidence)),
             patch.object(server, "_collect_plan_deep_evidence", new=AsyncMock(return_value=evidence)),
             patch.object(server, "_attach_operator_skills_to_plan", side_effect=lambda current, _signal, **_kwargs: current),
             patch.object(server, "_collect_ops_step", collector),
@@ -1021,6 +1218,7 @@ class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch.object(server, "_ops_release_gate", return_value={"allowed": True}),
+            patch.object(server, "_collect_plan_priority_evidence", new=AsyncMock(return_value={"pod": {"name": "web-abc"}, "events": [], "logs": {}})),
             patch.object(server, "_collect_plan_deep_evidence", new=AsyncMock(return_value={"pod": {"name": "web-abc"}, "events": [], "logs": {}})),
             patch.object(server, "_attach_operator_skills_to_plan", side_effect=lambda current, _signal, **_kwargs: current),
             patch.object(server, "_collect_ops_step", new=AsyncMock(side_effect=RuntimeError("probe serialization failed"))),
@@ -1089,6 +1287,7 @@ class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch.object(server, "_ops_release_gate", return_value={"allowed": True}),
+            patch.object(server, "_collect_plan_priority_evidence", new=AsyncMock(return_value={"pod": {"name": "web-abc"}, "events": [], "logs": {}})),
             patch.object(server, "_collect_plan_deep_evidence", new=AsyncMock(return_value={"pod": {"name": "web-abc"}, "events": []})),
             patch.object(server, "_attach_operator_skills_to_plan", side_effect=lambda plan, _signal, **_kwargs: plan),
             patch.object(server, "_execute_change", side_effect=execute),
@@ -1118,6 +1317,7 @@ class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch.object(server, "_ops_release_gate", return_value={"allowed": True}),
+            patch.object(server, "_collect_plan_priority_evidence", new=AsyncMock(return_value={"pod": {"name": "web-abc"}, "events": [], "logs": {}})),
             patch.object(server, "_collect_plan_deep_evidence", new=AsyncMock(return_value={"pod": {"name": "web-abc"}, "events": []})),
             patch.object(server, "_attach_operator_skills_to_plan", side_effect=lambda plan, _signal, **_kwargs: plan),
             patch.object(server, "_execute_change", new=AsyncMock(side_effect=RuntimeError("mcp transport closed"))),
@@ -1147,6 +1347,7 @@ class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
         execute = AsyncMock()
         with (
             patch.object(server, "_ops_release_gate", return_value={"allowed": True}),
+            patch.object(server, "_collect_plan_priority_evidence", new=AsyncMock(return_value={"error": "Rancher timeout"})),
             patch.object(server, "_collect_plan_deep_evidence", new=AsyncMock(return_value={"error": "Rancher timeout"})),
             patch.object(server, "_execute_change", execute),
             patch.object(server, "_probe_plan_recovery", new=AsyncMock(return_value={"status": "unknown", "recovered": None})),

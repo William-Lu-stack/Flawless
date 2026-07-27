@@ -345,6 +345,110 @@ class ClusterRegistry:
             "ingresses": ingresses,
         }
 
+    def namespace_pods(self, cluster_id: str, *, namespace: str) -> dict[str, Any]:
+        """Read only the Pod/ReplicaSet scope needed to select an incident Pod.
+
+        The full inventory endpoint intentionally gathers every supported
+        resource in the cluster.  Using it before reading a single failing
+        Pod's logs makes log collection depend on unrelated cluster-wide API
+        calls, which is both slow and fragile on production clusters.
+        """
+        api_client = self.api_client(cluster_id)
+        encode = api_client.sanitize_for_serialization
+        core = client.CoreV1Api(api_client)
+        apps = client.AppsV1Api(api_client)
+        return {
+            "pods": encode(core.list_namespaced_pod(namespace, limit=2000)).get("items", []),
+            "replicasets": encode(apps.list_namespaced_replica_set(namespace, limit=2000)).get("items", []),
+        }
+
+    @staticmethod
+    def _pod_log_bundle(
+        core: client.CoreV1Api,
+        raw_pod: dict[str, Any],
+        *,
+        namespace: str,
+        pod_name: str,
+        tail_lines: int,
+    ) -> dict[str, Any]:
+        """Read current/previous logs for every declared or observed container."""
+        pod_status = raw_pod.get("status") or {}
+        statuses = [
+            *(pod_status.get("containerStatuses") or []),
+            *(pod_status.get("initContainerStatuses") or []),
+            *(pod_status.get("ephemeralContainerStatuses") or []),
+        ]
+        restart_counts = {
+            str(status.get("name") or ""): int(status.get("restartCount") or 0)
+            for status in statuses
+            if status.get("name")
+        }
+        pod_spec = raw_pod.get("spec") or {}
+        names: list[str] = []
+        for item in [
+            *statuses,
+            *(pod_spec.get("containers") or []),
+            *(pod_spec.get("initContainers") or []),
+            *(pod_spec.get("ephemeralContainers") or []),
+        ]:
+            name = str(item.get("name") or "")
+            if name and name not in names:
+                names.append(name)
+        logs: dict[str, Any] = {}
+        for name in names[:16]:
+            current = previous = current_error = previous_error = ""
+            try:
+                current = core.read_namespaced_pod_log(
+                    pod_name,
+                    namespace,
+                    container=name,
+                    tail_lines=tail_lines,
+                )
+            except Exception as exc:
+                current_error = f"{type(exc).__name__}: {exc}"
+            if restart_counts.get(name, 0) > 0:
+                try:
+                    previous = core.read_namespaced_pod_log(
+                        pod_name,
+                        namespace,
+                        container=name,
+                        previous=True,
+                        tail_lines=tail_lines,
+                    )
+                except Exception as exc:
+                    previous_error = f"{type(exc).__name__}: {exc}"
+            logs[name] = {
+                "current": current[-10000:],
+                "previous": previous[-10000:],
+                "current_error": current_error,
+                "previous_error": previous_error,
+            }
+        return logs
+
+    def pod_priority_evidence(
+        self,
+        cluster_id: str,
+        *,
+        namespace: str,
+        pod_name: str,
+        tail_lines: int = 180,
+    ) -> dict[str, Any]:
+        """Return Pod YAML and logs without waiting for optional enrichments."""
+        api_client = self.api_client(cluster_id)
+        encode = api_client.sanitize_for_serialization
+        core = client.CoreV1Api(api_client)
+        raw_pod = encode(core.read_namespaced_pod(pod_name, namespace))
+        return {
+            "raw_pod": raw_pod,
+            "logs": self._pod_log_bundle(
+                core,
+                raw_pod,
+                namespace=namespace,
+                pod_name=pod_name,
+                tail_lines=tail_lines,
+            ),
+        }
+
     def pod_diagnostics(self, cluster_id: str, *, namespace: str, pod_name: str, tail_lines: int = 180) -> dict[str, Any]:
         api_client = self.api_client(cluster_id)
         encode = api_client.sanitize_for_serialization
@@ -353,26 +457,13 @@ class ClusterRegistry:
         batch = client.BatchV1Api(api_client)
         storage_api = client.StorageV1Api(api_client)
         raw_pod = encode(core.read_namespaced_pod(pod_name, namespace))
-        logs: dict[str, Any] = {}
-        pod_status = raw_pod.get("status") or {}
-        for status in [
-            *(pod_status.get("containerStatuses") or []),
-            *(pod_status.get("initContainerStatuses") or []),
-        ]:
-            name = str(status.get("name") or "")
-            if not name:
-                continue
-            current = previous = current_error = previous_error = ""
-            try:
-                current = core.read_namespaced_pod_log(pod_name, namespace, container=name, tail_lines=tail_lines)
-            except Exception as exc:
-                current_error = f"{type(exc).__name__}: {exc}"
-            if int(status.get("restartCount") or 0) > 0:
-                try:
-                    previous = core.read_namespaced_pod_log(pod_name, namespace, container=name, previous=True, tail_lines=tail_lines)
-                except Exception as exc:
-                    previous_error = f"{type(exc).__name__}: {exc}"
-            logs[name] = {"current": current[-10000:], "previous": previous[-10000:], "current_error": current_error, "previous_error": previous_error}
+        logs = self._pod_log_bundle(
+            core,
+            raw_pod,
+            namespace=namespace,
+            pod_name=pod_name,
+            tail_lines=tail_lines,
+        )
         # Fetch logs before broad Events/storage/service/node discovery so a
         # slow optional API cannot hide the direct application error.
         field_selector = f"involvedObject.name={pod_name}"

@@ -16,16 +16,17 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.11**.
+Current release: **3.2.12**.
 
-Release 3.2.11 replaces fixed Skill weighting with a contextual Bayesian
-utility router. DeepSeek proposes competing root-cause hypotheses; live evidence
-coverage, semantic alignment, per-Skill incident outcomes, lineage failures,
-uncertainty, and risk determine which single Skill runs next. Mutation remains
-behind evidence contracts and per-step human approval. The progressive volume
-permission Skill now materializes and verifies the complete approved root
-contract (`runAsUser/runAsGroup/fsGroup=0`, `runAsNonRoot=false`) in the live
-Workload YAML before it can report recovery.
+Release 3.2.12 adds a priority Pod-log evidence channel that persists
+current/previous logs before optional CMDB, topology, storage, or node probes.
+Remote SRE-chat and inspection plans now choose Rancher from the target cluster
+identity rather than the UI source label, and the console shows the actual
+ERROR/WARNING excerpts or the exact log API/RBAC failure. The volume-permission
+Skill rejects a no-op non-root Patch when the live Workload already has the same
+UID/GID/fsGroup contract and can advance, behind a fresh human approval, to the
+complete root fallback (`runAsUser/runAsGroup/fsGroup=0`,
+`runAsNonRoot=false`) followed by rollout and new-Pod log verification.
 
 Release 3.2 adds persistent remediation lineage: every failed strategy, action,
 verification result, and replacement plan stays linked across operator-approved

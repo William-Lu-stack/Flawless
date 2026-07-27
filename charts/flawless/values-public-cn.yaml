@@ -2,7 +2,7 @@
 # Keep immutable tags in production; avoid `latest` so mirror caches stay deterministic.
 image:
   repository: ghcr.dockerproxy.net/your-org/flawless
-  tag: 3.2.11
+  tag: 3.2.12
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

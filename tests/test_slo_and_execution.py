@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import httpx
 import os
 import tempfile
@@ -562,13 +563,24 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "phase": "Running",
                 "restart_count": 5,
                 "workload": {"kind": "Deployment", "name": "grafana"},
-                "security_context": {"runAsUser": 472, "runAsGroup": 472, "fsGroup": 472},
+                "security_context": {
+                    "runAsUser": 472,
+                    "runAsGroup": 472,
+                    "runAsNonRoot": True,
+                    "fsGroup": 472,
+                    "supplementalGroups": [472],
+                    "fsGroupChangePolicy": "OnRootMismatch",
+                },
                 "containers": [{
                     "name": "grafana",
                     "ready": False,
                     "state": "waiting",
                     "reason": "CrashLoopBackOff",
-                    "security_context": {"runAsUser": 472, "runAsGroup": 472},
+                    "security_context": {
+                        "runAsUser": 472,
+                        "runAsGroup": 472,
+                        "runAsNonRoot": True,
+                    },
                     "volume_mounts": [{"name": "data", "mount_path": "/var/lib/grafana"}],
                 }],
             },
@@ -589,10 +601,21 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                     "replicas": 1,
                     "template": {
                         "spec": {
-                            "securityContext": {"runAsUser": 472, "runAsGroup": 472, "fsGroup": 472},
+                            "securityContext": {
+                                "runAsUser": 472,
+                                "runAsGroup": 472,
+                                "runAsNonRoot": True,
+                                "fsGroup": 472,
+                                "supplementalGroups": [472],
+                                "fsGroupChangePolicy": "OnRootMismatch",
+                            },
                             "containers": [{
                                 "name": "grafana",
-                                "securityContext": {"runAsUser": 472, "runAsGroup": 472},
+                                "securityContext": {
+                                    "runAsUser": 472,
+                                    "runAsGroup": 472,
+                                    "runAsNonRoot": True,
+                                },
                                 "volumeMounts": [{"name": "data", "mountPath": "/var/lib/grafana"}],
                             }],
                             "volumes": [{
@@ -622,9 +645,57 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             ],
             "changes": [],
         }
+        simulated_cluster = {
+            "workload_security": copy.deepcopy(
+                evidence["workload"]["spec"]["template"]["spec"]["securityContext"]
+            ),
+            "container_security": copy.deepcopy(
+                evidence["workload"]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
+            ),
+            "new_pod_logs": evidence["logs"]["grafana"]["current"],
+            "new_pod_ready": False,
+        }
+
+        async def apply_simulated_change(change, _plan):
+            patched_spec = (((change.get("patch") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+            simulated_cluster["workload_security"] = copy.deepcopy(
+                patched_spec.get("securityContext") or {}
+            )
+            simulated_cluster["container_security"] = copy.deepcopy(
+                ((patched_spec.get("containers") or [{}])[0]).get("securityContext") or {}
+            )
+            simulated_cluster["new_pod_logs"] = "FILE_CREATE_OK database-ready"
+            simulated_cluster["new_pod_ready"] = True
+            return {
+                "status": "completed",
+                "change": copy.deepcopy(change),
+                "result": {"accepted": True, "operation": "patched"},
+            }
+
+        async def verify_simulated_recovery(_plan, _results, _cancel_event):
+            self.assertEqual(simulated_cluster["workload_security"]["runAsUser"], 0)
+            self.assertEqual(simulated_cluster["workload_security"]["runAsGroup"], 0)
+            self.assertEqual(simulated_cluster["workload_security"]["fsGroup"], 0)
+            self.assertEqual(simulated_cluster["workload_security"]["supplementalGroups"], [0])
+            self.assertIs(simulated_cluster["workload_security"]["runAsNonRoot"], False)
+            self.assertEqual(simulated_cluster["container_security"]["runAsUser"], 0)
+            self.assertIs(simulated_cluster["container_security"]["runAsNonRoot"], False)
+            self.assertTrue(simulated_cluster["new_pod_ready"])
+            self.assertNotIn("not writable", simulated_cluster["new_pod_logs"])
+            self.assertNotIn("unable to open database", simulated_cluster["new_pod_logs"])
+            return {
+                "status": "completed",
+                "recovered": True,
+                "message": "新 Pod 已 Ready，错误日志消失，重启次数稳定。",
+                "proof": simulated_cluster["new_pod_logs"],
+            }
         job_id = ""
         transport = httpx.ASGITransport(app=server.app)
         with patch.object(server, "_ops_release_gate", return_value={"allowed": True}), patch.object(
+            server,
+            "_collect_plan_priority_evidence",
+            AsyncMock(return_value=evidence),
+        ), patch.object(
             server,
             "_collect_plan_deep_evidence",
             AsyncMock(return_value=evidence),
@@ -635,19 +706,11 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             server,
             "_execute_change",
-            AsyncMock(return_value={
-                "status": "completed",
-                "change": {"type": "patch_workload_runtime_security"},
-                "result": {"accepted": True},
-            }),
+            AsyncMock(side_effect=apply_simulated_change),
         ), patch.object(
             server,
             "_verify_plan_recovery",
-            AsyncMock(return_value={
-                "status": "completed",
-                "recovered": True,
-                "message": "新 Pod 已 Ready，错误日志消失，重启次数稳定。",
-            }),
+            AsyncMock(side_effect=verify_simulated_recovery),
         ), patch.object(
             server,
             "_llm_ops_summary",
@@ -679,6 +742,21 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     (job.get("pending_approval") or {}).get("action"),
                     "patch_workload_runtime_security",
+                )
+                pending_spec = ((((
+                    (job.get("pending_approval") or {}).get("patch") or {}
+                ).get("spec") or {}).get("template") or {}).get("spec") or {})
+                self.assertEqual(
+                    (pending_spec.get("securityContext") or {}).get("runAsUser"),
+                    0,
+                )
+                self.assertIs(
+                    (pending_spec.get("securityContext") or {}).get("runAsNonRoot"),
+                    False,
+                )
+                self.assertEqual(
+                    (pending_spec.get("securityContext") or {}).get("fsGroup"),
+                    0,
                 )
                 stages = [event.get("stage") for event in job.get("events") or []]
                 self.assertIn("diagnosing", stages)
@@ -1604,6 +1682,8 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         os.environ["AUTO_OPS_STATIC_PV_NFS_BASE_PATH"] = "/exports"
         try:
             with patch.dict(os.environ, {"ALLOWED_NAMESPACES": "k8s-agent"}), patch.object(
+                server, "_collect_plan_priority_evidence", AsyncMock(return_value=evidence)
+            ), patch.object(
                 server, "_collect_plan_deep_evidence", AsyncMock(return_value=evidence)
             ), patch.object(server, "_execute_change", AsyncMock()) as execute_change:
                 result = await server._execute_ops_plan_once(plan, summarize=False)
