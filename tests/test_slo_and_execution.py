@@ -317,6 +317,157 @@ class ErrorBudgetTests(unittest.TestCase):
         self.assertEqual(root_spec["containers"][0]["name"], "grafana")
         self.assertEqual(root_spec["containers"][0]["securityContext"]["runAsUser"], 0)
 
+    def test_root_fallback_materializes_complete_pod_and_container_security_context(self):
+        plan = {
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "permission_recovery_stage": "root",
+            "_runtime_evidence": {
+                "pod": {
+                    "containers": [{
+                        "name": "grafana",
+                        "security_context": {"runAsUser": 472, "runAsNonRoot": True},
+                    }],
+                },
+                "logs": {"grafana": {"current": "unable to open database file"}},
+            },
+            "changes": [{
+                "type": "patch_workload",
+                "workload_type": "Deployment",
+                "workload_name": "grafana",
+                "container_name": "grafana",
+                "patch": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "securityContext": {"runAsUser": 0},
+                                "containers": [{
+                                    "name": "grafana",
+                                    "securityContext": {"runAsUser": 0},
+                                }],
+                            },
+                        },
+                    },
+                },
+            }],
+        }
+        valid, reason = server._enforce_root_security_context_plan(plan)
+        self.assertTrue(valid, reason)
+        change = plan["changes"][0]
+        complete, missing = server._root_security_context_patch_is_complete(plan, change)
+        self.assertTrue(complete, missing)
+        spec = change["patch"]["spec"]["template"]["spec"]
+        self.assertEqual(spec["securityContext"]["runAsUser"], 0)
+        self.assertEqual(spec["securityContext"]["runAsGroup"], 0)
+        self.assertEqual(spec["securityContext"]["fsGroup"], 0)
+        self.assertEqual(spec["securityContext"]["supplementalGroups"], [0])
+        self.assertIs(spec["securityContext"]["runAsNonRoot"], False)
+        container_sc = spec["containers"][0]["securityContext"]
+        self.assertEqual(container_sc["runAsUser"], 0)
+        self.assertEqual(container_sc["runAsGroup"], 0)
+        self.assertIs(container_sc["runAsNonRoot"], False)
+        self.assertIs(container_sc["allowPrivilegeEscalation"], False)
+
+    def test_resumed_permission_lineage_escalates_after_executed_nonroot_stages(self):
+        pod = {
+            "name": "grafana-abc",
+            "containers": [{
+                "name": "grafana",
+                "security_context": {"runAsUser": 472, "runAsGroup": 472},
+                "volume_mounts": [{"name": "data", "mount_path": "/var/lib/grafana"}],
+            }],
+        }
+        resumed = {
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "summary": "unable to open database file",
+            "_runtime_evidence": {
+                "pod": pod,
+                "logs": {"grafana": {"current": "GF_PATHS_DATA=/var/lib/grafana is not writable"}},
+            },
+            "_attempted_permission_recovery_stages": ["nonroot_group", "init_owner"],
+        }
+        root_plan = server._permission_recovery_followup(resumed)
+        self.assertEqual(root_plan["permission_recovery_stage"], "root")
+        root_sc = root_plan["changes"][0]["patch"]["spec"]["template"]["spec"]["securityContext"]
+        self.assertEqual(root_sc["runAsUser"], 0)
+        self.assertEqual(root_sc["runAsGroup"], 0)
+        self.assertEqual(root_sc["fsGroup"], 0)
+        self.assertIs(root_sc["runAsNonRoot"], False)
+
+    def test_declared_workload_patch_must_match_live_yaml_before_recovery(self):
+        plan = {
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "changes": [{
+                "type": "patch_workload_runtime_security",
+                "workload_type": "Deployment",
+                "workload_name": "grafana",
+                "patch": {"spec": {"template": {"spec": {
+                    "securityContext": {"fsGroup": 0, "runAsUser": 0},
+                    "containers": [{
+                        "name": "grafana",
+                        "securityContext": {"runAsUser": 0, "runAsNonRoot": False},
+                    }],
+                }}}},
+            }],
+        }
+        stale_workload = {
+            "spec": {"template": {"spec": {
+                "securityContext": {"fsGroup": 472, "runAsUser": 472},
+                "containers": [{
+                    "name": "grafana",
+                    "securityContext": {"runAsUser": 472, "runAsNonRoot": True},
+                }],
+            }}},
+        }
+        applied, proof = server._live_workload_postcondition(plan, stale_workload)
+        self.assertFalse(applied)
+        self.assertIn("fsGroup", proof)
+        recovered_workload = {
+            "spec": {"template": {"spec": {
+                "securityContext": {"fsGroup": 0, "runAsUser": 0},
+                "containers": [{
+                    "name": "grafana",
+                    "image": "example.invalid/grafana:latest",
+                    "securityContext": {"runAsUser": 0, "runAsNonRoot": False},
+                }],
+            }}},
+        }
+        applied, proof = server._live_workload_postcondition(plan, recovered_workload)
+        self.assertTrue(applied, proof)
+
+    def test_natural_language_write_recovery_criteria_use_fresh_logs(self):
+        criteria = server._assess_recovery_criteria(
+            {
+                "namespace": "default",
+                "target": "Deployment/writer",
+                "success_criteria": [
+                    "new_pod_ready",
+                    "file_create_succeeds",
+                    "permission_error_absent",
+                ],
+                "changes": [],
+            },
+            {"recovered": True},
+            {
+                "pod": {"name": "writer-new", "ready": True, "restart_count": 0},
+                "events": [],
+                "logs": {"writer": {"current": "FILE_CREATE_OK database-ready"}},
+                "workload": {
+                    "metadata": {"generation": 3},
+                    "spec": {"replicas": 1},
+                    "status": {
+                        "observedGeneration": 3,
+                        "updatedReplicas": 1,
+                        "readyReplicas": 1,
+                    },
+                },
+            },
+        )
+        self.assertTrue(criteria["passed"], criteria)
+        self.assertEqual(criteria["not_evaluated"], [])
+
     def test_99_percent_slo_has_one_percent_budget(self):
         budget = evaluate_error_budget({
             "id": "svc",
@@ -523,7 +674,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                     job = job_response.json()
                     if job.get("status") in {"awaiting_approval", "failed", "completed"}:
                         break
-                self.assertEqual(job["status"], "awaiting_approval")
+                self.assertEqual(job["status"], "awaiting_approval", job)
                 self.assertEqual(job["stage"], "awaiting_change_approval")
                 self.assertEqual(
                     (job.get("pending_approval") or {}).get("action"),

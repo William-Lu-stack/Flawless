@@ -16,15 +16,16 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.10**.
+Current release: **3.2.11**.
 
-Release 3.2.10 adds namespace and RBAC mutation preflight, resilient local
-SRE-graph fallback, and model-aware diagnosis timeouts. Root-cause planning is
-preemptible and observable, including
-explicit diagnosis stages, bounded model/persistence calls, DeepSeek/vLLM
-structured routing, and deterministic Skill fallback. The progressive volume
-permission Skill now keeps the incident open through non-root remediation,
-approved root escalation, new-Pod verification, and independent recovery proof.
+Release 3.2.11 replaces fixed Skill weighting with a contextual Bayesian
+utility router. DeepSeek proposes competing root-cause hypotheses; live evidence
+coverage, semantic alignment, per-Skill incident outcomes, lineage failures,
+uncertainty, and risk determine which single Skill runs next. Mutation remains
+behind evidence contracts and per-step human approval. The progressive volume
+permission Skill now materializes and verifies the complete approved root
+contract (`runAsUser/runAsGroup/fsGroup=0`, `runAsNonRoot=false`) in the live
+Workload YAML before it can report recovery.
 
 Release 3.2 adds persistent remediation lineage: every failed strategy, action,
 verification result, and replacement plan stays linked across operator-approved

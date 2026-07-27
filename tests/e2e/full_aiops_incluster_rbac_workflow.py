@@ -676,12 +676,40 @@ def run_aiops(client: httpx.Client, failed_pod: str) -> dict:
         "recovered"
     ) is True, job
     assert len(approvals) >= 2, approvals
+    root_approvals = []
+    for approval in approvals:
+        pod_spec = (
+            (((approval.get("patch") or {}).get("spec") or {}).get(
+                "template"
+            ) or {}).get("spec") or {}
+        )
+        writer = next(
+            (
+                item for item in (pod_spec.get("containers") or [])
+                if item.get("name") == "writer"
+            ),
+            {},
+        )
+        if (writer.get("securityContext") or {}).get("runAsUser") == 0:
+            root_approvals.append(approval)
+            pod_security = pod_spec.get("securityContext") or {}
+            container_security = writer.get("securityContext") or {}
+            assert pod_security.get("runAsUser") == 0, approval
+            assert pod_security.get("runAsGroup") == 0, approval
+            assert pod_security.get("runAsNonRoot") is False, approval
+            assert pod_security.get("fsGroup") == 0, approval
+            assert pod_security.get("supplementalGroups") == [0], approval
+            assert container_security.get("runAsUser") == 0, approval
+            assert container_security.get("runAsGroup") == 0, approval
+            assert container_security.get("runAsNonRoot") is False, approval
+    assert root_approvals, approvals
     stages = [str(item.get("stage") or "") for item in job.get("events") or []]
     for required in (
         "collecting_evidence_done",
         "diagnosing",
         "root_cause_diagnosing",
         "root_cause_diagnosed",
+        "root_security_contract_ready",
         "execution_preflight",
         "execution_preflight_done",
         "awaiting_change_approval",
@@ -818,16 +846,48 @@ def main() -> int:
                     "spec"
                 ) or {})
             )
-            assert (pod_spec.get("securityContext") or {}).get(
-                "runAsUser"
-            ) == 0, pod_spec
+            pod_security = pod_spec.get("securityContext") or {}
+            assert pod_security.get("runAsUser") == 0, pod_spec
+            assert pod_security.get("runAsGroup") == 0, pod_spec
+            assert pod_security.get("runAsNonRoot") is False, pod_spec
+            assert pod_security.get("fsGroup") == 0, pod_spec
+            assert pod_security.get("supplementalGroups") == [0], pod_spec
             containers = pod_spec.get("containers") or []
             writer = next(
                 item for item in containers if item.get("name") == "writer"
             )
-            assert (writer.get("securityContext") or {}).get(
+            writer_security = writer.get("securityContext") or {}
+            assert writer_security.get("runAsUser") == 0, writer
+            assert writer_security.get("runAsGroup") == 0, writer
+            assert writer_security.get("runAsNonRoot") is False, writer
+            live_pod = json.loads(kubectl(
+                "get", "pod", recovered_pod,
+                "-n", TARGET_NAMESPACE, "-o", "json",
+            ))
+            live_pod_spec = live_pod.get("spec") or {}
+            live_pod_security = live_pod_spec.get("securityContext") or {}
+            live_writer = next(
+                item for item in (live_pod_spec.get("containers") or [])
+                if item.get("name") == "writer"
+            )
+            assert live_pod_security.get("runAsUser") == 0, live_pod
+            assert live_pod_security.get("runAsGroup") == 0, live_pod
+            assert live_pod_security.get("runAsNonRoot") is False, live_pod
+            assert live_pod_security.get("fsGroup") == 0, live_pod
+            assert (live_writer.get("securityContext") or {}).get(
                 "runAsUser"
-            ) == 0, writer
+            ) == 0, live_pod
+            criteria = (
+                ((outcome["job"].get("result") or {}).get("verification") or {})
+                .get("criteria") or {}
+            )
+            assert "declared_workload_change_applied" in (
+                criteria.get("mandatory") or []
+            ), criteria
+            assert "root_security_context_applied" in (
+                criteria.get("mandatory") or []
+            ), criteria
+            assert criteria.get("passed") is True, criteria
             print(json.dumps({
                 "status": "passed",
                 "build": build,

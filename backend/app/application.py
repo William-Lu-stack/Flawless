@@ -187,8 +187,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.10")
-APP_CODE_SIGNATURE = "rbac-preflight-root-recovery-v15"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.11")
+APP_CODE_SIGNATURE = "adaptive-skill-root-postcondition-v16"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -7762,6 +7762,19 @@ async def _execute_change(change: dict, plan: dict) -> dict:
     if operator_confirmed:
         change["human_approved"] = True
         change["operator_confirmed"] = True
+    root_patch_complete, missing_root_fields = _root_security_context_patch_is_complete(plan, change)
+    if not root_patch_complete:
+        return {
+            "change": _redact_sensitive(change),
+            "status": "blocked",
+            "result": {
+                "error": (
+                    "approved root permission patch is incomplete; no Kubernetes request was sent: "
+                    + ", ".join(missing_root_fields)
+                ),
+                "missing_root_security_context_fields": missing_root_fields,
+            },
+        }
     policy_change = {**change, "type": registered_type, "human_approved": operator_confirmed}
     valid_action, action_reason = validate_change(policy_change)
     if not valid_action:
@@ -8653,6 +8666,98 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     return verification
 
 
+WORKLOAD_PATCH_CHANGE_TYPES = {
+    "restart",
+    "patch_workload",
+    "patch_workload_volume",
+    "patch_workload_runtime_security",
+    "patch",
+    "scale_out",
+    "rollback_workload",
+    "replace_immutable_workload",
+    "rollback_permission_hardening",
+}
+
+
+def _compare_declared_patch(expected, actual, path: str = "") -> list[str]:
+    """Return exact postcondition mismatches for a bounded Kubernetes patch."""
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return [f"{path or '<root>'}: expected object"]
+        missing: list[str] = []
+        for key, value in expected.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if key not in actual:
+                missing.append(f"{child_path}: missing")
+                continue
+            missing.extend(_compare_declared_patch(value, actual.get(key), child_path))
+        return missing
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return [f"{path}: expected list"]
+        if expected and all(isinstance(item, dict) and item.get("name") for item in expected):
+            actual_by_name = {
+                str(item.get("name") or ""): item
+                for item in actual
+                if isinstance(item, dict) and item.get("name")
+            }
+            missing: list[str] = []
+            for item in expected:
+                name = str(item.get("name") or "")
+                if name not in actual_by_name:
+                    missing.append(f"{path}[name={name}]: missing")
+                    continue
+                missing.extend(
+                    _compare_declared_patch(item, actual_by_name[name], f"{path}[name={name}]")
+                )
+            return missing
+        return [] if expected == actual else [f"{path}: expected {expected!r}, got {actual!r}"]
+    if expected == "<now>":
+        return [] if actual not in {None, "", "<now>"} else [f"{path}: restart annotation was not materialized"]
+    return [] if expected == actual else [f"{path}: expected {expected!r}, got {actual!r}"]
+
+
+def _live_workload_postcondition(plan: dict, workload: dict) -> tuple[bool | None, str]:
+    changes = [
+        item for item in (plan.get("changes") or [])
+        if isinstance(item, dict)
+        and str(item.get("type") or "") in WORKLOAD_PATCH_CHANGE_TYPES
+        and isinstance(item.get("patch"), dict)
+    ]
+    if not changes:
+        return None, "本轮没有声明式 Workload Patch"
+    if not workload:
+        return None, "未读取到变更后的 Workload YAML"
+    workload_spec = workload.get("spec") or {}
+    mismatches: list[str] = []
+    for change in changes:
+        patch = change.get("patch") or {}
+        kind = str(
+            change.get("kind")
+            or change.get("workload_type")
+            or _workload_identity_from_plan(plan)[1]
+            or ""
+        ).lower()
+        if kind in {"pod", "pods"}:
+            actual = {"spec": {"template": {"spec": workload_spec}}}
+        elif kind in {"cronjob", "cronjobs"}:
+            actual = {
+                "spec": {
+                    **workload_spec,
+                    "template": (
+                        (((workload_spec.get("jobTemplate") or {}).get("spec") or {}).get("template"))
+                        or {}
+                    ),
+                }
+            }
+        else:
+            actual = {"spec": workload_spec}
+        mismatches.extend(_compare_declared_patch(patch, actual))
+    if mismatches:
+        return False, "实时 Workload YAML 未完整落地审批 Patch：" + "; ".join(mismatches[:12])
+    return True, "实时 Workload YAML 已逐字段匹配本轮审批 Patch"
+
+
 def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) -> dict:
     """Evaluate the Skill/runbook criteria that can be proven from fresh evidence."""
     requested = [
@@ -8666,6 +8771,18 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
         "deployment", "statefulset", "daemonset", "replicaset", "job", "cronjob",
     }:
         mandatory.append("rollout_complete")
+    workload_change_applied, workload_change_proof = _live_workload_postcondition(
+        plan,
+        evidence.get("workload") or {},
+    )
+    if workload_change_applied is not None:
+        mandatory.append("declared_workload_change_applied")
+    root_contract_applied, root_contract_proof = _live_root_security_context_contract(
+        plan,
+        evidence.get("workload") or {},
+    )
+    if _permission_recovery_stage(plan) in ROOT_PERMISSION_RECOVERY_STAGES:
+        mandatory.append("root_security_context_applied")
     normalized_requested = {item.strip().lower().replace(" ", "_") for item in requested}
     requested = requested + [item for item in mandatory if item not in normalized_requested]
     pod = evidence.get("pod") or {}
@@ -8684,6 +8801,24 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
     baseline_pod = ((plan.get("evidence") or {}).get("pod") or {}) if isinstance(plan.get("evidence"), dict) else {}
     baseline_restarts = int(baseline_pod.get("restart_count") or 0)
     current_restarts = int(pod.get("restart_count") or 0)
+    write_error_absent = not any(term in text for term in (
+        "permission denied", "operation not permitted", "read-only file system", "mkdir:",
+        "unable to open database file", "can't open database file", "cannot open database file",
+        "attempt to write a readonly database", "attempt to write a read-only database",
+        "database is read-only", "database is readonly",
+        "failed to create lock file", "unable to create lock file",
+        "failed to open pid file", "failed to create wal",
+        "failed to create temporary file", "data directory is not writable",
+        " is not writable", "paths_data", "path_data",
+    ))
+    write_probe_succeeded = any(term in text for term in (
+        "file_create_ok",
+        "file create ok",
+        "write_probe_ok",
+        "write probe ok",
+        "database-ready",
+        "database ready",
+    ))
     status = workload.get("status") or {}
     metadata = workload.get("metadata") or {}
     spec = workload.get("spec") or {}
@@ -8719,22 +8854,33 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             verification.get("recovered") is True and bool(pod and (pod.get("ready") or _pod_completed_successfully(pod))),
             "活动 Pod 均为 Ready，或 Job Pod 已成功完成",
         ),
+        "new_pod_ready": (
+            verification.get("recovered") is True and bool(pod and (pod.get("ready") or _pod_completed_successfully(pod))),
+            "变更后新 Pod 已 Ready，或 Job Pod 已成功完成",
+        ),
         "rollout_complete": (rollout_complete if workload else None, "Workload observedGeneration 与可用副本已收敛"),
+        "declared_workload_change_applied": (
+            workload_change_applied,
+            workload_change_proof,
+        ),
+        "root_security_context_applied": (
+            root_contract_applied,
+            root_contract_proof,
+        ),
         "restart_count_stable": (current_restarts <= max(1, baseline_restarts), f"restart_count={current_restarts}, baseline={baseline_restarts}"),
         "events_no_new_backoff": (not any(term in text for term in ("backoff", "back-off restarting", "failedmount", "errimagepull")), "新 Pod Events 无 BackOff/FailedMount/ImagePull"),
         "mount_events_absent": (not any(term in text for term in ("failedmount", "failedattachvolume", "mountvolume")), "新 Pod 无挂载失败事件"),
         "write_errors_absent": (
-            not any(term in text for term in (
-                "permission denied", "operation not permitted", "read-only file system", "mkdir:",
-                "unable to open database file", "can't open database file", "cannot open database file",
-                "attempt to write a readonly database", "attempt to write a read-only database",
-                "database is read-only", "database is readonly",
-                "failed to create lock file", "unable to create lock file",
-                "failed to open pid file", "failed to create wal",
-                "failed to create temporary file", "data directory is not writable",
-                " is not writable", "paths_data", "path_data",
-            )),
+            write_error_absent,
             "新 Pod 日志无直接或应用层包装的路径写入错误",
+        ),
+        "permission_error_absent": (
+            write_error_absent,
+            "新 Pod 日志无权限、只读目录或数据库路径写入错误",
+        ),
+        "file_create_succeeds": (
+            write_probe_succeeded,
+            "新 Pod 日志包含明确的文件/数据库写探针成功标记",
         ),
         "oom_absent": ("oomkilled" not in text and "out of memory" not in text, "新 Pod 无 OOM 证据"),
         "probe_failures_absent": ("probe failed" not in text and "unhealthy" not in text, "新 Pod 无探针失败证据"),
@@ -9427,13 +9573,206 @@ def _permission_failure_container(plan: dict) -> tuple[dict, str, str]:
     return container, failing_name, failing_path
 
 
+ROOT_PERMISSION_RECOVERY_STAGES = {"root", "root_rollback"}
+ROOT_POD_SECURITY_CONTEXT = {
+    "runAsUser": 0,
+    "runAsGroup": 0,
+    "runAsNonRoot": False,
+    "fsGroup": 0,
+    "supplementalGroups": [0],
+    "fsGroupChangePolicy": "OnRootMismatch",
+}
+ROOT_CONTAINER_SECURITY_CONTEXT = {
+    "runAsUser": 0,
+    "runAsGroup": 0,
+    "runAsNonRoot": False,
+    "allowPrivilegeEscalation": False,
+}
+
+
+def _permission_recovery_stage(plan: dict, change: dict | None = None) -> str:
+    change = change if isinstance(change, dict) else {}
+    return str(
+        change.get("permission_recovery_stage")
+        or plan.get("permission_recovery_stage")
+        or ""
+    ).strip()
+
+
+def _root_security_context_container_name(plan: dict, change: dict) -> str:
+    name = str(change.get("container_name") or "").strip()
+    if name:
+        return name
+    pod_spec = (((change.get("patch") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+    for item in pod_spec.get("containers") or []:
+        if isinstance(item, dict) and item.get("name"):
+            return str(item["name"])
+    _container, failing_name, _failing_path = _permission_failure_container(plan)
+    return str(failing_name or "")
+
+
+def _enforce_root_security_context_change(plan: dict, change: dict) -> tuple[bool, str]:
+    """Materialize the complete, approval-visible root fallback contract.
+
+    DeepSeek may describe only one securityContext field, and a persisted
+    continuation may be resumed from an older partial plan.  Once the
+    progressive permission Skill reaches its separately approved root stage,
+    the submitted strategic merge patch must contain the complete Pod and
+    failing-container identity contract.  This function runs before the
+    approval fingerprint is issued; the executor only validates it later.
+    """
+    if _permission_recovery_stage(plan, change) not in ROOT_PERMISSION_RECOVERY_STAGES:
+        return True, ""
+    if str(change.get("type") or "") not in {
+        "patch_workload",
+        "patch_workload_runtime_security",
+        "replace_immutable_workload",
+        "rollback_permission_hardening",
+    }:
+        return False, "root permission recovery requires a workload runtime-security patch"
+    container_name = _root_security_context_container_name(plan, change)
+    if not container_name:
+        return False, "root permission recovery requires the exact failing container_name"
+
+    patch = copy.deepcopy(change.get("patch") or {})
+    pod_spec = patch.setdefault("spec", {}).setdefault("template", {}).setdefault("spec", {})
+    pod_security = pod_spec.setdefault("securityContext", {})
+    pod_security.update(copy.deepcopy(ROOT_POD_SECURITY_CONTEXT))
+
+    containers = pod_spec.setdefault("containers", [])
+    if not isinstance(containers, list):
+        return False, "root permission recovery patch spec.template.spec.containers must be a list"
+    target = next(
+        (
+            item for item in containers
+            if isinstance(item, dict) and str(item.get("name") or "") == container_name
+        ),
+        None,
+    )
+    if target is None:
+        target = {"name": container_name}
+        containers.append(target)
+    target_security = target.setdefault("securityContext", {})
+    if not isinstance(target_security, dict):
+        return False, "root permission recovery container.securityContext must be an object"
+    target_security.update(copy.deepcopy(ROOT_CONTAINER_SECURITY_CONTEXT))
+
+    change["container_name"] = container_name
+    change["permission_recovery_stage"] = "root"
+    change["type"] = (
+        "replace_immutable_workload"
+        if str(change.get("type") or "") == "replace_immutable_workload"
+        else "patch_workload_runtime_security"
+    )
+    change["patch"] = patch
+    change["root_security_context_contract"] = {
+        "pod": copy.deepcopy(ROOT_POD_SECURITY_CONTEXT),
+        "container": {
+            "name": container_name,
+            **copy.deepcopy(ROOT_CONTAINER_SECURITY_CONTEXT),
+        },
+    }
+    return True, ""
+
+
+def _enforce_root_security_context_plan(plan: dict) -> tuple[bool, str]:
+    for change in plan.get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+        valid, reason = _enforce_root_security_context_change(plan, change)
+        if not valid:
+            return False, reason
+    return True, ""
+
+
+def _root_security_context_patch_is_complete(plan: dict, change: dict) -> tuple[bool, list[str]]:
+    if _permission_recovery_stage(plan, change) not in ROOT_PERMISSION_RECOVERY_STAGES:
+        return True, []
+    missing: list[str] = []
+    pod_spec = (((change.get("patch") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+    pod_security = pod_spec.get("securityContext") or {}
+    for key, expected in ROOT_POD_SECURITY_CONTEXT.items():
+        if pod_security.get(key) != expected:
+            missing.append(f"spec.template.spec.securityContext.{key}={expected!r}")
+    container_name = _root_security_context_container_name(plan, change)
+    container = next(
+        (
+            item for item in (pod_spec.get("containers") or [])
+            if isinstance(item, dict) and str(item.get("name") or "") == container_name
+        ),
+        {},
+    )
+    container_security = container.get("securityContext") or {}
+    for key, expected in ROOT_CONTAINER_SECURITY_CONTEXT.items():
+        if container_security.get(key) != expected:
+            missing.append(
+                f"spec.template.spec.containers[{container_name}].securityContext.{key}={expected!r}"
+            )
+    return not missing, missing
+
+
+def _live_root_security_context_contract(plan: dict, workload: dict) -> tuple[bool | None, str]:
+    if _permission_recovery_stage(plan) not in ROOT_PERMISSION_RECOVERY_STAGES:
+        return None, "当前方案不是 root 权限恢复阶段"
+    if not workload:
+        return None, "未读取到恢复后的 Workload YAML"
+    spec = workload.get("spec") or {}
+    normalized_kind = str(_workload_identity_from_plan(plan)[1] or "").lower()
+    if normalized_kind in {"cronjob", "cronjobs"}:
+        pod_spec = (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+    else:
+        pod_spec = ((spec.get("template") or {}).get("spec") or {})
+    missing: list[str] = []
+    pod_security = pod_spec.get("securityContext") or {}
+    for key, expected in ROOT_POD_SECURITY_CONTEXT.items():
+        if pod_security.get(key) != expected:
+            missing.append(f"pod.{key}")
+    target_change = next(
+        (
+            item for item in (plan.get("changes") or [])
+            if isinstance(item, dict)
+            and _permission_recovery_stage(plan, item) in ROOT_PERMISSION_RECOVERY_STAGES
+        ),
+        {},
+    )
+    container_name = _root_security_context_container_name(plan, target_change)
+    container = next(
+        (
+            item for item in (pod_spec.get("containers") or [])
+            if isinstance(item, dict) and str(item.get("name") or "") == container_name
+        ),
+        {},
+    )
+    container_security = container.get("securityContext") or {}
+    for key, expected in ROOT_CONTAINER_SECURITY_CONTEXT.items():
+        if container_security.get(key) != expected:
+            missing.append(f"container[{container_name}].{key}")
+    if missing:
+        return False, f"恢复后的 Workload 仍缺少 root securityContext 字段：{', '.join(missing)}"
+    return True, (
+        f"Workload YAML 已确认 Pod 与容器 {container_name} 的 runAsUser/runAsGroup/fsGroup=0，"
+        "runAsNonRoot=false"
+    )
+
+
 def _permission_attempted_stages(plan: dict) -> set[str]:
-    attempted: set[str] = set()
+    continuation = plan.get("continuation_context") if isinstance(plan.get("continuation_context"), dict) else {}
+    attempted: set[str] = {
+        str(value)
+        for value in [
+            *(plan.get("_attempted_permission_recovery_stages") or []),
+            *(continuation.get("permission_recovery_stages") or []),
+        ]
+        if str(value)
+    }
     candidates = [
         *((plan.get("_last_failure") or {}).get("attempted_changes") or []),
     ]
     for prior in plan.get("_prior_attempts") or []:
         if isinstance(prior, dict):
+            prior_stage = str(prior.get("permission_recovery_stage") or "")
+            if prior_stage:
+                attempted.add(prior_stage)
             candidates.extend(prior.get("changes") or [])
     for change in candidates:
         if not isinstance(change, dict):
@@ -9696,6 +10035,7 @@ def _permission_recovery_followup(
             "source": "storage_admin_required",
             "verification_plan": _next_attempt_verification_plan(target),
         }
+    change["permission_recovery_stage"] = stage
     if (
         str(workload_type or "").lower() in {"pod", "job"}
         and change.get("type") == "patch_workload_runtime_security"
@@ -10537,6 +10877,7 @@ _CHANGE_FINGERPRINT_IGNORED_KEYS = {
     "human_approved", "operator_confirmed", "requires_confirmation",
     "requires_high_risk_confirmation", "selection_source", "skill_supported", "skill_id",
     "approval_receipt", "approval_id", "approved_at", "approved_by", "operator_override_reason",
+    "root_security_context_contract",
 }
 
 
@@ -10647,6 +10988,7 @@ def _ops_attempt_summary(item: dict) -> dict:
     return {
         "attempt": int(item.get("attempt") or 0),
         "strategy": str(item.get("strategy") or "ops-plan")[:180],
+        "permission_recovery_stage": str(item.get("permission_recovery_stage") or ""),
         "fingerprint": str(item.get("fingerprint") or ""),
         "actions": [str(value) for value in (item.get("actions") or []) if value][:12],
         "change_fingerprints": [str(value) for value in (item.get("change_fingerprints") or []) if value][:12],
@@ -10675,6 +11017,7 @@ def _build_ops_continuation_context(
         {
             "attempt": int(item.get("attempt") or prior_attempt_offset + index + 1),
             "strategy": str(item.get("strategy") or "ops-plan")[:180],
+            "permission_recovery_stage": str(item.get("permission_recovery_stage") or ""),
             "fingerprint": str(item.get("fingerprint") or ""),
             "actions": [str(value) for value in (item.get("actions") or []) if value][:12],
             "change_fingerprints": [str(value) for value in (item.get("change_fingerprints") or []) if value][:12],
@@ -10709,6 +11052,15 @@ def _build_ops_continuation_context(
         str(value) for value in (plan.get("_attempted_actions") or existing.get("attempted_actions") or []) if value
     }
     actions.update(_history_action_types(history))
+    permission_recovery_stages = {
+        str(value)
+        for value in [
+            *(plan.get("_attempted_permission_recovery_stages") or []),
+            *(existing.get("permission_recovery_stages") or []),
+            *(item.get("permission_recovery_stage") for item in deduplicated),
+        ]
+        if str(value)
+    }
     last_attempt = deduplicated[-1] if deduplicated else {
         "strategy": plan.get("title") or plan.get("source") or "ops-plan",
         "status": result.get("status") or "unknown",
@@ -10727,6 +11079,7 @@ def _build_ops_continuation_context(
         ),
         "attempted_change_fingerprints": sorted(change_fingerprints),
         "attempted_actions": sorted(actions),
+        "permission_recovery_stages": sorted(permission_recovery_stages),
         "attempts": deduplicated[-12:],
         "last_failure": _redact_sensitive(last_attempt),
     }
@@ -10771,6 +11124,14 @@ def _apply_ops_continuation_context(plan: dict) -> dict:
         str(value)
         for value in [*(plan.get("_attempted_actions") or []), *(context.get("attempted_actions") or [])]
         if value
+    })
+    plan["_attempted_permission_recovery_stages"] = sorted({
+        str(value)
+        for value in [
+            *(plan.get("_attempted_permission_recovery_stages") or []),
+            *(context.get("permission_recovery_stages") or []),
+        ]
+        if str(value)
     })
     if isinstance(context.get("last_failure"), dict):
         plan["_last_failure"] = copy.deepcopy(context["last_failure"])
@@ -11328,7 +11689,51 @@ async def _execute_ops_plan_once(
             "message": verification["message"],
         }
 
+    root_contract_valid, root_contract_reason = _enforce_root_security_context_plan(plan)
+    if not root_contract_valid:
+        verification = {
+            "status": "blocked",
+            "recovered": False,
+            "message": root_contract_reason,
+            "proof": "root 兜底补丁在签发人工审批指纹前未满足完整 securityContext 契约；未提交 Kubernetes 变更。",
+            "operator_steps": [
+                "重新读取失败 Pod 与拥有它的 Workload，确认准确 container_name。",
+                "重新运行权限恢复 Skill；审批页必须同时展示 Pod 级与容器级 securityContext 完整差异。",
+            ],
+        }
+        await emit(
+            "root_security_contract_blocked",
+            root_contract_reason,
+            verification=verification,
+            level="error",
+        )
+        return {
+            "status": "blocked",
+            "executed": False,
+            "steps": executed_steps,
+            "changes": [],
+            "results": [],
+            "release_gate": release_gate,
+            "verification": verification,
+            "operator_steps": verification["operator_steps"],
+            "message": root_contract_reason,
+        }
     changes = [change if isinstance(change, dict) else {"type": str(change)} for change in plan.get("changes", [])]
+    root_changes = [
+        change for change in changes
+        if isinstance(change, dict)
+        and _permission_recovery_stage(plan, change) in ROOT_PERMISSION_RECOVERY_STAGES
+    ]
+    if root_changes:
+        await emit(
+            "root_security_contract_ready",
+            "最终 root 兜底补丁已补齐并锁定：Pod/容器 runAsUser=0、runAsGroup=0、runAsNonRoot=false，Pod fsGroup=0。",
+            root_security_context_contracts=[
+                change.get("root_security_context_contract") for change in root_changes
+            ],
+            patches=[change.get("patch") for change in root_changes],
+            level="warning",
+        )
     permission_preflight = {"status": "skipped", "allowed": None, "checks": []}
     if changes:
         await emit(
@@ -12068,6 +12473,11 @@ def _public_skill_match(match: dict) -> dict:
         "score": match.get("score"),
         "rank": match.get("rank"),
         "score_breakdown": match.get("score_breakdown") or {},
+        "selection_algorithm": match.get("selection_algorithm"),
+        "diagnostic_priority": match.get("diagnostic_priority"),
+        "uncertainty": match.get("uncertainty"),
+        "evidence_readiness": match.get("evidence_readiness"),
+        "matched_hypotheses": match.get("matched_hypotheses") or [],
         "why": match.get("why"),
         "allowed_actions": skill.get("allowed_actions") or [],
         "evidence_required": skill.get("evidence_required") or [],
@@ -12272,7 +12682,38 @@ def _attach_operator_skills_to_plan(
     if not isinstance(plan, dict):
         return plan
     _enrich_plan_change_policies(plan)
-    result = OPS_SKILL_REGISTRY.match(signal, top_k=max(5, top_k))
+    preferred_skill_ids = [str(item) for item in preferred_skill_ids or [] if str(item)]
+    match_signal = copy.deepcopy(signal)
+    # Never let yesterday's route become today's evidence.  Plans are passed
+    # through several diagnosis/approval/replan cycles; feeding the prior
+    # operator_skills and their descriptions back into semantic matching makes
+    # every previously displayed Skill appear to match perfectly.
+    routing_output_fields = {
+        "operator_skills",
+        "skill_candidates",
+        "selected_skill_id",
+        "skill_allowed_actions",
+        "skill_evidence",
+        "skill_selection_algorithm",
+        "skill_match_policy",
+        "skill_suggested_steps",
+        "skill_script_candidates",
+        "skill_routing",
+    }
+    match_signal["plan"] = {
+        key: copy.deepcopy(value)
+        for key, value in plan.items()
+        if key not in routing_output_fields
+    }
+    if preferred_skill_ids:
+        # A model recommendation is a calibrated prior, never an unconditional
+        # override.  Live evidence and current-lineage failures still decide
+        # the final rank.
+        match_signal["_router_hints"] = {
+            "primary_skill_id": preferred_skill_ids[0],
+            "secondary_skill_ids": preferred_skill_ids[1:],
+        }
+    result = OPS_SKILL_REGISTRY.match(match_signal, top_k=max(5, top_k))
     attempted_skill_ids = {
         str(item) for item in (plan.get("_attempted_skill_ids") or []) if str(item)
     }
@@ -12286,28 +12727,6 @@ def _attach_operator_skills_to_plan(
             )
         )
     ]
-    preferred_skill_ids = [str(item) for item in preferred_skill_ids or [] if str(item)]
-    if preferred_skill_ids:
-        by_id = {str((item.get("skill") or {}).get("id")): item for item in matches}
-        registry_skills = {str(item.get("id")): item for item in OPS_SKILL_REGISTRY.list().get("skills") or []}
-        for index, skill_id in enumerate(preferred_skill_ids):
-            if skill_id not in by_id and skill_id in registry_skills and registry_skills[skill_id].get("enabled", True):
-                skill = registry_skills[skill_id]
-                by_id[skill_id] = {
-                    "skill": skill,
-                    "score": max(0.3, 0.9 - index * 0.08),
-                    "confidence": max(0.55, 0.92 - index * 0.08),
-                    "score_breakdown": {"router_preference": True},
-                    "why": "批量 Skill Router 根据异常证据与适用对象选择。",
-                }
-        matches = sorted(
-            by_id.values(),
-            key=lambda item: (
-                preferred_skill_ids.index(str((item.get("skill") or {}).get("id")))
-                if str((item.get("skill") or {}).get("id")) in preferred_skill_ids else len(preferred_skill_ids),
-                -float(item.get("confidence") or 0),
-            ),
-        )[:max(5, top_k)]
     matches = matches[:max(5, top_k)]
     for index, match in enumerate(matches, start=1):
         match["rank"] = index
@@ -12355,6 +12774,7 @@ def _attach_operator_skills_to_plan(
     plan["selected_skill_id"] = active_skill_id
     plan["skill_execution_mode"] = "adaptive_serial"
     plan["skill_execution_threshold"] = float(result.get("execution_threshold") or 0.70)
+    plan["skill_selection_algorithm"] = copy.deepcopy(result.get("selection_algorithm") or {})
     if active_skill_id:
         _record_skill_route_once(plan, active_skill_id, "selected")
     plan["skill_evidence"] = {
@@ -12383,11 +12803,19 @@ def _attach_operator_skills_to_plan(
         if plan.get("changes"):
             plan["_blocked_low_confidence_changes"] = copy.deepcopy(plan.get("changes") or [])
             plan["changes"] = []
-        plan["decision"] = "diagnostic_skill_then_rerank"
-        plan["evidence_gap"] = (
-            f"最高匹配 Skill 置信度 {active_confidence:.0%} 低于 70%；"
-            "本轮只执行该 Skill 的只读诊断步骤，取得新证据后重新排序。"
-        )
+        if active_match.get("_evidence_missing"):
+            plan["decision"] = "skill_evidence_required"
+            plan["evidence_gap"] = (
+                f"最高匹配 Skill 置信度 {active_confidence:.0%}，且执行契约仍缺少："
+                f"{', '.join(active_match.get('_evidence_missing') or [])}；"
+                "本轮只采集这些可区分候选根因的证据，随后重新排序。"
+            )
+        else:
+            plan["decision"] = "diagnostic_skill_then_rerank"
+            plan["evidence_gap"] = (
+                f"最高匹配 Skill 置信度 {active_confidence:.0%} 低于 70%；"
+                "本轮只执行该 Skill 的只读诊断步骤，取得新证据后重新排序。"
+            )
     if execution_matches and OPS_SKILL_RUNTIME.is_executable(active_skill_id):
         runtime_plan = _materialize_executable_skill(plan, signal, active_skill_id)
         if runtime_plan:
@@ -12490,11 +12918,12 @@ def _attach_operator_skills_to_plan(
     plan["planning_engine"] = (
         plan.get("planning_engine")
         if plan.get("skill_handler_invoked")
-        else "DynamicSREPlanner/v5 + AdaptiveSerialSkillRouter/v1 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
+        else "DynamicSREPlanner/v5 + ContextualBayesianSkillRouter/v2 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
     )
     plan["skill_match_policy"] = (
-        "候选 Skill 按 40/20/20/10/10 加权排序；同一时刻只允许最高分 Skill 执行，"
-        "低于 70% 先只读取证后重排，失败后排除已失败 Skill 并基于新证据选择下一项。"
+        "候选 Skill 由模型根因先验、实时证据覆盖、语义相似度、Beta 后验成功率、风险与"
+        "同一故障链失败惩罚动态排序；同一时刻只执行最高效用 Skill，低于 70% 只读取证后重排。"
+        "只有模型证明跨域依赖时才串行使用 secondary Skill，禁止一次并行执行多个修复 Skill。"
     )
     return plan
 
@@ -13508,6 +13937,17 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                 _history_change_fingerprints(history)
                 | {str(value) for value in (current.get("_attempted_change_fingerprints") or []) if value}
             )
+            root_contract_valid, root_contract_reason = _enforce_root_security_context_plan(current)
+            if not root_contract_valid:
+                await _append_ops_job_event(
+                    job_id,
+                    "root_security_contract_blocked",
+                    root_contract_reason,
+                    status="running",
+                    level="error",
+                )
+                current["changes"] = []
+                current["evidence_gap"] = root_contract_reason
             fingerprint = _change_fingerprint(current)
             if fingerprint in attempted:
                 result = _append_manual_exit_if_needed(
@@ -13548,6 +13988,11 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
             history.append({
                 "attempt": attempt,
                 "strategy": current.get("title") or current.get("source") or "ops-plan",
+                "permission_recovery_stage": (
+                    current.get("permission_recovery_stage") or ""
+                    if result.get("results")
+                    else ""
+                ),
                 "skill_id": current.get("selected_skill_id") or "",
                 "fingerprint": fingerprint,
                 "actions": sorted(_plan_action_types(current)),

@@ -442,12 +442,203 @@ class OpsSkillCatalogTests(unittest.TestCase):
                 {
                     "symptom_log_match",
                     "environment_match",
+                    "semantic_similarity",
+                    "hypothesis_alignment",
+                    "model_skill_prior",
+                    "evidence_readiness",
                     "historical_success",
                     "least_privilege",
                     "recency_reliability",
+                    "information_gain",
+                    "exploration",
+                    "lineage_failure_penalty",
+                    "inference_confidence",
                 },
             )
-            self.assertIn("40/20/20/10/10", registry.match({"question": "permission denied"})["policy"])
+            result = registry.match({"question": "permission denied"})
+            self.assertEqual(
+                result["selection_algorithm"]["id"],
+                "contextual_bayesian_utility_v2",
+            )
+            self.assertIn("Beta 后验成功率", result["policy"])
+            self.assertEqual(match["selection_algorithm"], "contextual_bayesian_utility_v2")
+
+    def test_root_cause_hypotheses_drive_skill_ranking_without_keyword_runbook(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = OpsSkillRegistry(Path(directory) / "skills")
+            result = registry.match({
+                "question": "application startup failed",
+                "diagnosis": {
+                    "root_cause_candidates": [
+                        {
+                            "id": "write-path",
+                            "hypothesis": (
+                                "sqlite database parent directory is not writable because "
+                                "container runAsUser and mounted volume ownership mismatch"
+                            ),
+                            "confidence": 0.91,
+                            "supporting_evidence": [
+                                "unable to open database file",
+                                "volumeMount /var/lib/app",
+                                "runAsNonRoot true",
+                            ],
+                        },
+                        {
+                            "id": "database-corruption",
+                            "hypothesis": "database file corruption",
+                            "confidence": 0.35,
+                        },
+                    ],
+                },
+                "evidence": {
+                    "logs": {"api": {"current": "sqlite3.OperationalError: unable to open database file"}},
+                    "events": [],
+                    "pod": {
+                        "security_context": {"runAsNonRoot": True},
+                        "containers": [{"name": "api"}],
+                    },
+                    "workload": {"kind": "Deployment"},
+                    "storage": [{"pvc_phase": "Bound", "storage_class": "nfs"}],
+                },
+            })
+            top = result["matches"][0]
+            self.assertEqual(top["skill"]["id"], "skill-volume-permission-recovery")
+            self.assertGreaterEqual(top["confidence"], result["execution_threshold"])
+            self.assertGreater(top["score_breakdown"]["hypothesis_alignment"], 0.4)
+            self.assertTrue(top["matched_hypotheses"])
+
+    def test_model_skill_hint_is_prior_not_override_and_failed_lineage_is_penalized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = OpsSkillRegistry(Path(directory) / "skills")
+            evidence = {
+                "logs": {"api": {"current": "unable to open database file"}},
+                "events": [],
+                "pod": {
+                    "security_context": {"runAsNonRoot": True},
+                    "containers": [{"name": "api"}],
+                },
+                "workload": {"kind": "Deployment"},
+                "storage": [{"pvc_phase": "Bound", "storage_class": "nfs"}],
+            }
+            payload = {
+                "question": "application startup failed",
+                "diagnosis": {
+                    "root_cause_candidates": [{
+                        "hypothesis": (
+                            "mounted database path cannot be written by the configured "
+                            "runAsUser and runAsGroup"
+                        ),
+                        "confidence": 0.94,
+                        "supporting_evidence": ["unable to open database file", "volumeMount"],
+                    }],
+                    # Deliberately wrong model hint: evidence must still win.
+                    "skill_routing": {
+                        "primary_skill_id": "skill-service-endpoint-flow",
+                    },
+                },
+                "evidence": evidence,
+                "plan": {},
+            }
+            first = registry.match(payload)
+            self.assertEqual(
+                first["matches"][0]["skill"]["id"],
+                "skill-volume-permission-recovery",
+            )
+
+            failed_payload = {
+                **payload,
+                "plan": {
+                    "_attempted_skill_ids": ["skill-service-endpoint-flow"],
+                },
+            }
+            failed = registry.match(failed_payload, top_k=20)
+            service_match = next(
+                item for item in failed["matches"]
+                if item["skill"]["id"] == "skill-service-endpoint-flow"
+            )
+            self.assertEqual(
+                service_match["score_breakdown"]["lineage_failure_penalty"],
+                0.3,
+            )
+
+            continuation_payload = {
+                **payload,
+                "plan": {
+                    "_attempted_skill_ids": ["skill-volume-permission-recovery"],
+                },
+            }
+            continuation = registry.match(continuation_payload, top_k=20)
+            volume_match = next(
+                item for item in continuation["matches"]
+                if item["skill"]["id"] == "skill-volume-permission-recovery"
+            )
+            self.assertEqual(
+                volume_match["score_breakdown"]["lineage_failure_penalty"],
+                0.0,
+            )
+
+    def test_prior_route_descriptions_do_not_pollute_fresh_skill_ranking(self):
+        evidence = {
+            "logs": {"writer": {"current": "unable to open database file"}},
+            "events": [],
+            "pod": {
+                "security_context": {"runAsUser": 10001, "runAsNonRoot": True},
+                "containers": [{
+                    "name": "writer",
+                    "security_context": {"runAsUser": 10001, "runAsNonRoot": True},
+                    "volume_mounts": [{"name": "data", "mount_path": "/var/lib/app"}],
+                }],
+            },
+            "workload": {"kind": "Deployment", "metadata": {"name": "writer"}},
+            "storage": [{"pvc_phase": "Bound", "storage_class": "nfs"}],
+        }
+        plan = {
+            "_skill_incident_id": "route-pollution",
+            "namespace": "default",
+            "target": "Deployment/writer",
+            "summary": "unable to open database file",
+            "evidence": evidence,
+            "changes": [],
+            "operator_skills": [{
+                "id": "skill-crashloop-root-cause",
+                "summary": (
+                    "CrashLoopBackOff permission denied unable to open database "
+                    "file workload_spec pod_security_context current_logs"
+                ),
+                "confidence": 0.99,
+            }],
+            "skill_candidates": [{
+                "id": "skill-crashloop-root-cause",
+                "confidence": 0.99,
+            }],
+        }
+        attached = server._attach_operator_skills_to_plan(
+            plan,
+            {
+                "question": plan["summary"],
+                "diagnosis": {
+                    "root_cause_candidates": [{
+                        "hypothesis": "mounted database path cannot be written by runAsUser",
+                        "confidence": 0.92,
+                        "supporting_evidence": ["volumeMount", "runAsNonRoot"],
+                    }],
+                    "skill_routing": {
+                        "primary_skill_id": "skill-volume-permission-recovery",
+                    },
+                },
+                "evidence": evidence,
+                "plan": plan,
+            },
+            preferred_skill_ids=["skill-volume-permission-recovery"],
+        )
+        self.assertEqual(
+            attached["selected_skill_id"],
+            "skill-volume-permission-recovery",
+        )
+        self.assertEqual(
+            attached["operator_skills"][0]["id"],
+            "skill-volume-permission-recovery",
+        )
 
     def test_persisted_builtin_skill_is_upgraded_to_current_security_policy(self):
         with tempfile.TemporaryDirectory() as directory:

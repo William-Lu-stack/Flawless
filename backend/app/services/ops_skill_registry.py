@@ -8,6 +8,7 @@ Skill 是一线运维人员沉淀经验的最小资产：它描述适用场景�
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -341,6 +342,164 @@ def _tokenize(value: Any) -> set[str]:
 def _clip(value: Any, limit: int = 2200) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return text[:limit]
+
+
+def _confidence(value: Any, default: float = 0.5) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _skill_routing_hints(payload: dict[str, Any]) -> tuple[str, list[str]]:
+    diagnosis = payload.get("diagnosis") if isinstance(payload.get("diagnosis"), dict) else {}
+    routing = diagnosis.get("skill_routing") if isinstance(diagnosis.get("skill_routing"), dict) else {}
+    explicit = payload.get("_router_hints") if isinstance(payload.get("_router_hints"), dict) else {}
+    primary = str(
+        explicit.get("primary_skill_id")
+        or routing.get("primary_skill_id")
+        or diagnosis.get("selected_skill_id")
+        or ""
+    ).strip()
+    secondary = [
+        str(item).strip()
+        for item in (
+            explicit.get("secondary_skill_ids")
+            or routing.get("secondary_skill_ids")
+            or diagnosis.get("secondary_skill_ids")
+            or []
+        )
+        if str(item).strip()
+    ]
+    return primary, secondary
+
+
+def _root_cause_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract model/engine hypotheses without depending on one response shape."""
+    diagnosis = payload.get("diagnosis") if isinstance(payload.get("diagnosis"), dict) else {}
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    planning = plan.get("planning") if isinstance(plan.get("planning"), dict) else {}
+    candidate_groups = [
+        diagnosis.get("root_cause_candidates"),
+        diagnosis.get("candidate_root_causes"),
+        diagnosis.get("root_cause_hypotheses"),
+        planning.get("candidate_root_causes"),
+        planning.get("root_cause_candidates"),
+        plan.get("candidate_root_causes"),
+        plan.get("root_cause_candidates"),
+    ]
+    normalized: list[dict[str, Any]] = []
+    for group in candidate_groups:
+        if not isinstance(group, list):
+            continue
+        for index, raw in enumerate(group):
+            if isinstance(raw, dict):
+                text = " ".join(
+                    str(raw.get(key) or "")
+                    for key in (
+                        "id",
+                        "hypothesis",
+                        "root_cause",
+                        "title",
+                        "summary",
+                        "supporting_evidence",
+                        "matched_evidence",
+                        "required_next_evidence",
+                    )
+                ).strip()
+                confidence = _confidence(
+                    raw.get("confidence", raw.get("probability", raw.get("score"))),
+                    max(0.25, 0.75 - index * 0.12),
+                )
+            else:
+                text = str(raw).strip()
+                confidence = max(0.25, 0.75 - index * 0.12)
+            if text:
+                normalized.append({"text": text, "confidence": confidence, "rank": index + 1})
+        if normalized:
+            break
+    if not normalized:
+        root_cause = str(diagnosis.get("root_cause") or plan.get("root_cause") or "").strip()
+        if root_cause:
+            normalized.append({
+                "text": root_cause,
+                "confidence": _confidence(diagnosis.get("confidence"), 0.55),
+                "rank": 1,
+            })
+    return normalized[:8]
+
+
+def _collected_evidence_ids(payload: dict[str, Any]) -> set[str]:
+    """Create coarse evidence features for ranking; execution validates them again."""
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    collected = {
+        str(item).strip()
+        for item in (evidence.get("collected_evidence") or evidence.get("evidence_collected") or [])
+        if str(item).strip()
+    }
+    logs = evidence.get("logs")
+    if isinstance(logs, dict) and logs:
+        if any(
+            bool(content.get("current")) if isinstance(content, dict) else bool(str(content).strip())
+            for content in logs.values()
+        ):
+            collected.add("current_logs")
+        if any(
+            isinstance(content, dict) and (
+                "previous" in content or int(content.get("restart_count") or 0) > 0
+            )
+            for content in logs.values()
+        ):
+            collected.add("previous_logs")
+    if isinstance(evidence.get("events"), list):
+        collected.add("events")
+    pod = evidence.get("pod") if isinstance(evidence.get("pod"), dict) else {}
+    if pod:
+        if "security_context" in pod or "securityContext" in pod:
+            collected.add("pod_security_context")
+        if pod.get("containers"):
+            collected.add("last_state")
+    workload = evidence.get("workload") if isinstance(evidence.get("workload"), dict) else {}
+    if workload:
+        collected.update({"workload_spec", "recent_changes"})
+    storage = evidence.get("storage") if isinstance(evidence.get("storage"), list) else []
+    if storage:
+        collected.add("storage_chain")
+        if any(isinstance(item, dict) and ("pvc_phase" in item or item.get("missing")) for item in storage):
+            collected.add("pvc_binding")
+        if any(isinstance(item, dict) and "storage_class" in item for item in storage):
+            collected.add("storage_class")
+    if isinstance(evidence.get("services"), list):
+        collected.add("service_endpoints")
+    if isinstance(evidence.get("node"), dict) and evidence.get("node"):
+        collected.update({"node_conditions", "node_capacity", "node_pressure", "node_labels", "system_pods"})
+    diagnostics = evidence.get("diagnostics") if isinstance(evidence.get("diagnostics"), dict) else {}
+    collected.update(str(key) for key, value in diagnostics.items() if value is not None)
+    return collected
+
+
+def _attempted_skill_ids(payload: dict[str, Any]) -> set[str]:
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    continuation = (
+        plan.get("continuation_context")
+        if isinstance(plan.get("continuation_context"), dict)
+        else {}
+    )
+    attempted = {
+        str(item).strip()
+        for item in (
+            *(plan.get("_attempted_skill_ids") or []),
+            *(continuation.get("attempted_skill_ids") or []),
+        )
+        if str(item).strip()
+    }
+    for item in plan.get("_prior_attempts") or []:
+        if not isinstance(item, dict):
+            continue
+        skill_id = str(item.get("skill_id") or item.get("selected_skill_id") or "").strip()
+        if skill_id and item.get("outcome") not in {"recovered", "succeeded"}:
+            attempted.add(skill_id)
+    return attempted
 
 
 SKILL_USAGE_FIELDS = (
@@ -808,13 +967,30 @@ class OpsSkillRegistry:
             return {"status": status, "id": skill_id}
 
     def match(self, payload: dict[str, Any], *, top_k: int = 5) -> dict[str, Any]:
+        """Rank Skills with evidence-aware contextual utility.
+
+        The LLM supplies hypotheses, not authority.  This router combines those
+        hypotheses with live evidence coverage, historical outcomes, current
+        lineage failures and risk.  Missing evidence may raise diagnostic
+        priority, but the caller still blocks mutation until the Skill's
+        evidence contract is satisfied.
+        """
         query_tokens = _tokenize(payload)
         query_text = json.dumps(payload, ensure_ascii=False, default=str).lower()
+        hypotheses = _root_cause_candidates(payload)
+        collected_evidence = _collected_evidence_ids(payload)
+        primary_hint, secondary_hints = _skill_routing_hints(payload)
+        attempted_skill_ids = _attempted_skill_ids(payload)
         matches: list[dict[str, Any]] = []
         with self._lock:
+            total_incidents = sum(
+                self._normalize_usage(value).get("incidents_handled", 0)
+                for value in self._usage.values()
+            )
             for skill in self._skills.values():
                 if not skill.get("enabled", True):
                     continue
+                skill_id = str(skill.get("id") or "")
                 skill_tokens = _tokenize({
                     "name": skill.get("name"),
                     "summary": skill.get("summary"),
@@ -833,8 +1009,6 @@ class OpsSkillRegistry:
                     for item in skill.get("symptoms") or []
                     if str(item).strip() and str(item).lower() in query_text
                 ]
-                if not hits and not exact_symptoms:
-                    continue
                 symptom_score = min(
                     1.0,
                     len(exact_symptoms) * 0.48
@@ -852,9 +1026,98 @@ class OpsSkillRegistry:
                     + len(evidence_hits) * 0.18
                     + (0.22 if category_hit else 0.0),
                 )
-                usage = self._normalize_usage(self._usage.get(str(skill.get("id"))))
+                semantic_score = min(1.0, symptom_score * 0.72 + environment_score * 0.28)
+
+                hypothesis_alignment = 0.0
+                matched_hypotheses: list[dict[str, Any]] = []
+                symptom_tokens = _tokenize(skill.get("symptoms"))
+                for hypothesis in hypotheses:
+                    hypothesis_text = str(hypothesis.get("text") or "")
+                    hypothesis_tokens = _tokenize(hypothesis_text)
+                    overlap = len(skill_tokens & hypothesis_tokens) / max(
+                        1,
+                        min(12, len(hypothesis_tokens)),
+                    )
+                    exact_hypothesis_symptoms = [
+                        str(item).lower()
+                        for item in skill.get("symptoms") or []
+                        if str(item).strip() and str(item).lower() in hypothesis_text.lower()
+                    ]
+                    symptom_overlap = len(symptom_tokens & hypothesis_tokens) / max(
+                        1,
+                        min(8, len(symptom_tokens)),
+                    )
+                    alignment = min(
+                        1.0,
+                        overlap * 1.4
+                        + symptom_overlap * 0.8
+                        + min(0.75, len(exact_hypothesis_symptoms) * 0.38),
+                    ) * _confidence(hypothesis.get("confidence"), 0.5)
+                    if alignment > 0:
+                        matched_hypotheses.append({
+                            "rank": int(hypothesis.get("rank") or 0),
+                            "confidence": round(_confidence(hypothesis.get("confidence"), 0.5), 4),
+                            "alignment": round(alignment, 4),
+                        })
+                    hypothesis_alignment = max(hypothesis_alignment, alignment)
+
+                model_prior = 0.0
+                if primary_hint and skill_id == primary_hint:
+                    model_prior = 1.0
+                elif skill_id in secondary_hints:
+                    model_prior = 0.58
+                hypothesis_score = min(
+                    1.0,
+                    hypothesis_alignment * 0.50 + model_prior * 0.50,
+                )
+
+                required = [
+                    str(item).strip()
+                    for item in (skill.get("evidence_required") or [])
+                    if str(item).strip()
+                ]
+                any_of_groups = [
+                    [str(item).strip() for item in group if str(item).strip()]
+                    for group in (skill.get("evidence_any_of") or [])
+                    if isinstance(group, (list, tuple))
+                ]
+                evidence_checks = [
+                    item in collected_evidence
+                    for item in required
+                ] + [
+                    any(item in collected_evidence for item in group)
+                    for group in any_of_groups
+                    if group
+                ]
+                evidence_readiness = (
+                    sum(1 for item in evidence_checks if item) / len(evidence_checks)
+                    if evidence_checks
+                    else 1.0
+                )
+                missing_evidence = [
+                    item for item in required if item not in collected_evidence
+                ] + [
+                    f"any_of:{'|'.join(group)}"
+                    for group in any_of_groups
+                    if group and not any(item in collected_evidence for item in group)
+                ]
+                candidate_ambiguity = min(1.0, max(0, len(hypotheses) - 1) / 3)
+                information_gain = (
+                    min(1.0, len(missing_evidence) / max(1, len(evidence_checks)))
+                    * candidate_ambiguity
+                )
+
+                if (
+                    not hits
+                    and not exact_symptoms
+                    and hypothesis_score <= 0
+                    and model_prior <= 0
+                ):
+                    continue
+
+                usage = self._normalize_usage(self._usage.get(skill_id))
                 executions = usage["executed"]
-                historical_score = (
+                posterior_success = (
                     (usage["incidents_resolved"] + 1) / (usage["incidents_handled"] + 2)
                     if usage["incidents_handled"]
                     else (usage["succeeded"] + 1) / (executions + 2)
@@ -870,22 +1133,89 @@ class OpsSkillRegistry:
                         if usage["incidents_handled"]
                         else usage["failed"] / max(1, executions)
                     )
-                    recent_reliability_score = max(0.1, min(1.0, historical_score * (1.0 - failure_rate * 0.35)))
+                    recent_reliability_score = max(
+                        0.1,
+                        min(1.0, posterior_success * (1.0 - failure_rate * 0.35)),
+                    )
+                exploration = min(
+                    1.0,
+                    math.sqrt(
+                        math.log(max(2, total_incidents + 2))
+                        / max(1, usage["incidents_handled"] + 1)
+                    ) / 1.4,
+                )
+                failure_penalty = 0.0
+                if skill_id in attempted_skill_ids:
+                    # A failed stage of a continuation-capable Skill is new
+                    # evidence for its next stage, not proof that the whole
+                    # Skill is wrong. Non-continuation Skills are penalized so
+                    # the same failed remediation is not selected repeatedly.
+                    failure_penalty = 0.0 if skill.get("continuation_capable") else 0.30
+
+                if hypotheses:
+                    weights = {
+                        "semantic_similarity": 0.22,
+                        "hypothesis_alignment": 0.28,
+                        "evidence_readiness": 0.18,
+                        "posterior_success": 0.10,
+                        "least_privilege": 0.08,
+                        "recency_reliability": 0.10,
+                        "information_gain": 0.04,
+                    }
+                else:
+                    weights = {
+                        "semantic_similarity": 0.38,
+                        "hypothesis_alignment": 0.00,
+                        "evidence_readiness": 0.20,
+                        "posterior_success": 0.14,
+                        "least_privilege": 0.10,
+                        "recency_reliability": 0.14,
+                        "information_gain": 0.04,
+                    }
+                raw_score = (
+                    semantic_score * weights["semantic_similarity"]
+                    + hypothesis_score * weights["hypothesis_alignment"]
+                    + evidence_readiness * weights["evidence_readiness"]
+                    + posterior_success * weights["posterior_success"]
+                    + risk_score * weights["least_privilege"]
+                    + recent_reliability_score * weights["recency_reliability"]
+                    + information_gain * weights["information_gain"]
+                )
+                # Exploration is reported for learning and tie-breaking only.
+                # It cannot increase mutation confidence for an unproven Skill.
+                diagnostic_priority = min(
+                    0.99,
+                    raw_score + exploration * information_gain * 0.06,
+                )
+                score = max(0.0, raw_score - failure_penalty)
+                inference_confidence = (
+                    semantic_score * 0.35
+                    + hypothesis_score * 0.35
+                    + evidence_readiness * 0.30
+                    if hypotheses
+                    else semantic_score * 0.60 + evidence_readiness * 0.40
+                )
+                uncertainty = max(0.0, min(1.0, 1.0 - inference_confidence))
                 score_breakdown = {
                     "symptom_log_match": round(symptom_score, 4),
                     "environment_match": round(environment_score, 4),
-                    "historical_success": round(historical_score, 4),
+                    "semantic_similarity": round(semantic_score, 4),
+                    "hypothesis_alignment": round(hypothesis_score, 4),
+                    "model_skill_prior": round(model_prior, 4),
+                    "evidence_readiness": round(evidence_readiness, 4),
+                    "historical_success": round(posterior_success, 4),
                     "least_privilege": round(risk_score, 4),
                     "recency_reliability": round(recent_reliability_score, 4),
+                    "information_gain": round(information_gain, 4),
+                    "exploration": round(exploration, 4),
+                    "lineage_failure_penalty": round(failure_penalty, 4),
+                    "inference_confidence": round(inference_confidence, 4),
                 }
-                score = (
-                    symptom_score * 0.40
-                    + environment_score * 0.20
-                    + historical_score * 0.20
-                    + risk_score * 0.10
-                    + recent_reliability_score * 0.10
-                )
-                confidence = min(0.99, round(score, 4))
+                # Utility ranks alternatives; confidence answers a different
+                # question: is the current live evidence strong enough to
+                # authorize this Skill's approval flow? Historical outcomes
+                # and risk must not erase direct evidence from this incident.
+                confidence = min(0.99, round(inference_confidence, 4))
                 matches.append({
                     "skill": deepcopy(skill),
                     "score": round(score, 4),
@@ -895,21 +1225,42 @@ class OpsSkillRegistry:
                     "matched_symptoms": symptom_hits[:8],
                     "exact_symptoms": exact_symptoms[:8],
                     "matched_evidence": evidence_hits[:8],
+                    "matched_hypotheses": matched_hypotheses[:4],
+                    "evidence_readiness": round(evidence_readiness, 4),
+                    "missing_evidence": missing_evidence,
+                    "uncertainty": round(uncertainty, 4),
+                    "diagnostic_priority": round(diagnostic_priority, 4),
+                    "selection_algorithm": "contextual_bayesian_utility_v2",
+                    "weights": weights,
                     "why": (
-                        "按症状/日志 40%、环境 20%、同场景成功率 20%、"
-                        "最小权限 10%、近期可靠性 10% 加权。"
+                        "综合模型候选根因、实时证据覆盖、语义相似度、同类故障后验成功率、"
+                        "当前故障链失败记录与变更风险计算；历史少的 Skill 只提高取证优先级，"
+                        "不会因此获得变更权限。"
                     ),
                 })
-        matches.sort(key=lambda item: (-item["score"], item["skill"]["id"]))
+        matches.sort(key=lambda item: (
+            -item["score"],
+            -item["diagnostic_priority"],
+            item["uncertainty"],
+            item["skill"]["id"],
+        ))
         return {
             "status": "ok",
             "matches": matches[: max(1, min(20, top_k))],
             "query_terms": sorted(query_tokens)[:80],
             "policy": (
-                "候选按 40/20/20/10/10 加权；执行时只选择当前最高分 Skill，"
-                "低于 70% 先运行一个只读诊断 Skill 后重新排序。"
+                "ContextualBayesianSkillRouter/v2 联合模型候选根因、实时证据覆盖、"
+                "语义相似度、Beta 后验成功率、风险和当前故障链失败惩罚；"
+                "执行时只选择最高效用 Skill，低于 70% 先执行只读取证后重新排序。"
             ),
             "execution_threshold": 0.70,
+            "selection_algorithm": {
+                "id": "contextual_bayesian_utility_v2",
+                "hypothesis_count": len(hypotheses),
+                "collected_evidence": sorted(collected_evidence),
+                "mutation_guard": "evidence_contract_and_human_approval",
+                "exploration_scope": "read_only_diagnostics_only",
+            },
         }
 
     def steps_from_matches(self, matches: list[dict[str, Any]], *, limit: int = 2) -> list[dict[str, Any]]:
