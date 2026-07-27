@@ -1187,7 +1187,7 @@ class OpsSkillRegistry:
                     0.99,
                     raw_score + exploration * information_gain * 0.06,
                 )
-                score = max(0.0, raw_score - failure_penalty)
+                contextual_utility = max(0.0, raw_score - failure_penalty)
                 inference_confidence = (
                     semantic_score * 0.35
                     + hypothesis_score * 0.35
@@ -1213,12 +1213,25 @@ class OpsSkillRegistry:
                 }
                 # Utility ranks alternatives; confidence answers a different
                 # question: is the current live evidence strong enough to
-                # authorize this Skill's approval flow? Historical outcomes
-                # and risk must not erase direct evidence from this incident.
+                # authorize this Skill's approval flow?  Ranking blends both:
+                # current-incident evidence remains dominant enough that a
+                # generic low-risk diagnostic cannot outrank a more specific
+                # root-cause Skill merely because its mutation risk is lower.
+                # Risk still controls approval/execution and calibrates 65% of
+                # contextual utility; it never grants mutation authority.
                 confidence = min(0.99, round(inference_confidence, 4))
+                selection_utility = max(
+                    0.0,
+                    min(
+                        0.99,
+                        contextual_utility * 0.65 + confidence * 0.35,
+                    ),
+                )
+                score_breakdown["contextual_utility"] = round(contextual_utility, 4)
+                score_breakdown["selection_utility"] = round(selection_utility, 4)
                 matches.append({
                     "skill": deepcopy(skill),
-                    "score": round(score, 4),
+                    "score": round(selection_utility, 4),
                     "confidence": confidence,
                     "score_breakdown": score_breakdown,
                     "matched_terms": hits[:12],
@@ -1230,7 +1243,7 @@ class OpsSkillRegistry:
                     "missing_evidence": missing_evidence,
                     "uncertainty": round(uncertainty, 4),
                     "diagnostic_priority": round(diagnostic_priority, 4),
-                    "selection_algorithm": "contextual_bayesian_utility_v2",
+                    "selection_algorithm": "contextual_bayesian_utility_v3",
                     "weights": weights,
                     "why": (
                         "综合模型候选根因、实时证据覆盖、语义相似度、同类故障后验成功率、"
@@ -1249,13 +1262,13 @@ class OpsSkillRegistry:
             "matches": matches[: max(1, min(20, top_k))],
             "query_terms": sorted(query_tokens)[:80],
             "policy": (
-                "ContextualBayesianSkillRouter/v2 联合模型候选根因、实时证据覆盖、"
+                "ContextualBayesianSkillRouter/v3 联合模型候选根因、实时证据覆盖、"
                 "语义相似度、Beta 后验成功率、风险和当前故障链失败惩罚；"
                 "执行时只选择最高效用 Skill，低于 70% 先执行只读取证后重新排序。"
             ),
             "execution_threshold": 0.70,
             "selection_algorithm": {
-                "id": "contextual_bayesian_utility_v2",
+                "id": "contextual_bayesian_utility_v3",
                 "hypothesis_count": len(hypotheses),
                 "collected_evidence": sorted(collected_evidence),
                 "mutation_guard": "evidence_contract_and_human_approval",

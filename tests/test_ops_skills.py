@@ -453,15 +453,17 @@ class OpsSkillCatalogTests(unittest.TestCase):
                     "exploration",
                     "lineage_failure_penalty",
                     "inference_confidence",
+                    "contextual_utility",
+                    "selection_utility",
                 },
             )
             result = registry.match({"question": "permission denied"})
             self.assertEqual(
                 result["selection_algorithm"]["id"],
-                "contextual_bayesian_utility_v2",
+                "contextual_bayesian_utility_v3",
             )
             self.assertIn("Beta 后验成功率", result["policy"])
-            self.assertEqual(match["selection_algorithm"], "contextual_bayesian_utility_v2")
+            self.assertEqual(match["selection_algorithm"], "contextual_bayesian_utility_v3")
 
     def test_root_cause_hypotheses_drive_skill_ranking_without_keyword_runbook(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -683,6 +685,11 @@ class OpsSkillCatalogTests(unittest.TestCase):
             "evidence": plan["evidence"],
             "plan": plan,
         })
+        self.assertEqual(
+            attached["selected_skill_id"],
+            "skill-volume-permission-recovery",
+            "a generic lower-risk CrashLoop skill must not outrank stronger permission evidence",
+        )
         self.assertEqual(attached["change_source"], "executable_skill")
         self.assertEqual(attached["skill_runtime"]["handler_id"], "volume-write-permission-recovery")
         self.assertEqual(attached["changes"][0]["skill_id"], "skill-volume-permission-recovery")

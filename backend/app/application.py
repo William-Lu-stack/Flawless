@@ -188,7 +188,7 @@ KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
 APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.11")
-APP_CODE_SIGNATURE = "adaptive-skill-root-postcondition-v16"
+APP_CODE_SIGNATURE = "adaptive-skill-evidence-utility-v17"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -12918,11 +12918,13 @@ def _attach_operator_skills_to_plan(
     plan["planning_engine"] = (
         plan.get("planning_engine")
         if plan.get("skill_handler_invoked")
-        else "DynamicSREPlanner/v5 + ContextualBayesianSkillRouter/v2 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
+        else "DynamicSREPlanner/v5 + ContextualBayesianSkillRouter/v3 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
     )
     plan["skill_match_policy"] = (
         "候选 Skill 由模型根因先验、实时证据覆盖、语义相似度、Beta 后验成功率、风险与"
         "同一故障链失败惩罚动态排序；同一时刻只执行最高效用 Skill，低于 70% 只读取证后重排。"
+        "当前故障证据置信度与上下文效用联合排序，风险用于校准和审批，不能让通用低风险 Skill "
+        "压过证据更充分的专用根因 Skill。"
         "只有模型证明跨域依赖时才串行使用 secondary Skill，禁止一次并行执行多个修复 Skill。"
     )
     return plan
