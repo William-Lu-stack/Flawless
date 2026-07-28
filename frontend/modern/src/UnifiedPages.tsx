@@ -687,8 +687,10 @@ export function OpsSkillsPage() {
       {skills.error && <div className="inline-error">{skills.error}</div>}
       <div className="skill-grid">
         {list(skills.data?.skills).map((skill: any) => <article className={`skill-card ${skill.enabled ? "" : "disabled"}`} key={skill.id}>
-          <div><span>{skill.lifecycle === "candidate" ? "候选待审核" : skill.category} · {skill.risk} · v{skill.version || "1.0.0"}</span><strong>{skill.name}</strong></div>
+          <div><span>{skill.lifecycle === "candidate" ? "候选待审核" : skill.category} · {skill.skill_type || "recovery"} · {skill.risk} · v{skill.version || "1.0.0"}</span><strong>{skill.name}</strong></div>
           <p>{skill.summary}</p>
+          {list(skill.dimensions).length > 0 && <div className="chips">{list(skill.dimensions).map((item: any) => <span key={item}>{item}</span>)}</div>}
+          {list(skill.progressive_evidence).length > 0 && <small>渐进取证：{list(skill.progressive_evidence).map((item: any) => item.stage).join(" → ")}</small>}
           <div className="chips">{list(skill.allowed_actions).slice(0, 4).map((item: any) => <span key={item}>{item}</span>)}</div>
           {skill.script_policy?.enabled && <div className="skill-script-badge"><TerminalSquare size={13} /><span>批准脚本：{skill.script_policy.script_id}</span></div>}
           <footer><small>{skill.builtin ? "内置" : skill.lifecycle === "candidate" ? "AI 从成功恢复中沉淀" : "自定义"} · {skill.owner || "operator"} · {skill.execution_model === "executable_builtin_skill" ? `内置可执行 Handler：${skill.runtime_handler}` : skill.execution_ready ? "可执行动作映射" : "指令型"}</small><div><button className="ghost tiny" onClick={() => exportSkill(skill)} title="导出标准 Agent Skill ZIP"><Download size={13} />导出</button><button className="ghost tiny" onClick={() => editSkill(skill)}>{skill.lifecycle === "candidate" ? "审核并发布" : "编辑"}</button><button className="ghost tiny" onClick={() => disableSkill(skill)}>{skill.builtin ? "禁用" : "删除"}</button></div></footer>

@@ -478,13 +478,13 @@ Deep evidence: {json.dumps(safe_diagnostics, ensure_ascii=False)[:14000]}
 请以 JSON 格式返回诊断结果，包含以下字段：
 - root_cause: 根因分析（中文）
 - root_cause_candidates: 候选根因数组，每项包含 id、hypothesis、confidence、supporting_evidence、contradicting_evidence、required_next_evidence。必须同时考虑至少 2 个可解释当前症状的候选，除非 Kubernetes 状态已经给出唯一确定原因
-- skill_routing: 包含 primary_skill_id、secondary_skill_ids、strategy_id、strategy_confidence、rationale。只能引用“按需加载的运维 Skills”中已有 id；通常只选一个主 Skill，只有根因跨两个独立领域且后一个依赖前一个结果时才给出 secondary_skill_ids。strategy_id 必须是证据推导出的具体恢复策略，而不是 Skill 名称
+- skill_routing: 包含 primary_skill_id、secondary_skill_ids、skill_dependencies、strategy_id、strategy_confidence、rationale。只能引用“按需加载的运维 Skills”中已有 id；通常只选一个主 Skill。仅当根因跨两个不同领域且后一个依赖前一个结果时才给 secondary_skill_ids，并为每条依赖给出 {{from_skill_id,to_skill_id,reason,gate_evidence}}；缺少依赖原因或启动证据时 secondary_skill_ids 必须为空。strategy_id 必须是证据推导出的具体恢复策略，而不是 Skill 名称
 - impact: 影响范围
 - confidence: 置信度 (0-1)
 - risk_level: 风险等级 (low/medium/high/critical)
 - blast_radius: 影响面（namespace/service/workload/user-facing 维度）
 - signals: 关键证据数组，每项包含 source 和 finding
-- immediate_actions: 本次故障专属的专家步骤对象数组，每项包含 title、description、probe、expected_evidence、decision_rule、on_match、on_miss。probe 只能从 current_logs/previous_logs/events/workload_spec/pod_metrics/node_conditions/service_endpoints/dns/network_policy/dependency_topology/storage_chain/csi_status/pod_security_context/image_pull_secrets/registry_connectivity/scheduler_constraints/quota/pvc_binding/hpa/recent_changes/pdb_state/certificate_chain/webhook_status/config_ref_exists 中选择
+- immediate_actions: 本次故障专属的专家步骤对象数组，每项包含 title、description、probe、expected_evidence、decision_rule、on_match、on_miss。probe 只能从 current_logs/previous_logs/events/workload_spec/pod_metrics/node_conditions/service_endpoints/dns/network_policy/dependency_topology/storage_chain/csi_status/pod_security_context/image_pull_secrets/registry_connectivity/scheduler_constraints/quota/pvc_binding/hpa/recent_changes/pdb_state/certificate_chain/webhook_status/config_ref_exists/cluster_inventory/control_plane_health/workload_inventory/gpu_health/node_system_metrics/node_system_logs/collector_status/telemetry_pipeline/data_freshness/query_schema/sample_records/query_error/query_validation/entity_inventory/topology_model/ebpf_flows/trace_relationships 中选择
 - prevention: 后续预防建议数组
 - suggested_action: 建议操作，只能是 execute_plan/investigate；不要再使用 observe 作为运维结论
 - proposed_changes: 候选动作数组，每项包含 type、目标字段、reason、rollback 和必要参数。type 可从 create_workload/patch_workload/restart/scale_out/recreate_pod/patch_hpa/expand_pvc/create_pvc/create_pv/patch_workload_volume/patch_workload_runtime_security/cordon_node/evict_pod/uncordon_node/rollback_workload/patch_service/patch_service_account/create_configmap/patch_pdb/apply_manifest/patch_resource/delete_resource/run_shell/exec_pod/exec_node 中选择。声明式动作要给 manifest 或 api_version/kind/name/namespace/patch；Shell 动作要给 command、timeout_seconds，Pod/节点动作还要给 pod_name/container_name 或 node_name。任何动作都必须有直接证据并等待人工审批，不得猜测目标、路径、Secret 值或配置内容。

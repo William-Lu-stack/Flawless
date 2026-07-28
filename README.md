@@ -16,9 +16,18 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.12**.
+Current release: **3.2.13**.
 
-Release 3.2.12 adds a priority Pod-log evidence channel that persists
+Release 3.2.13 adapts the strongest reusable patterns from the STAROps official
+Skill catalog into vendor-neutral built-in Skills for progressive Kubernetes,
+node and database inspection, observability-pipeline diagnosis, verified
+PromQL/LogQL/TraceQL generation, and topology/eBPF data modeling. The runtime
+now loads one primary Skill body by default, admits secondary Skills only
+through an explicit cross-domain dependency and evidence gate, exposes a
+cheapest-first evidence plan, and keeps every mutation behind the existing
+human approval, rollback, and recovery-verification boundary.
+
+Release 3.2.12 added a priority Pod-log evidence channel that persists
 current/previous logs before optional CMDB, topology, storage, or node probes.
 Remote SRE-chat and inspection plans now choose Rancher from the target cluster
 identity rather than the UI source label, and the console shows the actual

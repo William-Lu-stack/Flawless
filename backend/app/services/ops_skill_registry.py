@@ -188,11 +188,271 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "enabled": True,
         "builtin": True,
     },
+    {
+        "id": "skill-kubernetes-progressive-inspection",
+        "name": "Kubernetes 渐进式健康巡检",
+        "category": "inspection",
+        "summary": "面向交付验收、升级前检查、定时巡检和故障后复检，按管控面、节点、工作负载、网络、存储、GPU 六个组件逐层加载证据，并从稳定性、性能、安全、成本四个维度输出可追溯发现。",
+        "symptoms": [
+            "Kubernetes 巡检", "集群巡检", "升级前检查", "交付验收", "故障后复检",
+            "control plane", "节点健康", "工作负载健康", "GPU health", "容量风险",
+        ],
+        "applies_to": ["Cluster", "Namespace", "Node", "Pod", "Deployment", "StatefulSet", "DaemonSet", "Service", "PVC", "PV"],
+        "evidence_required": ["cluster_inventory", "control_plane_health", "node_conditions", "workload_inventory"],
+        "evidence_any_of": [
+            ["pod_metrics", "events"],
+            ["service_endpoints", "storage_chain", "gpu_health"],
+        ],
+        "diagnostic_steps": [
+            "先锁定集群、namespace、时间窗口和巡检目标，只读取对象清单与健康摘要，不一开始拉取全量日志。",
+            "按管控面、节点、工作负载、网络、存储、GPU 分组件下钻；每个组件同时评估稳定性、性能、安全和成本，只对异常实体加载详细证据。",
+            "为每个发现保存对象、时间、证据来源、严重度、影响面和下一步；P0/P1 发现再路由到最匹配的恢复 Skill，巡检 Skill 本身不直接修改集群。",
+        ],
+        "allowed_actions": [],
+        "success_criteria": ["inspection_scope_complete", "evidence_fresh", "no_unresolved_critical_findings"],
+        "risk": "low",
+        "rollback": "只读 Skill 不产生回滚；若后续恢复 Skill 生成变更，使用该 Skill 自身的审批和回滚契约。",
+        "owner": "Flawless",
+        "enabled": True,
+        "builtin": True,
+        "execution_ready": False,
+        "skill_type": "inspection",
+        "dimensions": ["stability", "performance", "security", "cost"],
+        "progressive_evidence": [
+            {
+                "stage": "scope",
+                "evidence": ["cluster_inventory", "control_plane_health"],
+                "stop_when": "目标范围不可确认或数据时间戳过期时停止并报告接入问题。",
+            },
+            {
+                "stage": "component_scan",
+                "evidence": ["node_conditions", "workload_inventory", "events", "pod_metrics"],
+                "stop_when": "健康实体保留摘要；只对异常组件继续深挖。",
+            },
+            {
+                "stage": "domain_deep_dive",
+                "evidence": ["service_endpoints", "storage_chain", "gpu_health", "dependency_topology"],
+                "optional": True,
+                "stop_when": "直接证据已经闭合本地根因时，不把拓扑和跨域探针作为修复前置条件。",
+            },
+        ],
+    },
+    {
+        "id": "skill-kubernetes-node-inspection",
+        "name": "Kubernetes 节点健康巡检",
+        "category": "inspection",
+        "summary": "对 Kubernetes 节点的 CPU、Load、内存、磁盘、inode、网络、文件句柄、NTP、TCP 重传、内核与 OOM 信号做只读巡检，并关联节点条件与受影响 Pod。",
+        "symptoms": [
+            "NodeNotReady", "DiskPressure", "MemoryPressure", "PIDPressure", "node inspection",
+            "节点巡检", "load high", "inode full", "tcp retransmit", "OOM",
+        ],
+        "applies_to": ["Cluster", "Node", "Pod", "DaemonSet"],
+        "evidence_required": ["node_conditions", "node_capacity", "node_system_metrics"],
+        "evidence_any_of": [["node_system_logs", "events"]],
+        "diagnostic_steps": [
+            "读取 Node Conditions、allocatable、资源请求和系统组件状态，先区分节点不可达、资源压力与单 Pod 故障。",
+            "仅对异常节点补充 CPU/Load、内存、磁盘/inode、IO、网络、FD、NTP、TCP 重传和 OOM 日志，不对全集群执行无界命令。",
+            "关联受影响工作负载、PDB 和替代容量；需要隔离或驱逐时再切换到节点恢复 Skill 并进入人工审批。",
+        ],
+        "allowed_actions": [],
+        "success_criteria": ["node_baseline_healthy", "evidence_fresh", "no_unresolved_critical_findings"],
+        "risk": "low",
+        "rollback": "只读 Skill 不产生回滚。",
+        "owner": "Flawless",
+        "enabled": True,
+        "builtin": True,
+        "execution_ready": False,
+        "skill_type": "inspection",
+        "dimensions": ["stability", "performance", "security", "cost"],
+        "progressive_evidence": [
+            {
+                "stage": "node_summary",
+                "evidence": ["node_conditions", "node_capacity"],
+                "stop_when": "节点状态和资源水位正常时保留摘要，不进入主机级深挖。",
+            },
+            {
+                "stage": "node_deep_dive",
+                "evidence": ["node_system_metrics", "node_system_logs", "events"],
+                "stop_when": "锁定单一资源或系统故障后进入对应恢复 Skill。",
+            },
+        ],
+    },
+    {
+        "id": "skill-database-progressive-inspection",
+        "name": "数据库渐进式只读巡检",
+        "category": "inspection",
+        "summary": "逐实例检查数据库运行状态、配置、高可用、备份、容量、性能和事件，并按需加载慢查询、错误日志、锁与复制证据；巡检只读，恢复动作交给数据库恢复 Skill。",
+        "symptoms": [
+            "数据库巡检", "database inspection", "备份异常", "复制延迟", "慢查询巡检",
+            "连接数风险", "容量巡检", "高可用检查",
+        ],
+        "applies_to": ["Database", "MySQL", "PostgreSQL", "Oracle", "Redis", "MongoDB", "Elasticsearch"],
+        "evidence_required": ["db_connectivity", "db_capacity", "db_backup_status"],
+        "evidence_any_of": [["db_slow_queries", "db_locks", "db_replication"]],
+        "diagnostic_steps": [
+            "确认实例范围、角色、运行状态、配置基线、高可用和最近备份，异常实例才进入下一层。",
+            "按连接、慢查询、锁等待、复制、表空间/WAL/binlog 和错误日志分支取证，保留真实时间窗与对象证据。",
+            "输出风险、影响应用、恢复判据和建议恢复 Skill；巡检阶段不终止会话、不改参数、不切换主备。",
+        ],
+        "allowed_actions": [],
+        "success_criteria": ["inspection_scope_complete", "evidence_fresh", "no_unresolved_critical_findings"],
+        "risk": "low",
+        "rollback": "只读 Skill 不产生回滚。",
+        "owner": "Flawless",
+        "enabled": True,
+        "builtin": True,
+        "execution_ready": False,
+        "skill_type": "inspection",
+        "dimensions": ["availability", "performance", "capacity", "recoverability"],
+        "progressive_evidence": [
+            {
+                "stage": "instance_baseline",
+                "evidence": ["db_connectivity", "db_capacity", "db_backup_status"],
+                "stop_when": "实例基线健康且无事件时不读取高成本审计或慢日志。",
+            },
+            {
+                "stage": "database_deep_dive",
+                "evidence": ["db_slow_queries", "db_locks", "db_replication", "dependency_topology"],
+                "optional": True,
+                "stop_when": "根因和影响面已闭合时停止扩展查询。",
+            },
+        ],
+    },
+    {
+        "id": "skill-observability-collector-recovery",
+        "name": "可观测采集链路诊断",
+        "category": "observability",
+        "summary": "诊断 Kubernetes 日志、指标、链路、事件与 eBPF 流量从采集器到 Loki、Prometheus、Tempo、CMDB/拓扑的完整数据链，覆盖无数据、延迟、重复、解析、权限和目标映射错误。",
+        "symptoms": [
+            "没有日志", "没有指标", "没有链路", "telemetry missing", "collector delay",
+            "采集延迟", "重复采集", "Beyla pod 正常但没有 eBPF", "eBPF topology missing",
+            "拓扑没有流量", "权限错误",
+        ],
+        "applies_to": ["Cluster", "Namespace", "Pod", "DaemonSet", "Deployment", "Service", "Kafka"],
+        "evidence_required": ["collector_status", "telemetry_pipeline", "data_freshness"],
+        "evidence_any_of": [["current_logs", "events"], ["ebpf_flows", "dependency_topology"]],
+        "diagnostic_steps": [
+            "从目标数据缺口反向追踪 source -> collector -> transport -> store -> query -> topology，每一跳记录最后成功时间和错误回执。",
+            "核对采集选择器、namespace/label、RBAC、端点、TLS、解析规则、时间戳和目标租户；Beyla Pod Running 不能等同于已经产生并被查询到 eBPF flow。",
+            "先用只读查询验证修正方向；如需修改 DaemonSet、ConfigMap 或采集规则，交给最匹配的配置/Workload Skill 生成精确 diff 并人工审批，变更后做新数据延迟验收。",
+        ],
+        "allowed_actions": [],
+        "success_criteria": ["telemetry_fresh", "topology_edges_observed", "query_validated"],
+        "risk": "low",
+        "rollback": "只读诊断不产生回滚；采集配置变更必须恢复原 ConfigMap/DaemonSet 快照。",
+        "owner": "Flawless",
+        "enabled": True,
+        "builtin": True,
+        "execution_ready": False,
+        "skill_type": "ingestion",
+        "dimensions": ["availability", "freshness", "completeness", "correctness"],
+        "progressive_evidence": [
+            {
+                "stage": "pipeline_liveness",
+                "evidence": ["collector_status", "data_freshness"],
+                "stop_when": "采集器未运行或无权限时先修复该跳，不继续猜测存储和查询层。",
+            },
+            {
+                "stage": "pipeline_delivery",
+                "evidence": ["telemetry_pipeline", "current_logs", "events"],
+                "stop_when": "找到第一处失败跳点后，围绕该跳点生成修复前置证据。",
+            },
+            {
+                "stage": "flow_visibility",
+                "evidence": ["ebpf_flows", "dependency_topology", "query_validation"],
+                "optional": True,
+                "stop_when": "确认 flow 已入库且拓扑映射可见后完成验收。",
+            },
+        ],
+    },
+    {
+        "id": "skill-observability-query-generation",
+        "name": "可观测查询生成与验证",
+        "category": "observability",
+        "summary": "根据指标/日志 schema、标签、样本、现有查询和错误回执生成或修复 PromQL、LogQL、TraceQL 与 Kubernetes 选择器，并先执行只读语法和结果验证。",
+        "symptoms": [
+            "PromQL", "LogQL", "TraceQL", "查询报错", "query generation", "查询为空",
+            "label mismatch", "parse error", "日志检索", "指标查询",
+        ],
+        "applies_to": ["Cluster", "Namespace", "Pod", "Service", "Prometheus", "Loki", "Tempo"],
+        "evidence_required": ["query_schema", "query_validation"],
+        "evidence_any_of": [["sample_records", "query_error"]],
+        "diagnostic_steps": [
+            "读取真实 schema、索引/标签、样本和时间范围，先选择正确查询语言与数据源。",
+            "生成最小查询并做语法验证，再小窗口执行；为空时区分确实无数据、标签不匹配、时间戳/时区和采集链路故障。",
+            "只把验证通过的查询交给后续 RCA；查询结果不能直接授权基础设施变更。",
+        ],
+        "allowed_actions": [],
+        "success_criteria": ["query_validated", "evidence_fresh"],
+        "risk": "low",
+        "rollback": "只读查询不产生回滚。",
+        "owner": "Flawless",
+        "enabled": True,
+        "builtin": True,
+        "execution_ready": False,
+        "skill_type": "analysis",
+        "selection_role": "supporting",
+        "dimensions": ["syntax", "schema", "result", "freshness"],
+        "progressive_evidence": [
+            {
+                "stage": "query_context",
+                "evidence": ["query_schema", "sample_records", "query_error"],
+                "stop_when": "数据源或 schema 不明确时不生成猜测查询。",
+            },
+            {
+                "stage": "query_verify",
+                "evidence": ["query_validation", "data_freshness"],
+                "stop_when": "语法和小窗口结果通过后才扩大时间范围。",
+            },
+        ],
+    },
+    {
+        "id": "skill-topology-data-modeling",
+        "name": "可观测拓扑数据建模",
+        "category": "topology",
+        "summary": "把主机、集群、Namespace、Workload、Pod、Service、存储和外部依赖统一成实体关系，融合 Kubernetes 对象、CMDB、Trace 与 eBPF 流量，并验证映射、方向、时间新鲜度和影响面。",
+        "symptoms": [
+            "拓扑缺失", "拓扑不完整", "eBPF 不显示", "dependency missing", "entity mapping",
+            "服务关系错误", "影响面不准", "CMDB topology", "Beyla flow",
+        ],
+        "applies_to": ["Cluster", "Namespace", "Node", "Pod", "Deployment", "StatefulSet", "DaemonSet", "Service", "Database", "Kafka"],
+        "evidence_required": ["entity_inventory", "topology_model"],
+        "evidence_any_of": [["ebpf_flows", "dependency_topology"], ["service_endpoints", "trace_relationships"]],
+        "diagnostic_steps": [
+            "先建立稳定实体键：cluster、namespace、kind、name、UID 和时间范围，禁止只用易碰撞的 display name 合并对象。",
+            "按声明关系、Service/Endpoint、Trace 调用和 eBPF 实际流量分层建边，保留 source_system、observed、方向、端口、首次/最后观测时间和证据。",
+            "验证孤儿节点、重复边、跨集群映射和数据新鲜度；只有真实观测边才进入影响面推理，静态推断必须明确标记。",
+        ],
+        "allowed_actions": [],
+        "success_criteria": ["data_model_consistent", "topology_edges_observed", "evidence_fresh"],
+        "risk": "low",
+        "rollback": "只读建模不修改业务资源；运行时模型写入需保留上一个版本并可恢复。",
+        "owner": "Flawless",
+        "enabled": True,
+        "builtin": True,
+        "execution_ready": False,
+        "skill_type": "modeling",
+        "dimensions": ["identity", "relationship", "freshness", "provenance"],
+        "progressive_evidence": [
+            {
+                "stage": "entity_identity",
+                "evidence": ["entity_inventory", "service_endpoints"],
+                "stop_when": "实体键不唯一或 namespace/cluster 缺失时先修复映射。",
+            },
+            {
+                "stage": "relationship_fusion",
+                "evidence": ["topology_model", "trace_relationships", "ebpf_flows", "dependency_topology"],
+                "stop_when": "每条关键边都有来源、方向和时间证据后进入影响面分析。",
+            },
+        ],
+    },
 ]
 
 
 SKILL_OPTION_CATALOG: dict[str, list[dict[str, str]]] = {
     "applies_to": [
+        {"id": "Cluster", "label": "Kubernetes 集群", "description": "集群级巡检、管控面、节点、网络、存储和数据接入范围。"},
+        {"id": "Namespace", "label": "Namespace", "description": "命名空间级工作负载、配额、策略、日志和依赖范围。"},
         {"id": "Pod", "label": "Pod", "description": "单个运行实例，适合日志、重启、挂载、探针和调度问题。"},
         {"id": "Deployment", "label": "Deployment", "description": "无状态应用工作负载，适合模板、镜像、副本和滚动发布问题。"},
         {"id": "StatefulSet", "label": "StatefulSet", "description": "有状态工作负载，需额外关注顺序、稳定身份和持久卷。"},
@@ -258,6 +518,23 @@ SKILL_OPTION_CATALOG: dict[str, list[dict[str, str]]] = {
         {"id": "vm_disk_usage", "label": "主机磁盘使用率", "description": "检查分区、inode、文件系统只读、增长趋势和可扩容空间。"},
         {"id": "vm_system_logs", "label": "系统日志", "description": "读取 syslog/journal/EventLog 摘要，不导出敏感正文。"},
         {"id": "vm_snapshot_state", "label": "快照 / 回滚点", "description": "确认快照、备份或镜像回滚点是否可用。"},
+        {"id": "cluster_inventory", "label": "集群实体清单", "description": "读取管控面、节点、Namespace、Workload、Service、存储和 GPU 实体摘要。"},
+        {"id": "control_plane_health", "label": "管控面健康", "description": "检查 API Server、调度器、控制器与核心系统组件的可用性和错误事件。"},
+        {"id": "workload_inventory", "label": "工作负载清单", "description": "读取各类 Workload 的期望/可用副本、generation、异常 Pod 和关键模板摘要。"},
+        {"id": "gpu_health", "label": "GPU 健康", "description": "检查 GPU 节点、设备插件、可分配设备、Xid/驱动错误和任务使用情况。"},
+        {"id": "node_system_metrics", "label": "节点系统指标", "description": "检查 CPU/Load、内存、磁盘/inode、IO、网络、FD、NTP 和 TCP 重传。"},
+        {"id": "node_system_logs", "label": "节点系统日志", "description": "读取内核、容器运行时、kubelet、OOM 和文件系统错误的脱敏摘要。"},
+        {"id": "collector_status", "label": "采集器状态", "description": "检查日志、指标、链路、事件或 eBPF 采集器的 Pod、配置、RBAC 和运行错误。"},
+        {"id": "telemetry_pipeline", "label": "遥测数据链路", "description": "沿 source、collector、transport、store、query、topology 记录每一跳的状态和回执。"},
+        {"id": "data_freshness", "label": "数据新鲜度", "description": "比较事件时间、采集时间、入库时间和最后成功查询时间。"},
+        {"id": "query_schema", "label": "查询 Schema", "description": "读取真实指标、日志或链路字段、标签、索引和数据源能力。"},
+        {"id": "sample_records", "label": "样本记录", "description": "读取小窗口脱敏样本，用于确认字段、标签、时间戳和解析结果。"},
+        {"id": "query_error", "label": "查询错误回执", "description": "保留查询语法、权限、超时、标签或数据源错误的原始脱敏回执。"},
+        {"id": "query_validation", "label": "查询验证", "description": "对生成的 PromQL、LogQL、TraceQL 或选择器执行只读语法与小窗口结果验证。"},
+        {"id": "entity_inventory", "label": "实体清单与稳定键", "description": "读取 cluster、namespace、kind、name、UID 和外部资源标识，避免拓扑对象碰撞。"},
+        {"id": "topology_model", "label": "拓扑模型", "description": "读取实体、关系、方向、来源、端口、首次/最后观测时间和置信度。"},
+        {"id": "ebpf_flows", "label": "eBPF 流量", "description": "读取 Beyla/Hubble/CNI 等 eBPF 数据源的真实流量、方向、端点和时间窗口。"},
+        {"id": "trace_relationships", "label": "Trace 调用关系", "description": "读取 Trace/Span 中的服务调用边、错误、延迟和目标属性。"},
     ],
     "success_criteria": [
         {"id": "pod_ready", "label": "Pod Ready", "description": "目标 Pod 连续通过 readiness，状态稳定。"},
@@ -287,6 +564,14 @@ SKILL_OPTION_CATALOG: dict[str, list[dict[str, str]]] = {
         {"id": "vm_service_active", "label": "主机服务恢复", "description": "目标服务 active/running，端口和业务探测通过。"},
         {"id": "vm_disk_pressure_relieved", "label": "磁盘压力解除", "description": "磁盘、inode、只读状态和增长趋势回到安全范围。"},
         {"id": "vm_probe_healthy", "label": "主机探测健康", "description": "ICMP/TCP/HTTP 或 Agent 探测恢复正常。"},
+        {"id": "inspection_scope_complete", "label": "巡检范围完整", "description": "目标范围内的组件均有状态摘要，异常实体已按需下钻。"},
+        {"id": "evidence_fresh", "label": "证据时间有效", "description": "关键证据位于指定时间窗口，采集时间和来源可追溯。"},
+        {"id": "no_unresolved_critical_findings", "label": "无未处理严重发现", "description": "P0/P1 发现均已进入明确的恢复 Skill、人工处理或风险接受流程。"},
+        {"id": "node_baseline_healthy", "label": "节点基线健康", "description": "节点条件、容量、系统指标和关键日志回到健康基线。"},
+        {"id": "telemetry_fresh", "label": "遥测持续到达", "description": "日志、指标、链路、事件或流量在验收窗口内持续产生并可查询。"},
+        {"id": "query_validated", "label": "查询已验证", "description": "查询语法通过，小窗口执行成功，结果字段和时间范围符合预期。"},
+        {"id": "topology_edges_observed", "label": "观测边可见", "description": "关键 eBPF/Trace/Endpoint 关系带来源与时间证据并在拓扑中可见。"},
+        {"id": "data_model_consistent", "label": "数据模型一致", "description": "实体键唯一，关键关系无错误跨集群合并、孤儿或重复边。"},
     ],
     "script_triggers": [
         {"id": "symptom_matched", "label": "症状精确命中", "description": "告警、日志或事件命中 Skill 配置的症状关键词。"},
@@ -473,6 +758,26 @@ def _collected_evidence_ids(payload: dict[str, Any]) -> set[str]:
         collected.add("service_endpoints")
     if isinstance(evidence.get("node"), dict) and evidence.get("node"):
         collected.update({"node_conditions", "node_capacity", "node_pressure", "node_labels", "system_pods"})
+    for evidence_id in (
+        "cluster_inventory", "control_plane_health", "workload_inventory", "gpu_health",
+        "node_system_metrics", "node_system_logs", "collector_status", "telemetry_pipeline",
+        "data_freshness", "query_schema", "sample_records", "query_error",
+        "query_validation", "entity_inventory", "topology_model", "ebpf_flows",
+        "trace_relationships",
+    ):
+        if evidence_id in evidence and evidence.get(evidence_id) not in (None, "", [], {}):
+            collected.add(evidence_id)
+    topology = evidence.get("topology") if isinstance(evidence.get("topology"), dict) else {}
+    if topology.get("nodes"):
+        collected.add("entity_inventory")
+    if topology.get("edges"):
+        collected.update({"topology_model", "dependency_topology"})
+        if any(
+            isinstance(item, dict)
+            and str(item.get("source_system") or "").startswith(("ebpf_", "hubble", "cilium"))
+            for item in topology.get("edges") or []
+        ):
+            collected.add("ebpf_flows")
     diagnostics = evidence.get("diagnostics") if isinstance(evidence.get("diagnostics"), dict) else {}
     collected.update(str(key) for key, value in diagnostics.items() if value is not None)
     return collected
@@ -621,7 +926,8 @@ class OpsSkillRegistry:
                                 "name", "description", "category", "summary", "symptoms", "applies_to",
                                 "evidence_required", "evidence_any_of", "diagnostic_steps", "allowed_actions",
                                 "success_criteria", "risk", "rollback", "script_policy", "execution_ready",
-                                "runtime_handler", "execution_model", "continuation_capable",
+                                "runtime_handler", "execution_model", "continuation_capable", "skill_type",
+                                "selection_role", "dimensions", "progressive_evidence",
                             }
                             if any(record.get(key) != builtin.get(key) for key in policy_fields if key in builtin):
                                 upgraded_builtin_ids.add(str(record["id"]))
@@ -737,6 +1043,30 @@ class OpsSkillRegistry:
                 and item.get("builtin")
                 and item.get("runtime_handler")
             ),
+            "skill_type": str(
+                item.get("skill_type")
+                or ("recovery" if item.get("execution_ready", bool(item.get("allowed_actions"))) else "analysis")
+            ).strip().lower(),
+            "selection_role": str(item.get("selection_role") or "primary").strip().lower(),
+            "dimensions": [
+                str(value).strip()
+                for value in (item.get("dimensions") or [])
+                if str(value).strip()
+            ][:12],
+            "progressive_evidence": [
+                {
+                    "stage": str(stage.get("stage") or f"stage-{index + 1}").strip()[:80],
+                    "evidence": [
+                        str(value).strip()
+                        for value in (stage.get("evidence") or [])
+                        if str(value).strip()
+                    ][:16],
+                    "optional": bool(stage.get("optional", False)),
+                    "stop_when": _clip(stage.get("stop_when") or "", 800),
+                }
+                for index, stage in enumerate(item.get("progressive_evidence") or [])
+                if isinstance(stage, dict)
+            ][:8],
             "package_path": str(item.get("package_path") or self.root / skill_id),
             "package_files": int(item.get("package_files") or 0),
             "bundled_scripts": [str(x) for x in item.get("bundled_scripts") or []],
@@ -750,6 +1080,10 @@ class OpsSkillRegistry:
             normalized["lifecycle"] = "published" if normalized["enabled"] else "candidate"
         if normalized["enabled"] and normalized["lifecycle"] == "candidate":
             normalized["lifecycle"] = "published"
+        if normalized["skill_type"] not in {"recovery", "inspection", "analysis", "ingestion", "modeling"}:
+            normalized["skill_type"] = "recovery" if normalized["execution_ready"] else "analysis"
+        if normalized["selection_role"] not in {"primary", "supporting"}:
+            normalized["selection_role"] = "primary"
         return normalized
 
     def list(self) -> dict[str, Any]:
@@ -998,6 +1332,9 @@ class OpsSkillRegistry:
                     "applies_to": skill.get("applies_to"),
                     "evidence_required": skill.get("evidence_required"),
                     "category": skill.get("category"),
+                    "skill_type": skill.get("skill_type"),
+                    "selection_role": skill.get("selection_role"),
+                    "dimensions": skill.get("dimensions"),
                     "script_policy": skill.get("script_policy"),
                     "instructions": skill.get("instructions"),
                 })
@@ -1181,6 +1518,37 @@ class OpsSkillRegistry:
                     + recent_reliability_score * weights["recency_reliability"]
                     + information_gain * weights["information_gain"]
                 )
+                concrete_incident = any(
+                    term in query_text
+                    for term in (
+                        "crashloop", "permission denied", "not writable", "failedmount",
+                        "imagepull", "oomkilled", "failedscheduling", "connection refused",
+                        "unable to open", "can't open", "readonly", "back-off",
+                    )
+                )
+                inspection_intent = any(
+                    term in query_text
+                    for term in (
+                        "巡检", "inspection", "验收", "升级前", "健康检查", "复检",
+                    )
+                )
+                broad_diagnostic_penalty = (
+                    0.18
+                    if concrete_incident
+                    and not inspection_intent
+                    and str(skill.get("skill_type") or "") == "inspection"
+                    else 0.0
+                )
+                supporting_role_penalty = (
+                    0.12
+                    if str(skill.get("selection_role") or "primary") == "supporting"
+                    and model_prior < 0.5
+                    else 0.0
+                )
+                raw_score = max(
+                    0.0,
+                    raw_score - broad_diagnostic_penalty - supporting_role_penalty,
+                )
                 # Exploration is reported for learning and tie-breaking only.
                 # It cannot increase mutation confidence for an unproven Skill.
                 diagnostic_priority = min(
@@ -1209,6 +1577,8 @@ class OpsSkillRegistry:
                     "information_gain": round(information_gain, 4),
                     "exploration": round(exploration, 4),
                     "lineage_failure_penalty": round(failure_penalty, 4),
+                    "broad_diagnostic_penalty": round(broad_diagnostic_penalty, 4),
+                    "supporting_role_penalty": round(supporting_role_penalty, 4),
                     "inference_confidence": round(inference_confidence, 4),
                 }
                 # Utility ranks alternatives; confidence answers a different
@@ -1243,7 +1613,7 @@ class OpsSkillRegistry:
                     "missing_evidence": missing_evidence,
                     "uncertainty": round(uncertainty, 4),
                     "diagnostic_priority": round(diagnostic_priority, 4),
-                    "selection_algorithm": "contextual_bayesian_utility_v3",
+                    "selection_algorithm": "contextual_bayesian_utility_v4",
                     "weights": weights,
                     "why": (
                         "综合模型候选根因、实时证据覆盖、语义相似度、同类故障后验成功率、"
@@ -1255,6 +1625,7 @@ class OpsSkillRegistry:
             -item["score"],
             -item["diagnostic_priority"],
             item["uncertainty"],
+            1 if str((item.get("skill") or {}).get("selection_role") or "primary") == "supporting" else 0,
             item["skill"]["id"],
         ))
         return {
@@ -1262,13 +1633,13 @@ class OpsSkillRegistry:
             "matches": matches[: max(1, min(20, top_k))],
             "query_terms": sorted(query_tokens)[:80],
             "policy": (
-                "ContextualBayesianSkillRouter/v3 联合模型候选根因、实时证据覆盖、"
+                "ContextualBayesianSkillRouter/v4 联合模型候选根因、实时证据覆盖、"
                 "语义相似度、Beta 后验成功率、风险和当前故障链失败惩罚；"
                 "执行时只选择最高效用 Skill，低于 70% 先执行只读取证后重新排序。"
             ),
             "execution_threshold": 0.70,
             "selection_algorithm": {
-                "id": "contextual_bayesian_utility_v3",
+                "id": "contextual_bayesian_utility_v4",
                 "hypothesis_count": len(hypotheses),
                 "collected_evidence": sorted(collected_evidence),
                 "mutation_guard": "evidence_contract_and_human_approval",
@@ -1291,31 +1662,62 @@ class OpsSkillRegistry:
         return steps
 
     def agent_context(self, payload: dict[str, Any], *, top_k: int = 3, max_chars: int = 12000) -> list[dict[str, Any]]:
-        """按渐进披露原则返回匹配 Skill 的指令正文，供诊断智能体按需注入。"""
+        """Load one primary Skill body; keep alternatives as lightweight metadata."""
         result = self.match(payload, top_k=top_k)
+        matches = result.get("matches") or []
+        primary_id = str((((matches[0] if matches else {}).get("skill") or {}).get("id") or ""))
+        diagnosis = payload.get("diagnosis") if isinstance(payload.get("diagnosis"), dict) else {}
+        routing = diagnosis.get("skill_routing") if isinstance(diagnosis.get("skill_routing"), dict) else {}
+        dependencies = [
+            item for item in (routing.get("skill_dependencies") or [])
+            if isinstance(item, dict)
+        ]
+        dependent_ids = {
+            str(item.get("to_skill_id") or "").strip()
+            for item in dependencies
+            if str(item.get("from_skill_id") or "").strip()
+            and str(item.get("to_skill_id") or "").strip()
+            and str(item.get("reason") or "").strip()
+            and any(str(value).strip() for value in (item.get("gate_evidence") or []))
+        }
+        full_instruction_ids = {primary_id, *dependent_ids}
         context: list[dict[str, Any]] = []
         remaining = max_chars
-        for match in result.get("matches") or []:
+        for index, match in enumerate(matches):
             if float(match.get("confidence") or 0) < 0.28 or remaining <= 0:
                 continue
             skill = match.get("skill") or {}
-            instructions = str(skill.get("instructions") or "")
-            if not instructions:
-                try:
-                    instructions = read_package(self.root / str(skill.get("id")))["instructions"]
-                except Exception:
-                    instructions = ""
-            instructions = instructions[:remaining]
-            remaining -= len(instructions)
+            skill_id = str(skill.get("id") or "")
+            instructions = ""
+            if skill_id in full_instruction_ids:
+                instructions = str(skill.get("instructions") or "")
+                if not instructions:
+                    try:
+                        instructions = read_package(self.root / skill_id)["instructions"]
+                    except Exception:
+                        instructions = ""
+                instructions = instructions[:remaining]
+                remaining -= len(instructions)
             context.append({
-                "name": skill.get("id"),
+                "name": skill_id,
                 "display_name": skill.get("name"),
                 "description": skill.get("description") or skill.get("summary"),
                 "version": skill.get("version"),
                 "instructions": instructions,
+                "instructions_loaded": bool(instructions),
+                "context_role": (
+                    "primary"
+                    if index == 0 else
+                    "dependent"
+                    if skill_id in dependent_ids else
+                    "candidate_metadata"
+                ),
                 "evidence_required": skill.get("evidence_required") or [],
                 "allowed_actions": skill.get("allowed_actions") or [],
                 "success_criteria": skill.get("success_criteria") or [],
+                "skill_type": skill.get("skill_type") or "recovery",
+                "dimensions": skill.get("dimensions") or [],
+                "progressive_evidence": skill.get("progressive_evidence") or [],
                 "confidence": match.get("confidence"),
                 "execution_ready": skill.get("execution_ready"),
             })

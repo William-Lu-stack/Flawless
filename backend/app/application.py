@@ -187,8 +187,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.12")
-APP_CODE_SIGNATURE = "priority-pod-log-skill-escalation-v18"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.13")
+APP_CODE_SIGNATURE = "progressive-skill-orchestration-v19"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -11036,9 +11036,11 @@ async def _evidence_based_replan(
                 "写路径权限类新故障必须先保持业务容器非 root 并对齐 UID/GID/fsGroup；只有该阶段执行后新 Pod 验证仍失败，"
                 "才允许在下一张独立审批单中把实际失败容器升级为 root。不能在首次方案中跳过非 root 阶段。"
                 "只有匹配 Skill 允许时才可提出 run_shell/exec_pod/exec_node，并必须给 command、明确目标、timeout_seconds、reason、rollback。"
-                "通常只执行最高匹配的一个 Skill；只有两个根因跨域且后一个明确依赖前一个结果时，才串行给 secondary_skill_ids，不能并行乱用多个。"
+                "通常只执行最高匹配的一个 Skill；只有两个根因跨不同领域且后一个明确依赖前一个结果时，才串行给 secondary_skill_ids，"
+                "并为每条依赖给出 {from_skill_id,to_skill_id,reason,gate_evidence}。缺少依赖原因或启动证据时 secondary_skill_ids 必须为空，不能并行乱用多个。"
                 "只返回 {root_cause,candidate_root_causes:[{id,hypothesis,confidence,supporting_evidence,contradicting_evidence,"
-                "required_next_evidence}],selected_skill_id,secondary_skill_ids,confidence,selected_runbook,reason,changes:[{type,namespace,workload_type,workload_name,pod_name,"
+                "required_next_evidence}],selected_skill_id,secondary_skill_ids,skill_dependencies:[{from_skill_id,to_skill_id,reason,gate_evidence}],"
+                "confidence,selected_runbook,reason,changes:[{type,namespace,workload_type,workload_name,pod_name,"
                 "container_name,hpa_name,pvc_name,storage,node_name,service_account,configmap_name,api_version,kind,name,replicas,manifest,patch,command,timeout_seconds,reason,rollback}]}。\n"
                 f"动作目录={json.dumps(action_catalog_payload(), ensure_ascii=False)}\n"
                 f"动态匹配 Skills={json.dumps(_redact_sensitive(matched_skill_context), ensure_ascii=False)[:12000]}\n"
@@ -11126,6 +11128,15 @@ async def _evidence_based_replan(
         "verification_plan": _next_attempt_verification_plan(f"{workload_type}/{workload_name}" if workload_name else plan.get("target", "")),
         "rejected_candidates": rejected,
     }
+    planner_preferred_skill_ids = [
+        str(planner_meta.get("selected_skill_id") or ""),
+        *[
+            str(item)
+            for item in (planner_meta.get("secondary_skill_ids") or [])
+            if str(item)
+        ],
+    ]
+    planner_preferred_skill_ids = [item for item in planner_preferred_skill_ids if item]
     replanned = _attach_operator_skills_to_plan(
         replanned,
         _skill_signal_payload(
@@ -11135,6 +11146,21 @@ async def _evidence_based_replan(
             evidence=deep,
             plan=replanned,
         ),
+        preferred_skill_ids=planner_preferred_skill_ids or None,
+        routing={
+            "engine": "DeepSeekRootCauseSkillRouter/v2",
+            "source": planner_meta.get("source") or "evidence_router",
+            "selected_skill_ids": planner_preferred_skill_ids,
+            "secondary_skill_ids": [
+                str(item) for item in (planner_meta.get("secondary_skill_ids") or [])
+                if str(item)
+            ],
+            "skill_dependencies": [
+                item for item in (planner_meta.get("skill_dependencies") or [])
+                if isinstance(item, dict)
+            ],
+            "rationale": planner_meta.get("reason") or "",
+        } if planner_preferred_skill_ids else None,
     )
     return [replanned] if replanned.get("changes") else []
 
@@ -11886,6 +11912,25 @@ async def _execute_ops_plan_once(
             rejected_change_count=max(0, changes_before_skill_route - len(plan.get("changes") or [])),
             level="success" if selected_skills else "warning",
         )
+        if plan.get("skill_evidence_plan"):
+            await emit(
+                "evidence_plan_ready",
+                "已按主 Skill 生成渐进式取证计划：先直接证据，再组件下钻，最后才做可选跨域关联。",
+                evidence_plan=plan.get("skill_evidence_plan"),
+                level="info",
+            )
+        if plan.get("skill_execution_chain"):
+            chain = plan.get("skill_execution_chain") or {}
+            await emit(
+                "skill_chain_ready",
+                (
+                    "已确认跨域 Skill 串行依赖；后续 Skill 仅在门禁证据满足后启动。"
+                    if chain.get("mode") == "serial_dependency" else
+                    "本轮只采用最高匹配的一个主 Skill；其他候选不会被同时调用。"
+                ),
+                skill_execution_chain=chain,
+                level="info",
+            )
         routed_change_fingerprints = {
             _change_item_fingerprint(change)
             for change in (plan.get("changes") or [])
@@ -12970,6 +13015,10 @@ def _public_skill_match(match: dict) -> dict:
         "category": skill.get("category"),
         "summary": skill.get("summary"),
         "risk": skill.get("risk"),
+        "skill_type": skill.get("skill_type") or "recovery",
+        "selection_role": skill.get("selection_role") or "primary",
+        "dimensions": skill.get("dimensions") or [],
+        "progressive_evidence": skill.get("progressive_evidence") or [],
         "confidence": match.get("confidence"),
         "score": match.get("score"),
         "rank": match.get("rank"),
@@ -12995,6 +13044,178 @@ def _public_skill_match(match: dict) -> dict:
         "execution_authorized": bool(match.get("_execution_authorized")),
         "evidence_collected": match.get("_evidence_collected") or [],
         "evidence_missing": match.get("_evidence_missing") or [],
+    }
+
+
+def _skill_progressive_evidence_plan(skill: dict, collected: set[str]) -> list[dict]:
+    """Build the cheapest-first evidence plan exposed to operators and agents."""
+    configured = [
+        item for item in (skill.get("progressive_evidence") or [])
+        if isinstance(item, dict)
+    ]
+    if not configured:
+        required = [
+            str(item).strip()
+            for item in (skill.get("evidence_required") or [])
+            if str(item).strip()
+        ]
+        direct_ids = {
+            "current_logs", "previous_logs", "last_state", "events",
+            "workload_spec", "pod_security_context", "recent_changes",
+        }
+        correlation_ids = {
+            "dependency_topology", "traffic_baseline", "trace_relationships",
+            "topology_model", "ebpf_flows",
+        }
+        configured = [
+            {
+                "stage": "direct_evidence",
+                "evidence": [item for item in required if item in direct_ids],
+                "stop_when": "直接错误与实时对象配置已经闭合根因时，停止扩大取证范围。",
+            },
+            {
+                "stage": "component_evidence",
+                "evidence": [
+                    item for item in required
+                    if item not in direct_ids and item not in correlation_ids
+                ],
+                "stop_when": "组件级证据可区分剩余候选根因时，进入最小变更规划。",
+            },
+            {
+                "stage": "cross_domain_correlation",
+                "evidence": [item for item in required if item in correlation_ids],
+                "optional": True,
+                "stop_when": "仅在本地证据无法闭合根因或需要评估影响面时加载。",
+            },
+        ]
+    labels = {
+        str(item.get("id")): str(item.get("label") or item.get("id"))
+        for item in skill_option_catalog().get("evidence_required") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    result: list[dict] = []
+    for index, stage in enumerate(configured, start=1):
+        evidence_ids = [
+            str(item).strip()
+            for item in (stage.get("evidence") or [])
+            if str(item).strip()
+        ]
+        if not evidence_ids:
+            continue
+        present = [item for item in evidence_ids if item in collected]
+        missing = [item for item in evidence_ids if item not in collected]
+        optional = bool(stage.get("optional", False))
+        result.append({
+            "sequence": index,
+            "stage": str(stage.get("stage") or f"stage-{index}"),
+            "status": (
+                "completed"
+                if not missing else
+                "optional"
+                if optional else
+                "pending"
+            ),
+            "optional": optional,
+            "evidence": [
+                {"id": item, "label": labels.get(item, item), "collected": item in collected}
+                for item in evidence_ids
+            ],
+            "collected": present,
+            "missing": missing,
+            "stop_when": str(stage.get("stop_when") or ""),
+        })
+    return result
+
+
+def _skill_execution_chain(
+    active_match: dict,
+    matches: list[dict],
+    routing: dict | None,
+) -> dict:
+    """Allow multiple Skills only as an explicit cross-domain dependency DAG."""
+    active_skill = active_match.get("skill") or {}
+    active_id = str(active_skill.get("id") or "")
+    match_by_id = {
+        str((item.get("skill") or {}).get("id") or ""): item
+        for item in matches
+        if str((item.get("skill") or {}).get("id") or "")
+    }
+    route = routing if isinstance(routing, dict) else {}
+    selected_route_ids = [
+        str(item).strip()
+        for item in (route.get("selected_skill_ids") or [])
+        if str(item).strip()
+    ]
+    requested_secondary = [
+        str(item).strip()
+        for item in (
+            route.get("secondary_skill_ids")
+            or selected_route_ids[1:]
+            or []
+        )
+        if str(item).strip()
+    ]
+    dependencies = [
+        item for item in (route.get("skill_dependencies") or [])
+        if isinstance(item, dict)
+    ]
+    steps = [{
+        "sequence": 1,
+        "skill_id": active_id,
+        "skill_name": active_skill.get("name") or active_id,
+        "category": active_skill.get("category"),
+        "role": "primary",
+        "start_when": "当前实时证据与该 Skill 的触发条件和对象范围一致。",
+    }]
+    accepted: set[str] = set()
+    previous_id = active_id
+    for dependency in dependencies[:4]:
+        source_id = str(dependency.get("from_skill_id") or "").strip()
+        target_id = str(dependency.get("to_skill_id") or "").strip()
+        reason = str(dependency.get("reason") or "").strip()
+        gate_evidence = [
+            str(item).strip()
+            for item in (dependency.get("gate_evidence") or [])
+            if str(item).strip()
+        ]
+        target_match = match_by_id.get(target_id)
+        target_skill = (target_match or {}).get("skill") or {}
+        cross_domain = (
+            bool(target_skill)
+            and str(target_skill.get("category") or "") != str(active_skill.get("category") or "")
+        )
+        if (
+            source_id != previous_id
+            or target_id not in requested_secondary
+            or target_id in accepted
+            or not reason
+            or not gate_evidence
+            or not cross_domain
+        ):
+            continue
+        accepted.add(target_id)
+        steps.append({
+            "sequence": len(steps) + 1,
+            "skill_id": target_id,
+            "skill_name": target_skill.get("name") or target_id,
+            "category": target_skill.get("category"),
+            "role": "dependent",
+            "depends_on": source_id,
+            "start_when": reason,
+            "gate_evidence": gate_evidence,
+        })
+        previous_id = target_id
+        if len(steps) >= 3:
+            break
+    ignored = [item for item in requested_secondary if item not in accepted]
+    return {
+        "mode": "serial_dependency" if len(steps) > 1 else "primary_only",
+        "steps": steps,
+        "ignored_secondary_skill_ids": ignored,
+        "policy": (
+            "默认只使用最高匹配的主 Skill；只有不同领域的后续 Skill 声明依赖关系、"
+            "启动证据和原因后才允许串行加入，禁止并行执行多个修复 Skill。"
+        ),
     }
 
 
@@ -13138,6 +13359,26 @@ def _collected_skill_evidence(signal: dict) -> set[str]:
         collected.add("service_endpoints")
     if evidence.get("node") and not (evidence.get("node") or {}).get("error"):
         collected.update({"node_conditions", "node_capacity", "node_pressure", "node_labels", "system_pods"})
+    for evidence_id in (
+        "cluster_inventory", "control_plane_health", "workload_inventory", "gpu_health",
+        "node_system_metrics", "node_system_logs", "collector_status", "telemetry_pipeline",
+        "data_freshness", "query_schema", "sample_records", "query_error",
+        "query_validation", "entity_inventory", "topology_model", "ebpf_flows",
+        "trace_relationships",
+    ):
+        if evidence_id in evidence and evidence.get(evidence_id) not in (None, "", [], {}):
+            collected.add(evidence_id)
+    topology = evidence.get("topology") if isinstance(evidence.get("topology"), dict) else {}
+    if topology.get("nodes"):
+        collected.add("entity_inventory")
+    if topology.get("edges"):
+        collected.update({"topology_model", "dependency_topology"})
+        if any(
+            isinstance(item, dict)
+            and str(item.get("source_system") or "").startswith(("ebpf_", "hubble", "cilium"))
+            for item in topology.get("edges") or []
+        ):
+            collected.add("ebpf_flows")
     diagnostics = evidence.get("diagnostics") if isinstance(evidence.get("diagnostics"), dict) else {}
     for key in diagnostics:
         if diagnostics.get(key) is not None:
@@ -13200,6 +13441,8 @@ def _attach_operator_skills_to_plan(
         "skill_suggested_steps",
         "skill_script_candidates",
         "skill_routing",
+        "skill_execution_chain",
+        "skill_evidence_plan",
     }
     match_signal["plan"] = {
         key: copy.deepcopy(value)
@@ -13286,6 +13529,15 @@ def _attach_operator_skills_to_plan(
             if match.get("_evidence_missing")
         },
     }
+    plan["skill_evidence_plan"] = _skill_progressive_evidence_plan(
+        active_skill,
+        collected_evidence,
+    )
+    plan["skill_execution_chain"] = _skill_execution_chain(
+        active_match,
+        matches,
+        routing,
+    )
     existing_step_ids = {str(step.get("id") or step.get("title")) for step in plan.get("steps") or [] if isinstance(step, dict)}
     skill_steps = [
         step for step in OPS_SKILL_REGISTRY.steps_from_matches([active_match], limit=1)
@@ -13419,7 +13671,7 @@ def _attach_operator_skills_to_plan(
     plan["planning_engine"] = (
         plan.get("planning_engine")
         if plan.get("skill_handler_invoked")
-        else "DynamicSREPlanner/v5 + ContextualBayesianSkillRouter/v3 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
+        else "DynamicSREPlanner/v6 + ContextualBayesianSkillRouter/v4 (AgentSkillRouter/v2 compatible) + SkillMemory + ApprovalGate"
     )
     plan["skill_match_policy"] = (
         "候选 Skill 由模型根因先验、实时证据覆盖、语义相似度、Beta 后验成功率、风险与"
@@ -13527,6 +13779,14 @@ def _attach_operator_skills_to_chat(req: ChatRequest, data: dict) -> dict:
                 "engine": "DeepSeekRootCauseSkillRouter/v1",
                 "source": "llm_root_cause_candidates+semantic_match",
                 "selected_skill_ids": preferred_skill_ids,
+                "secondary_skill_ids": [
+                    str(item) for item in (llm_skill_routing.get("secondary_skill_ids") or [])
+                    if str(item)
+                ],
+                "skill_dependencies": [
+                    item for item in (llm_skill_routing.get("skill_dependencies") or [])
+                    if isinstance(item, dict)
+                ],
                 "strategy_id": strategy_preference,
                 "strategy_confidence": llm_skill_routing.get("strategy_confidence"),
                 "rationale": llm_skill_routing.get("rationale") or "",
@@ -13677,14 +13937,15 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
                 "随后用 Pod/Workload securityContext、volumeMount、PVC/PV 和 Events 交叉验证，"
                 "先生成候选根因及支持/反证，再为每个 finding 选择最多 3 个最相关的 Skill。"
                 "只能选择目录中已有 id，不得生成命令或新 Skill。通常只把最高证据一致性的 Skill 作为第一项；"
-                "只有跨域依赖时才保留后续 Skill。"
+                "只有跨不同领域且后一个依赖前一个结果时才保留后续 Skill，并为每条依赖给出"
+                "{from_skill_id,to_skill_id,reason,gate_evidence}；否则只保留一个 Skill。"
                 "遇到 `PATH...=/path is not writable` 加数据库/lock/WAL 打开失败时，不能停在应用报错；"
                 "要核对路径是否位于 volumeMount、当前 UID/GID、fsGroup、只读挂载、容量、I/O、数据库损坏和 root_squash。"
                 "若明确不可写路径、同路径数据库启动失败、挂载关联和非 root 约束四类证据闭合，"
                 "可以建议 strategy_id=root_workload_security_context；否则不得仅凭一个相似词建议 root。"
                 "该 strategy 只是候选排序：新故障执行时仍须先尝试非 root UID/GID/fsGroup 对齐，验证失败后才可另行审批 root。"
                 "优先选择能覆盖根因证据、对象类型和恢复判据的 Skill；证据不足时保留确定性候选并降低 confidence。"
-                "只返回 JSON：{routes:[{finding_id,skill_ids,confidence,strategy_id,strategy_confidence,"
+                "只返回 JSON：{routes:[{finding_id,skill_ids,skill_dependencies,confidence,strategy_id,strategy_confidence,"
                 "root_cause_candidates:[{hypothesis,confidence,supporting_evidence,contradicting_evidence,"
                 "required_next_evidence}],rationale}]}。\n"
                 f"Skill目录={json.dumps(_redact_sensitive(skill_catalog), ensure_ascii=False)[:14000]}\n"
@@ -13706,6 +13967,11 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
                 if finding_id and selected:
                     llm_routes[finding_id] = {
                         "skill_ids": selected,
+                        "skill_dependencies": [
+                            dependency
+                            for dependency in (route.get("skill_dependencies") or [])
+                            if isinstance(dependency, dict)
+                        ][:3],
                         "confidence": max(0.0, min(1.0, float(route.get("confidence") or 0.0))),
                         "strategy_id": _clip_text(route.get("strategy_id"), 120),
                         "strategy_confidence": max(
@@ -13743,6 +14009,8 @@ async def _route_inspection_findings_with_skills(payload: dict, model_profile_id
             "engine": "AgentSkillRouter/v2",
             "source": "llm+semantic_match" if llm_route else "semantic_match_fallback",
             "selected_skill_ids": preferred,
+            "secondary_skill_ids": preferred[1:],
+            "skill_dependencies": (llm_route or {}).get("skill_dependencies") or [],
             "confidence": (llm_route or {}).get("confidence"),
             "strategy_id": (llm_route or {}).get("strategy_id") or "",
             "strategy_confidence": (llm_route or {}).get("strategy_confidence"),

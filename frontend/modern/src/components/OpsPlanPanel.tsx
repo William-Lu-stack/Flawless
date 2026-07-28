@@ -24,7 +24,7 @@ const ACTIVE_STATUSES = new Set(["queued", "running", "awaiting_approval", "resu
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "unresolved", "blocked"]);
 const ACTIVE_EVENT_STAGES = new Set([
   "queued", "starting", "attempt", "collecting_priority_logs", "collecting_evidence", "step_start", "step_waiting",
-  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "skill_routed", "execution_preflight", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
+  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "skill_routed", "evidence_plan_ready", "skill_chain_ready", "execution_preflight", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
   "continuation_wait", "resume_pending",
 ]);
 const EXECUTION_PHASES = ["采集证据", "根因诊断", "提交变更", "恢复验证"];
@@ -65,6 +65,8 @@ function stageLabel(stage: unknown) {
     root_cause_diagnosed: "根因诊断完成",
     diagnosis_done: "根因诊断完成",
     skill_routed: "Skill 动态路由",
+    evidence_plan_ready: "渐进取证计划",
+    skill_chain_ready: "Skill 执行链",
     step_waiting: "诊断进行中",
     step_start: "诊断开始",
     step_done: "诊断完成",
@@ -626,6 +628,8 @@ export function OpsPlanPanel({ plan, autonomous = false }: { plan: OpsPlan; auto
     [plan],
   );
   const operatorSkills = useMemo(() => asList(plan?.operator_skills), [plan]);
+  const skillChain = useMemo(() => asList(plan?.skill_execution_chain?.steps), [plan]);
+  const skillEvidenceStages = useMemo(() => asList(plan?.skill_evidence_plan), [plan]);
   const strategyDecision = plan?.permission_strategy_decision || {};
   const planTarget = targetLabel(plan?.target, "目标对象");
   const requiresHighRisk = useMemo(
@@ -698,8 +702,14 @@ export function OpsPlanPanel({ plan, autonomous = false }: { plan: OpsPlan; auto
       <span>{changes.length ? `将修改 ${changes.map((change: any) => `${change.workload_type || change.kind || "resource"}/${change.workload_name || change.name || planTarget}`).join("、")}。${riskPreview}。执行后会继续验证 Ready、重启次数、Events 和错误率。` : `${evidenceReason} 原理：SRE 门禁要求“根因证据 -> 最小变更 -> 可回滚 -> 可验证”闭环；证据不足时直接改配置会扩大故障半径，所以先执行深度诊断并让系统重规划。`}</span>
     </div>
     {operatorSkills.length > 0 && <div className="ops-skill-strip">
-      <b>匹配到的运维 Skill</b>
-      {operatorSkills.map((skill: any) => <span key={skill.id}><strong>{skill.name}</strong><small>{Math.round(Number(skill.confidence || 0) * 100)}% · {skill.category} · {skill.risk} · {skill.execution_authorized ? "所需证据已齐，可进入审批" : asList(skill.evidence_missing).length ? `仍缺 ${asList(skill.evidence_missing).join("、")}` : "仅诊断，未发布执行权限"}</small></span>)}
+      <b>Skill 候选排序 · 实际采用 {plan?.skill_execution_chain?.mode === "serial_dependency" ? "跨域串行链" : "单一主 Skill"}</b>
+      {operatorSkills.slice(0, 3).map((skill: any, index: number) => <span className={index === 0 ? "primary" : ""} key={skill.id}><strong>{index === 0 ? "主 Skill · " : `候选 ${index + 1} · `}{skill.name}</strong><small>{Math.round(Number(skill.confidence || 0) * 100)}% · {skill.category} · {skill.skill_type || "recovery"} · {skill.execution_authorized ? "证据已齐，可进入审批" : asList(skill.evidence_missing).length ? `仍缺 ${asList(skill.evidence_missing).join("、")}` : "只读诊断"}</small></span>)}
+      {skillChain.length > 1 && <div className="ops-skill-chain">{skillChain.map((item: any, index: number) => <span key={`${item.skill_id}-${index}`}><i>{index + 1}</i><strong>{item.skill_name}</strong><small>{item.role === "primary" ? "先执行主 Skill" : `依赖 ${item.depends_on} · ${item.start_when}`}</small></span>)}</div>}
+      {asList(plan?.skill_execution_chain?.ignored_secondary_skill_ids).length > 0 && <small className="ops-skill-ignored">未满足跨域依赖契约，未加载：{asList(plan.skill_execution_chain.ignored_secondary_skill_ids).join("、")}</small>}
+    </div>}
+    {skillEvidenceStages.length > 0 && <div className="ops-skill-evidence-plan">
+      <b>渐进式取证</b>
+      {skillEvidenceStages.map((stage: any, index: number) => <span key={`${stage.stage}-${index}`} className={stage.status}><i>{index + 1}</i><strong>{stage.stage}</strong><small>{asList(stage.evidence).map((item: any) => `${item.collected ? "✓" : "○"} ${item.label || item.id}`).join(" · ")}</small>{stage.stop_when && <em>{stage.stop_when}</em>}</span>)}
     </div>}
     {strategyDecision.selected_strategy && <div className="ops-strategy-decision">
       <b>智能策略选择</b>

@@ -111,6 +111,10 @@ class OpsSkillDefinition(BaseModel):
     rollback: str = ""
     owner: str = ""
     enabled: bool = True
+    skill_type: str = "recovery"
+    selection_role: str = "primary"
+    dimensions: list[str] = Field(default_factory=list)
+    progressive_evidence: list[dict] = Field(default_factory=list)
     script_policy: OpsSkillScriptPolicy = Field(default_factory=OpsSkillScriptPolicy)
 
 

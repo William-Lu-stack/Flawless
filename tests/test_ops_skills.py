@@ -539,6 +539,8 @@ class OpsSkillCatalogTests(unittest.TestCase):
                     "information_gain",
                     "exploration",
                     "lineage_failure_penalty",
+                    "broad_diagnostic_penalty",
+                    "supporting_role_penalty",
                     "inference_confidence",
                     "contextual_utility",
                     "selection_utility",
@@ -547,10 +549,10 @@ class OpsSkillCatalogTests(unittest.TestCase):
             result = registry.match({"question": "permission denied"})
             self.assertEqual(
                 result["selection_algorithm"]["id"],
-                "contextual_bayesian_utility_v3",
+                "contextual_bayesian_utility_v4",
             )
             self.assertIn("Beta 后验成功率", result["policy"])
-            self.assertEqual(match["selection_algorithm"], "contextual_bayesian_utility_v3")
+            self.assertEqual(match["selection_algorithm"], "contextual_bayesian_utility_v4")
 
     def test_root_cause_hypotheses_drive_skill_ranking_without_keyword_runbook(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -897,7 +899,123 @@ class OpsSkillCatalogTests(unittest.TestCase):
         self.assertIn("success_criteria", catalog)
         self.assertIn("script_triggers", catalog)
         self.assertTrue(any(item["id"] == "previous_logs" for item in catalog["evidence_required"]))
+        self.assertTrue(any(item["id"] == "ebpf_flows" for item in catalog["evidence_required"]))
+        self.assertTrue(any(item["id"] == "telemetry_fresh" for item in catalog["success_criteria"]))
         self.assertTrue(all(item.get("description") for items in catalog.values() for item in items))
+
+    def test_official_recommended_patterns_are_adapted_as_builtin_skills(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = OpsSkillRegistry(Path(directory) / "skills")
+            skills = {item["id"]: item for item in registry.list()["skills"]}
+        expected = {
+            "skill-kubernetes-progressive-inspection",
+            "skill-kubernetes-node-inspection",
+            "skill-database-progressive-inspection",
+            "skill-observability-collector-recovery",
+            "skill-observability-query-generation",
+            "skill-topology-data-modeling",
+        }
+        self.assertTrue(expected.issubset(skills))
+        self.assertTrue(all(skills[skill_id]["builtin"] for skill_id in expected))
+        self.assertTrue(all(skills[skill_id]["progressive_evidence"] for skill_id in expected))
+        self.assertTrue(all(not skills[skill_id]["execution_ready"] for skill_id in expected))
+
+    def test_progressive_inspection_and_telemetry_skills_rank_for_their_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = OpsSkillRegistry(Path(directory) / "skills")
+            inspection = registry.match({
+                "question": "对 Kubernetes 集群做升级前巡检，覆盖管控面、节点、工作负载、网络、存储和 GPU",
+            }, top_k=3)
+            telemetry = registry.match({
+                "question": "Beyla Pod 正常但是拓扑没有 eBPF 流量，检查采集链路",
+            }, top_k=3)
+            permission = registry.match({
+                "question": "GF_PATHS_DATA is not writable; unable to open database file; CrashLoopBackOff",
+            }, top_k=3)
+        self.assertEqual(inspection["matches"][0]["skill"]["id"], "skill-kubernetes-progressive-inspection")
+        self.assertEqual(telemetry["matches"][0]["skill"]["id"], "skill-observability-collector-recovery")
+        self.assertEqual(permission["matches"][0]["skill"]["id"], "skill-volume-permission-recovery")
+
+    def test_agent_context_loads_one_primary_body_and_keeps_candidates_lightweight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = OpsSkillRegistry(Path(directory) / "skills")
+            context = registry.agent_context({
+                "question": "Beyla Pod 正常但是拓扑没有 eBPF 流量，采集链路和数据模型是否正确",
+            }, top_k=3)
+        self.assertGreaterEqual(len(context), 2)
+        self.assertTrue(context[0]["instructions_loaded"])
+        self.assertEqual(context[0]["context_role"], "primary")
+        self.assertTrue(all(not item["instructions_loaded"] for item in context[1:]))
+        self.assertTrue(all(item["context_role"] == "candidate_metadata" for item in context[1:]))
+
+    def test_skill_chain_requires_explicit_cross_domain_dependency(self):
+        primary = {
+            "skill": {
+                "id": "skill-storage-pvc-pv",
+                "name": "存储恢复",
+                "category": "storage",
+            },
+        }
+        network = {
+            "skill": {
+                "id": "skill-service-endpoint-flow",
+                "name": "网络恢复",
+                "category": "network",
+            },
+        }
+        ignored = server._skill_execution_chain(
+            primary,
+            [primary, network],
+            {
+                "secondary_skill_ids": ["skill-service-endpoint-flow"],
+                "skill_dependencies": [],
+            },
+        )
+        self.assertEqual(ignored["mode"], "primary_only")
+        self.assertEqual(ignored["ignored_secondary_skill_ids"], ["skill-service-endpoint-flow"])
+
+        accepted = server._skill_execution_chain(
+            primary,
+            [primary, network],
+            {
+                "secondary_skill_ids": ["skill-service-endpoint-flow"],
+                "skill_dependencies": [{
+                    "from_skill_id": "skill-storage-pvc-pv",
+                    "to_skill_id": "skill-service-endpoint-flow",
+                    "reason": "PVC 恢复后 Endpoint 仍为空时再检查网络链路",
+                    "gate_evidence": ["pvc_bound", "service_endpoints"],
+                }],
+            },
+        )
+        self.assertEqual(accepted["mode"], "serial_dependency")
+        self.assertEqual([item["skill_id"] for item in accepted["steps"]], [
+            "skill-storage-pvc-pv",
+            "skill-service-endpoint-flow",
+        ])
+
+    def test_progressive_evidence_plan_marks_collected_and_optional_stages(self):
+        skill = {
+            "progressive_evidence": [
+                {
+                    "stage": "direct",
+                    "evidence": ["current_logs", "workload_spec"],
+                    "stop_when": "根因闭合",
+                },
+                {
+                    "stage": "topology",
+                    "evidence": ["dependency_topology"],
+                    "optional": True,
+                    "stop_when": "仅在需要影响面时加载",
+                },
+            ],
+        }
+        evidence_plan = server._skill_progressive_evidence_plan(
+            skill,
+            {"current_logs", "workload_spec"},
+        )
+        self.assertEqual(evidence_plan[0]["status"], "completed")
+        self.assertEqual(evidence_plan[1]["status"], "optional")
+        self.assertEqual(evidence_plan[1]["missing"], ["dependency_topology"])
 
     def test_action_catalog_has_operator_guidance(self):
         actions = {item["id"]: item for item in action_catalog_payload()}

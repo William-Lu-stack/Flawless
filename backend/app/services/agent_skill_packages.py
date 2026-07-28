@@ -81,6 +81,10 @@ def render_skill_md(skill: dict[str, Any]) -> str:
     steps = [str(item) for item in skill.get("diagnostic_steps") or []]
     actions = [str(item) for item in skill.get("allowed_actions") or []]
     criteria = [str(item) for item in skill.get("success_criteria") or []]
+    progressive_evidence = [
+        item for item in (skill.get("progressive_evidence") or [])
+        if isinstance(item, dict)
+    ]
     rollback = str(skill.get("rollback") or "Use the recorded pre-change state or the platform-approved rollback action.").strip()
 
     def bullets(values: list[str], empty: str) -> str:
@@ -89,6 +93,17 @@ def render_skill_md(skill: dict[str, Any]) -> str:
     workflow = "\n".join(f"{index}. {item}" for index, item in enumerate(steps, 1))
     if not workflow:
         workflow = "1. Collect direct runtime evidence before proposing any mutation.\n2. Produce a minimal, reversible plan and verify recovery."
+    progressive = "\n".join(
+        (
+            f"{index}. **{str(stage.get('stage') or f'Stage {index}')}** — "
+            f"{', '.join(str(item) for item in (stage.get('evidence') or [])) or 'incident-specific evidence'}"
+            f"{' (optional)' if stage.get('optional') else ''}. "
+            f"Stop/advance rule: {str(stage.get('stop_when') or 'Advance only when this stage leaves the root cause unresolved.')}"
+        )
+        for index, stage in enumerate(progressive_evidence, 1)
+    )
+    if not progressive:
+        progressive = "1. Load the cheapest direct evidence first, then expand only when it can distinguish remaining root-cause candidates."
     body = f"""
 # {title}
 
@@ -109,6 +124,10 @@ Collect and validate these evidence classes before proposing a change:
 ## Workflow
 
 {workflow}
+
+## Progressive Evidence Plan
+
+{progressive}
 
 ## Allowed Operations
 
@@ -164,6 +183,11 @@ def render_ops_policy(skill: dict[str, Any]) -> str:
             "runtime_handler": str(skill.get("runtime_handler") or ""),
             "execution_model": str(skill.get("execution_model") or "host_action_mapping"),
             "continuation_capable": bool(skill.get("continuation_capable", False)),
+            "execution_ready": bool(skill.get("execution_ready", bool(skill.get("allowed_actions")))),
+            "skill_type": str(skill.get("skill_type") or "recovery"),
+            "selection_role": str(skill.get("selection_role") or "primary"),
+            "dimensions": list(skill.get("dimensions") or []),
+            "progressive_evidence": deepcopy(skill.get("progressive_evidence") or []),
         },
         "guardrails": {
             "risk": str(skill.get("risk") or "medium"),
@@ -299,13 +323,20 @@ def read_package(package_dir: Path) -> dict[str, Any]:
         "updated_by": lifecycle.get("updated_by") or "package-loader",
         "format": AGENT_SKILL_SPEC,
         "portable": True,
-        "execution_ready": bool(policy and workflow.get("allowed_actions")),
+        "execution_ready": bool(
+            policy
+            and workflow.get("execution_ready", bool(workflow.get("allowed_actions")))
+        ),
         # Imported packages can describe a runtime handler for portability, but
         # the registry strips it unless the application itself marks the Skill
         # as a trusted built-in.
         "runtime_handler": str(workflow.get("runtime_handler") or ""),
         "execution_model": str(workflow.get("execution_model") or "host_action_mapping"),
         "continuation_capable": bool(workflow.get("continuation_capable", False)),
+        "skill_type": str(workflow.get("skill_type") or ("recovery" if workflow.get("allowed_actions") else "analysis")),
+        "selection_role": str(workflow.get("selection_role") or "primary"),
+        "dimensions": list(workflow.get("dimensions") or []),
+        "progressive_evidence": list(workflow.get("progressive_evidence") or []),
         "package_path": str(package_dir),
         "package_files": sum(1 for path in package_dir.rglob("*") if path.is_file()),
         "bundled_scripts": script_files,

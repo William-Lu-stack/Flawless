@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Immutable release tag to publish (for example 3.2.7)
+        description: Immutable release tag to publish (for example 3.2.13)
         required: true
-        default: "3.2.7"
+        default: "3.2.13"
   push:
     tags:
       - "v*"
