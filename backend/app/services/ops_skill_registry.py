@@ -1044,6 +1044,21 @@ class OpsSkillRegistry:
                 )
                 return merged, policy_changed
 
+            current_packaged_builtins: dict[str, bool] = {}
+
+            def packaged_builtin_is_current(skill_id: str) -> bool:
+                """Avoid replaying a completed legacy migration on every boot."""
+                if skill_id in current_packaged_builtins:
+                    return current_packaged_builtins[skill_id]
+                package_dir = self.root / skill_id
+                try:
+                    packaged = read_package(package_dir)
+                    _, changed = merge_builtin_policy(packaged)
+                    current_packaged_builtins[skill_id] = not changed
+                except Exception:
+                    current_packaged_builtins[skill_id] = False
+                return current_packaged_builtins[skill_id]
+
             self._skills = {
                 item["id"]: self._normalize(deepcopy(item), actor="builtin-loader")
                 for item in DEFAULT_OPERATOR_SKILLS
@@ -1055,6 +1070,13 @@ class OpsSkillRegistry:
                     for item in raw.get("skills", []) if isinstance(raw, dict) else raw:
                         if isinstance(item, dict) and item.get("id"):
                             merged, upgraded = merge_builtin_policy(item)
+                            # A current standard package proves that the legacy
+                            # record was already migrated on an earlier boot.
+                            # Continue applying the shipped in-memory policy,
+                            # but do not emit another migration receipt or
+                            # rewrite the package forever.
+                            if upgraded and packaged_builtin_is_current(str(item["id"])):
+                                upgraded = False
                             if upgraded:
                                 upgraded_builtin_ids.add(str(item["id"]))
                                 self._load_errors.append(

@@ -16,9 +16,14 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.15**.
+Current release: **3.2.16**.
 
-Release 3.2.15 makes built-in Skill policy upgrade-safe. On the first process
+Release 3.2.16 makes the built-in Skill migration idempotent. Once a stale
+legacy definition has been materialized as a current standard Skill package,
+later restarts keep enforcing the shipped policy without emitting duplicate
+migration receipts or rewriting the package.
+
+Release 3.2.15 made built-in Skill policy upgrade-safe. On the first process
 start after an image upgrade, application-owned Skills now replace stale
 legacy JSON and directory-package policy with the shipped version while
 retaining the operator's enabled state. This prevents an older executable

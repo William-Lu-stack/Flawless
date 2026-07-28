@@ -80,7 +80,7 @@ class OpsSkillCatalogTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             self.assertIn("routing_only: true", persisted)
             self.assertIn("handoff_required: true", persisted)
-            second_boot = OpsSkillRegistry(root, legacy_path=None).list()
+            second_boot = OpsSkillRegistry(root, legacy_path=legacy).list()
             self.assertFalse(
                 any(
                     item.startswith("builtin-policy-upgraded:")
