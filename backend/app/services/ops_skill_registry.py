@@ -33,6 +33,7 @@ from backend.app.services.agent_skill_packages import (
 DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
     {
         "id": "skill-volume-permission-recovery",
+        "version": "2.1.0",
         "name": "容器卷权限修复与重新发布",
         "category": "storage",
         "summary": "根据直接权限错误或数据库/锁/WAL/临时文件不可写等间接日志，关联运行用户、挂载和 Workload 配置，逐级执行最小权限 YAML 修复并重新发布验证。",
@@ -108,6 +109,7 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
     },
     {
         "id": "skill-crashloop-root-cause",
+        "version": "2.1.0",
         "name": "CrashLoop 根因分流",
         "category": "runtime",
         "summary": "非终态路由 Skill：把 CrashLoopBackOff 按 OOM、探针、配置、挂载、权限、镜像和依赖故障分流，并把控制权交给证据最匹配的可执行恢复 Skill。",
@@ -993,6 +995,55 @@ class OpsSkillRegistry:
                 str(item["id"]): deepcopy(item)
                 for item in DEFAULT_OPERATOR_SKILLS
             }
+
+            def merge_builtin_policy(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+                """Apply the application-shipped policy on the first upgraded boot.
+
+                Older releases loaded ``ops-skills.json`` before materialising
+                Agent Skill packages.  That legacy record could therefore
+                shadow a newer built-in for one complete process lifetime.  In
+                production this left the old CrashLoop Skill executable and
+                terminal even though the image contained a routing-only
+                definition.  A built-in id is an application-owned security
+                boundary, so persisted data may retain only its enable/disable
+                state and creation metadata; policy and runtime ownership
+                always come from the running application.
+                """
+                builtin = builtin_by_id.get(str(record.get("id") or ""))
+                if not builtin:
+                    return record, False
+                merged = {
+                    **deepcopy(builtin),
+                    "enabled": bool(record.get("enabled", True)),
+                    "lifecycle": record.get("lifecycle") or "published",
+                    "created_at": record.get("created_at"),
+                    "builtin": True,
+                }
+                current_policy = self._normalize(
+                    deepcopy(record),
+                    actor=record.get("updated_by") or "policy-migration-check",
+                )
+                shipped_policy = self._normalize(
+                    deepcopy(merged),
+                    actor="builtin-policy-migration",
+                )
+                policy_changed = any(
+                    current_policy.get(key) != shipped_policy.get(key)
+                    for key in (
+                        "version", "name", "category", "summary",
+                        "symptoms", "applies_to", "evidence_required",
+                        "evidence_any_of", "diagnostic_steps", "allowed_actions",
+                        "success_criteria", "risk", "rollback", "script_policy",
+                        "execution_ready", "runtime_handler", "execution_model",
+                        "continuation_capable", "skill_type", "selection_role",
+                        "dimensions", "progressive_evidence", "routing_only",
+                        "handoff_required", "workflow_phases",
+                        "evidence_failure_policy", "completion_contract",
+                        "builtin",
+                    )
+                )
+                return merged, policy_changed
+
             self._skills = {
                 item["id"]: self._normalize(deepcopy(item), actor="builtin-loader")
                 for item in DEFAULT_OPERATOR_SKILLS
@@ -1003,7 +1054,16 @@ class OpsSkillRegistry:
                     raw = json.loads(self.legacy_path.read_text(encoding="utf-8"))
                     for item in raw.get("skills", []) if isinstance(raw, dict) else raw:
                         if isinstance(item, dict) and item.get("id"):
-                            self._skills[str(item["id"])] = self._normalize(item, actor=item.get("updated_by") or "store")
+                            merged, upgraded = merge_builtin_policy(item)
+                            if upgraded:
+                                upgraded_builtin_ids.add(str(item["id"]))
+                                self._load_errors.append(
+                                    f"builtin-policy-upgraded:{item['id']}:legacy"
+                                )
+                            self._skills[str(item["id"])] = self._normalize(
+                                merged,
+                                actor=item.get("updated_by") or "store",
+                            )
                 except Exception as exc:
                     self._load_errors.append(f"legacy:{type(exc).__name__}:{exc}")
             try:
@@ -1011,31 +1071,12 @@ class OpsSkillRegistry:
                 for skill_file in sorted(self.root.glob("*/SKILL.md")):
                     try:
                         record = read_package(skill_file.parent)
-                        builtin = builtin_by_id.get(str(record.get("id") or ""))
-                        if builtin and record.get("builtin"):
-                            policy_fields = {
-                                "name", "description", "category", "summary", "symptoms", "applies_to",
-                                "evidence_required", "evidence_any_of", "diagnostic_steps", "allowed_actions",
-                                "success_criteria", "risk", "rollback", "script_policy", "execution_ready",
-                                "runtime_handler", "execution_model", "continuation_capable", "skill_type",
-                                "selection_role", "dimensions", "progressive_evidence",
-                                "routing_only", "handoff_required", "workflow_phases",
-                                "evidence_failure_policy", "completion_contract",
-                            }
-                            if any(record.get(key) != builtin.get(key) for key in policy_fields if key in builtin):
-                                upgraded_builtin_ids.add(str(record["id"]))
-                            # Built-in policy is versioned with the application.
-                            # Operators can disable it, but custom changes belong
-                            # in a separate Skill id so security upgrades cannot
-                            # be shadowed by an old persisted package.
-                            record = {
-                                **record,
-                                **builtin,
-                                "enabled": bool(record.get("enabled", True)),
-                                "lifecycle": record.get("lifecycle") or "published",
-                                "created_at": record.get("created_at"),
-                                "builtin": True,
-                            }
+                        record, upgraded = merge_builtin_policy(record)
+                        if upgraded:
+                            upgraded_builtin_ids.add(str(record["id"]))
+                            self._load_errors.append(
+                                f"builtin-policy-upgraded:{record['id']}:package"
+                            )
                         self._skills[record["id"]] = self._normalize(record, actor=record.get("updated_by") or "package-loader")
                     except Exception as exc:
                         self._load_errors.append(f"{skill_file.parent.name}:{type(exc).__name__}:{exc}")

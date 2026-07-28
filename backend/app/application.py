@@ -187,8 +187,9 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.14")
-APP_CODE_SIGNATURE = "active-evidence-skill-handoff-v20"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.15")
+APP_CODE_SIGNATURE = "builtin-skill-first-boot-migration-v21"
+BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -214,7 +215,11 @@ async def startup_build_banner():
             limits=HTTP_LIMITS,
             headers={"Accept": "application/json"},
         )
-    print(f"FLAWLESS_BACKEND_BUILD version={APP_BUILD_VERSION} signature={APP_CODE_SIGNATURE}", flush=True)
+    print(
+        f"FLAWLESS_BACKEND_BUILD version={APP_BUILD_VERSION} "
+        f"signature={APP_CODE_SIGNATURE} skill_policy={BUILTIN_SKILL_POLICY_REVISION}",
+        flush=True,
+    )
 
 
 @app.on_event("shutdown")
@@ -238,6 +243,7 @@ async def build_info():
         "status": "ok",
         "version": APP_BUILD_VERSION,
         "signature": APP_CODE_SIGNATURE,
+        "builtin_skill_policy_revision": BUILTIN_SKILL_POLICY_REVISION,
         "server_module": "backend.app.main",
         "self_heal_run_signature": "request-json-body",
     }
@@ -12389,6 +12395,26 @@ async def _execute_ops_plan_once(
             "next_steps": next_steps,
             "message": verification["message"],
         }
+
+    if plan.get("changes"):
+        await emit(
+            "root_cause_diagnosed",
+            (
+                f"根因诊断已闭合：{plan.get('selected_skill_id') or '可执行恢复 Skill'} "
+                f"已根据实时日志、Pod/Workload YAML 与 Events 生成 {len(plan.get('changes') or [])} 项受控变更。"
+            ),
+            selected_skill_id=plan.get("selected_skill_id"),
+            permission_recovery_stage=plan.get("permission_recovery_stage"),
+            changes_total=len(plan.get("changes") or []),
+            level="success",
+        )
+        await emit(
+            "diagnosis_done",
+            "根因诊断完成，开始执行权限预检并等待逐项人工审批。",
+            selected_skill_id=plan.get("selected_skill_id"),
+            changes_total=len(plan.get("changes") or []),
+            level="success",
+        )
 
     root_contract_valid, root_contract_reason = _enforce_root_security_context_plan(plan)
     if not root_contract_valid:

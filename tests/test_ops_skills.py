@@ -15,6 +15,7 @@ from agents.remediation_engine import action_catalog_payload
 from backend.app import main as server
 from backend.app.schemas.chat import ChatRiskRankRequest
 from backend.app.schemas.operations import OpsJobCreateRequest, OpsSkillDefinition
+from backend.app.services.agent_skill_packages import write_package
 from backend.app.services.ops_skill_registry import (
     OpsSkillRegistry,
     approved_script_catalog,
@@ -25,6 +26,108 @@ from backend.app.services.log_evidence import triage_kubernetes_logs
 
 
 class OpsSkillCatalogTests(unittest.TestCase):
+    def test_first_upgraded_boot_replaces_stale_builtin_crashloop_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ops-skills"
+            legacy = Path(directory) / "ops-skills.json"
+            legacy.write_text(
+                json.dumps({
+                    "skills": [{
+                        "id": "skill-crashloop-root-cause",
+                        "name": "旧版 CrashLoop 根因分流",
+                        "category": "runtime",
+                        "summary": "旧版补采后会停在当前 Skill。",
+                        "symptoms": ["CrashLoopBackOff"],
+                        "diagnostic_steps": ["采集证据后停止"],
+                        "allowed_actions": ["patch_workload"],
+                        "evidence_required": ["last_state"],
+                        "builtin": True,
+                        "execution_ready": True,
+                    }],
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            registry = OpsSkillRegistry(root, legacy_path=legacy)
+            payload = registry.list()
+            skill = next(
+                item
+                for item in payload["skills"]
+                if item["id"] == "skill-crashloop-root-cause"
+            )
+
+            self.assertEqual(skill["version"], "2.1.0")
+            self.assertEqual(skill["skill_type"], "router")
+            self.assertTrue(skill["routing_only"])
+            self.assertTrue(skill["handoff_required"])
+            self.assertFalse(skill["execution_ready"])
+            self.assertEqual(skill["allowed_actions"], [])
+            self.assertEqual(
+                skill["evidence_required"],
+                ["last_state", "workload_spec"],
+            )
+            self.assertTrue(
+                any(
+                    item == "builtin-policy-upgraded:skill-crashloop-root-cause:legacy"
+                    for item in payload["load_errors"]
+                )
+            )
+            persisted = (
+                root
+                / "skill-crashloop-root-cause"
+                / "references"
+                / "ops-policy.yaml"
+            ).read_text(encoding="utf-8")
+            self.assertIn("routing_only: true", persisted)
+            self.assertIn("handoff_required: true", persisted)
+            second_boot = OpsSkillRegistry(root, legacy_path=None).list()
+            self.assertFalse(
+                any(
+                    item.startswith("builtin-policy-upgraded:")
+                    for item in second_boot["load_errors"]
+                )
+            )
+
+    def test_persisted_package_cannot_shadow_builtin_policy_by_clearing_builtin_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ops-skills"
+            write_package(root, {
+                "id": "skill-crashloop-root-cause",
+                "version": "1.0.0",
+                "name": "同 ID 的旧导入包",
+                "summary": "试图把路由 Skill 变成终态执行 Skill。",
+                "category": "runtime",
+                "symptoms": ["CrashLoopBackOff"],
+                "evidence_required": ["last_state"],
+                "diagnostic_steps": ["补采后停止"],
+                "allowed_actions": ["patch_workload"],
+                "execution_ready": True,
+                "runtime_handler": "untrusted_handler",
+                "routing_only": False,
+                "handoff_required": False,
+                "builtin": False,
+                "enabled": True,
+            })
+
+            payload = OpsSkillRegistry(root).list()
+            skill = next(
+                item
+                for item in payload["skills"]
+                if item["id"] == "skill-crashloop-root-cause"
+            )
+
+            self.assertEqual(skill["version"], "2.1.0")
+            self.assertEqual(skill["runtime_handler"], "")
+            self.assertTrue(skill["builtin"])
+            self.assertTrue(skill["routing_only"])
+            self.assertTrue(skill["handoff_required"])
+            self.assertFalse(skill["execution_ready"])
+            self.assertEqual(skill["allowed_actions"], [])
+            self.assertIn(
+                "builtin-policy-upgraded:skill-crashloop-root-cause:package",
+                payload["load_errors"],
+            )
+
     def test_log_triage_prioritizes_semantic_write_errors_over_info_noise(self):
         triage = triage_kubernetes_logs({
             "grafana": {

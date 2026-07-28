@@ -28,6 +28,10 @@ IMAGE = os.getenv("E2E_WORKLOAD_IMAGE", "flawless-local:latest")
 TIMEOUT_SECONDS = int(os.getenv("E2E_TIMEOUT_SECONDS", "300"))
 HTTP_TIMEOUT_SECONDS = float(os.getenv("E2E_HTTP_TIMEOUT_SECONDS", "130"))
 REQUIRE_LLM = os.getenv("E2E_REQUIRE_LLM", "false").lower() in {"1", "true", "yes", "on"}
+REQUIRE_STALE_SKILL_MIGRATION = os.getenv(
+    "E2E_REQUIRE_STALE_SKILL_MIGRATION",
+    "false",
+).lower() in {"1", "true", "yes", "on"}
 
 
 def kubectl(*args: str, stdin: dict | None = None) -> str:
@@ -176,6 +180,23 @@ def main() -> int:
     timeout = httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=5.0)
     with httpx.Client(base_url=BASE_URL, timeout=timeout) as client:
         build = client.get("/api/build").json()
+        skills_payload = client.get("/api/ops/skills").json()
+        crashloop_skill = next(
+            item
+            for item in (skills_payload.get("skills") or [])
+            if item.get("id") == "skill-crashloop-root-cause"
+        )
+        assert crashloop_skill.get("version") == "2.1.0", crashloop_skill
+        assert crashloop_skill.get("skill_type") == "router", crashloop_skill
+        assert crashloop_skill.get("routing_only") is True, crashloop_skill
+        assert crashloop_skill.get("handoff_required") is True, crashloop_skill
+        assert crashloop_skill.get("execution_ready") is False, crashloop_skill
+        assert crashloop_skill.get("allowed_actions") == [], crashloop_skill
+        if REQUIRE_STALE_SKILL_MIGRATION:
+            assert any(
+                str(item).startswith("builtin-policy-upgraded:skill-crashloop-root-cause:")
+                for item in (skills_payload.get("load_errors") or [])
+            ), skills_payload.get("load_errors")
         kubeconfig_text = KUBECONFIG.read_text(encoding="utf-8")
         cluster = client.post(
             "/api/clusters",
@@ -344,6 +365,11 @@ def main() -> int:
             "recovered_pod": recovered_pod,
             "diagnosis_source": (diagnosis.get("diagnosis_metadata") or {}).get("source"),
             "matched_skill": "skill-volume-permission-recovery",
+            "skill_policy_revision": build.get("builtin_skill_policy_revision"),
+            "stale_skill_migrated": any(
+                str(item).startswith("builtin-policy-upgraded:skill-crashloop-root-cause:")
+                for item in (skills_payload.get("load_errors") or [])
+            ),
             "approvals": len(approvals),
             "approval_actions": [item.get("action") for item in approvals],
             "stages": stages,

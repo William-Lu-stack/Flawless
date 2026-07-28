@@ -16,7 +16,19 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.14**.
+Current release: **3.2.15**.
+
+Release 3.2.15 makes built-in Skill policy upgrade-safe. On the first process
+start after an image upgrade, application-owned Skills now replace stale
+legacy JSON and directory-package policy with the shipped version while
+retaining the operator's enabled state. This prevents an older executable
+CrashLoop router from shadowing the current handoff-only definition and
+stalling after evidence refresh. Executable plans also emit explicit
+root-cause and diagnosis-complete events before approval. The release is
+covered by a real K3s workflow that creates a file/database permission failure,
+tries the non-root policy first, escalates through a second human approval to
+the complete root securityContext, patches the Deployment, and verifies the
+replacement Pod.
 
 Release 3.2.14 fixes the non-terminal CrashLoop diagnosis path. A generic
 CrashLoop Skill now performs resource discovery and scenario routing only; it
