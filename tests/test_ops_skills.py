@@ -889,8 +889,47 @@ class OpsSkillCatalogTests(unittest.TestCase):
             "plan": plan,
         })
         self.assertEqual(attached["changes"], [])
-        self.assertEqual(attached["decision"], "skill_evidence_required")
+        self.assertEqual(attached["decision"], "skill_evidence_collection_in_progress")
         self.assertTrue(any(item["evidence_missing"] for item in attached["operator_skills"]))
+        self.assertEqual(attached["steps"][0]["id"], "skill_evidence_refresh")
+        self.assertTrue(attached["skill_workflow_state"]["must_continue"])
+
+    def test_crashloop_router_is_non_terminal_and_schedules_active_evidence(self):
+        plan = {
+            "namespace": "default",
+            "target": "Deployment/api",
+            "summary": "CrashLoopBackOff",
+            "changes": [{
+                "type": "restart",
+                "namespace": "default",
+                "workload_type": "Deployment",
+                "workload_name": "api",
+            }],
+        }
+        attached = server._attach_operator_skills_to_plan(
+            plan,
+            {
+                "question": "CrashLoopBackOff",
+                "evidence": {
+                    "pod": {
+                        "name": "api-x",
+                        "containers": [{
+                            "name": "api",
+                            "reason": "CrashLoopBackOff",
+                            "restart_count": 4,
+                        }],
+                    },
+                },
+                "plan": plan,
+            },
+            preferred_skill_ids=["skill-crashloop-root-cause"],
+        )
+        self.assertEqual(attached["selected_skill_id"], "skill-crashloop-root-cause")
+        self.assertEqual(attached["changes"], [])
+        self.assertTrue(attached["operator_skills"][0]["routing_only"])
+        self.assertEqual(attached["decision"], "skill_router_collecting_evidence")
+        self.assertEqual(attached["steps"][0]["id"], "skill_evidence_refresh")
+        self.assertIn("workload_spec", attached["steps"][0]["evidence_ids"])
 
     def test_option_catalog_exposes_multiselect_fields(self):
         catalog = skill_option_catalog()
@@ -919,6 +958,12 @@ class OpsSkillCatalogTests(unittest.TestCase):
         self.assertTrue(all(skills[skill_id]["builtin"] for skill_id in expected))
         self.assertTrue(all(skills[skill_id]["progressive_evidence"] for skill_id in expected))
         self.assertTrue(all(not skills[skill_id]["execution_ready"] for skill_id in expected))
+        crashloop = skills["skill-crashloop-root-cause"]
+        self.assertEqual(crashloop["skill_type"], "router")
+        self.assertTrue(crashloop["routing_only"])
+        self.assertTrue(crashloop["handoff_required"])
+        self.assertTrue(crashloop["workflow_phases"])
+        self.assertIn("普通取证失败", crashloop["evidence_failure_policy"])
 
     def test_progressive_inspection_and_telemetry_skills_rank_for_their_intent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1180,6 +1225,136 @@ Collect evidence and explain the result. Do not mutate infrastructure.
 
 
 class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_skill_evidence_refresh_recollects_then_closes_contract(self):
+        shallow = {
+            "pod": {
+                "name": "grafana-x",
+                "containers": [{
+                    "name": "grafana",
+                    "reason": "CrashLoopBackOff",
+                    "restart_count": 4,
+                }],
+            },
+            "logs": {},
+        }
+        full = {
+            "pod": {
+                "name": "grafana-x",
+                "containers": [{
+                    "name": "grafana",
+                    "reason": "CrashLoopBackOff",
+                    "restart_count": 4,
+                    "security_context": {
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "runAsNonRoot": True,
+                    },
+                    "volume_mounts": [{
+                        "name": "data",
+                        "mount_path": "/var/lib/grafana",
+                    }],
+                }],
+                "security_context": {
+                    "runAsUser": 10001,
+                    "runAsGroup": 10001,
+                    "runAsNonRoot": True,
+                    "fsGroup": 10001,
+                    "supplementalGroups": [10001],
+                },
+            },
+            "logs": {
+                "grafana": {
+                    "current": (
+                        "GF_PATHS_DATA='/var/lib/grafana' is not writable\n"
+                        "Error: unable to open database file (14)"
+                    ),
+                    "previous": "",
+                },
+            },
+            "events": [],
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "grafana"},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "securityContext": {
+                                "runAsUser": 10001,
+                                "runAsGroup": 10001,
+                                "runAsNonRoot": True,
+                                "fsGroup": 10001,
+                                "supplementalGroups": [10001],
+                            },
+                            "containers": [{
+                                "name": "grafana",
+                                "securityContext": {
+                                    "runAsUser": 10001,
+                                    "runAsGroup": 10001,
+                                    "runAsNonRoot": True,
+                                },
+                                "volumeMounts": [{
+                                    "name": "data",
+                                    "mountPath": "/var/lib/grafana",
+                                }],
+                            }],
+                        },
+                    },
+                },
+            },
+            "storage": [{"pvc": "grafana", "pvc_phase": "Bound"}],
+        }
+        plan = {
+            "namespace": "default",
+            "target": "Deployment/grafana",
+            "pod_name": "grafana-x",
+            "_runtime_evidence": shallow,
+        }
+        step = {
+            "id": "skill_evidence_refresh",
+            "title": "主动补采",
+            "evidence_ids": [
+                "workload_spec",
+                "pod_security_context",
+                "current_logs",
+            ],
+        }
+        with patch.object(
+            server,
+            "_collect_plan_priority_evidence",
+            AsyncMock(return_value=full),
+        ), patch.object(
+            server,
+            "_collect_plan_deep_evidence",
+            AsyncMock(return_value=full),
+        ):
+            result = await server._collect_ops_step(step, plan)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["artifacts"]["remaining_evidence"], [])
+        self.assertIn("workload_spec", result["artifacts"]["newly_collected"])
+        rerouted = server._attach_operator_skills_to_plan(
+            {
+                **plan,
+                "summary": "CrashLoopBackOff",
+                "changes": [],
+            },
+            {
+                "question": "CrashLoopBackOff",
+                "evidence": plan["_runtime_evidence"],
+                "plan": plan,
+            },
+            preferred_skill_ids=["skill-crashloop-root-cause"],
+        )
+        self.assertEqual(
+            rerouted["selected_skill_id"],
+            "skill-volume-permission-recovery",
+        )
+        self.assertEqual(rerouted["permission_recovery_stage"], "root")
+        root_spec = rerouted["changes"][0]["patch"]["spec"]["template"]["spec"]
+        self.assertEqual(root_spec["securityContext"]["runAsUser"], 0)
+        self.assertEqual(root_spec["securityContext"]["runAsGroup"], 0)
+        self.assertEqual(root_spec["securityContext"]["fsGroup"], 0)
+        self.assertFalse(root_spec["securityContext"]["runAsNonRoot"])
+
     async def test_remote_sre_chat_plan_uses_rancher_transport_by_cluster_identity(self):
         plan = {
             "source": "sre_chat",
@@ -1708,7 +1883,9 @@ class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
             plan = result["plan"]
             self.assertEqual(plan["preview_mode"], "live_evidence_ai")
             self.assertEqual(plan["target"], "Deployment/orders-api")
-            self.assertEqual(plan["changes"][0]["workload_name"], "orders-api")
+            self.assertEqual(plan["changes"], [])
+            self.assertEqual(plan["selected_skill_id"], "skill-crashloop-root-cause")
+            self.assertTrue(plan["skill_workflow_state"]["must_continue"])
             self.assertEqual(plan["evidence_summary"]["events"], 1)
             self.assertEqual(plan["target_binding"], "inspection_finding_id")
         finally:

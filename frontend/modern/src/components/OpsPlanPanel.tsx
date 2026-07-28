@@ -24,7 +24,7 @@ const ACTIVE_STATUSES = new Set(["queued", "running", "awaiting_approval", "resu
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "unresolved", "blocked"]);
 const ACTIVE_EVENT_STAGES = new Set([
   "queued", "starting", "attempt", "collecting_priority_logs", "collecting_evidence", "step_start", "step_waiting",
-  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "skill_routed", "evidence_plan_ready", "skill_chain_ready", "execution_preflight", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
+  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "skill_routed", "evidence_plan_ready", "skill_evidence_refreshed", "skill_chain_ready", "execution_preflight", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
   "continuation_wait", "resume_pending",
 ]);
 const EXECUTION_PHASES = ["采集证据", "根因诊断", "提交变更", "恢复验证"];
@@ -66,6 +66,7 @@ function stageLabel(stage: unknown) {
     diagnosis_done: "根因诊断完成",
     skill_routed: "Skill 动态路由",
     evidence_plan_ready: "渐进取证计划",
+    skill_evidence_refreshed: "Skill 证据已补采",
     skill_chain_ready: "Skill 执行链",
     step_waiting: "诊断进行中",
     step_start: "诊断开始",
@@ -134,7 +135,7 @@ function eventIcon(event: any, active: boolean) {
 function phaseIndex(stage: unknown) {
   const value = String(stage || "");
   if (["queued", "starting", "attempt", "release_gate", "collecting_priority_logs", "pod_logs_collected", "pod_logs_unavailable", "collecting_evidence", "collecting_evidence_done"].includes(value)) return 0;
-  if (["log_triage_done", "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "root_cause_diagnosed", "diagnosis_done", "skill_routed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
+  if (["log_triage_done", "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "root_cause_diagnosed", "diagnosis_done", "skill_routed", "skill_evidence_refreshed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
   if (["execution_preflight", "execution_preflight_done", "execution_permission_blocked", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting", "change_done"].includes(value)) return 2;
   if (["verifying", "verification_done", "recovered"].includes(value)) return 3;
   return 1;

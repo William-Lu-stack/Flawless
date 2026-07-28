@@ -86,11 +86,11 @@ names=(
   "Approved Node Executor"
 )
 sources=(
-  "ghcr.dockerproxy.net/your-org/flawless:3.2.13"
+  "ghcr.dockerproxy.net/your-org/flawless:3.2.14"
   "ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36"
 )
 targets=(
-  "your-org/flawless:3.2.13"
+  "your-org/flawless:3.2.14"
   "your-org/flawless-node-exec:1.36"
 )
 

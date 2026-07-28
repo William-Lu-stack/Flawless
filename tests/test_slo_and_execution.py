@@ -645,6 +645,24 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             ],
             "changes": [],
         }
+        # Reproduce the production timing bug: the first collection only knows
+        # CrashLoopBackOff, while the targeted Skill refresh obtains logs and
+        # the owning Deployment on the second pass.
+        shallow_evidence = {
+            "namespace": "monitoring",
+            "pod_name": "grafana-abc",
+            "pod": {
+                "name": "grafana-abc",
+                "namespace": "monitoring",
+                "ready": False,
+                "containers": [{
+                    "name": "grafana",
+                    "reason": "CrashLoopBackOff",
+                    "restart_count": 5,
+                }],
+            },
+            "logs": {},
+        }
         simulated_cluster = {
             "workload_security": copy.deepcopy(
                 evidence["workload"]["spec"]["template"]["spec"]["securityContext"]
@@ -694,11 +712,11 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(server, "_ops_release_gate", return_value={"allowed": True}), patch.object(
             server,
             "_collect_plan_priority_evidence",
-            AsyncMock(return_value=evidence),
+            AsyncMock(side_effect=[shallow_evidence, evidence]),
         ), patch.object(
             server,
             "_collect_plan_deep_evidence",
-            AsyncMock(return_value=evidence),
+            AsyncMock(side_effect=[shallow_evidence, evidence]),
         ), patch.object(
             server,
             "_probe_plan_recovery",
@@ -761,6 +779,8 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 stages = [event.get("stage") for event in job.get("events") or []]
                 self.assertIn("diagnosing", stages)
                 self.assertIn("diagnosis_done", stages)
+                self.assertIn("skill_evidence_refreshed", stages)
+                self.assertIn("root_cause_diagnosed", stages)
                 self.assertIn("awaiting_change_approval", stages)
                 pending = job["pending_approval"]
                 approval_response = await client.post(

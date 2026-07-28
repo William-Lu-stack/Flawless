@@ -16,9 +16,19 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.13**.
+Current release: **3.2.14**.
 
-Release 3.2.13 adapts the strongest reusable patterns from the STAROps official
+Release 3.2.14 fixes the non-terminal CrashLoop diagnosis path. A generic
+CrashLoop Skill now performs resource discovery and scenario routing only; it
+cannot own a mutation or end an incident. Missing Skill evidence becomes an
+active Kubernetes refresh followed by immediate rerouting, and recently
+collected live evidence survives a transient retry failure instead of being
+replaced by an empty result. Direct write-path proof now deterministically
+promotes the volume-permission Skill, which can produce the complete
+`runAsUser/runAsGroup/fsGroup=0`, `runAsNonRoot=false` fallback behind a fresh
+human approval, then redeploy and verify the new Pod.
+
+Release 3.2.13 adapted the strongest reusable patterns from the STAROps official
 Skill catalog into vendor-neutral built-in Skills for progressive Kubernetes,
 node and database inspection, observability-pipeline diagnosis, verified
 PromQL/LogQL/TraceQL generation, and topology/eBPF data modeling. The runtime

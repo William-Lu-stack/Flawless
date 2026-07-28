@@ -504,7 +504,8 @@ Deep evidence: {json.dumps(safe_diagnostics, ensure_ascii=False)[:14000]}
 11. 对每个候选根因列出支持证据和反证。不要因为 Skill 名称、用户描述或单个相似词强行命中；先输出候选根因，再选择主 Skill。主 Skill 的某一阶段验证失败不等于整个 Skill 失败，可连续 Skill 应基于失败后新证据进入下一阶段。
 12. 如果日志同时明确给出某个配置路径 `is not writable`、数据库/lock/WAL 在该路径启动失败，且 Pod YAML 证明该路径位于 volumeMount、securityContext 强制非 root，必须把 `root_workload_security_context` 列为候选策略；若其证据强度最高可作为 strategy_id。它仍是高风险提案，必须由服务端复核实时 YAML 并人工审批，不能直接执行。若存在 no space、I/O、数据库损坏或 NFS root_squash 证据，应降低该策略并列出反证。
 13. 严格按证据成本排序：先读 log_triage.priority 中的 ERROR/FATAL/PANIC 和 WARNING，再读 previous/current 原始日志尾部；仍不能闭合根因时才扩展到 Pod 状态、Workload YAML、Events、存储链和依赖拓扑。若高优先级日志已经与实时 YAML 闭合出本地根因，不得把 dependency_topology/CMDB 作为恢复前置步骤。
-14. 对写路径权限类新故障，即便 root 候选评分最高，也必须先提出保持业务容器非 root 的 UID/GID/fsGroup 对齐阶段；只有该阶段已经执行且新 Pod 验证仍失败，才进入另一次人工审批的 root 阶段。每个阶段后都要验证新 Pod Ready、错误日志消失且重启数稳定，未恢复就依据新证据继续同一 Skill 的下一阶段。
+14. 对写路径权限类新故障，优先保持业务容器非 root 并对齐 UID/GID/fsGroup；但如果实时 Workload 已经完整使用同值非 root securityContext，而当前新日志仍明确报同一挂载路径不可写，则该配置本身就是“非 root 阶段已失败”的证据，禁止再生成完全相同的无效补丁，可以提出需单独人工审批的完整 root 兜底。每个阶段后都要验证新 Pod Ready、错误日志消失且重启数稳定，未恢复就依据新证据继续同一 Skill 的下一阶段。
+15. `skill-crashloop-root-cause` 只是非终态分流器，不拥有写动作，也不能作为最终 selected_skill_id。它必须主动补采缺失证据，并交接给权限、PVC/PV、OOM、探针、配置、镜像或依赖等具体 Skill；普通探针失败应记录后继续其他证据通道。
 
 只返回 JSON，不要任何其他内容。"""
 

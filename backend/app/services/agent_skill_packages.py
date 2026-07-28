@@ -85,6 +85,18 @@ def render_skill_md(skill: dict[str, Any]) -> str:
         item for item in (skill.get("progressive_evidence") or [])
         if isinstance(item, dict)
     ]
+    workflow_phases = [
+        item for item in (skill.get("workflow_phases") or [])
+        if isinstance(item, dict)
+    ]
+    evidence_failure_policy = str(
+        skill.get("evidence_failure_policy")
+        or "Record a failed probe and continue with the remaining evidence channels; pause only when the target is absent or read authorization is unavailable."
+    ).strip()
+    completion_contract = str(
+        skill.get("completion_contract")
+        or "Do not report recovery until the host has verified the declared success criteria against fresh runtime evidence."
+    ).strip()
     rollback = str(skill.get("rollback") or "Use the recorded pre-change state or the platform-approved rollback action.").strip()
 
     def bullets(values: list[str], empty: str) -> str:
@@ -104,6 +116,20 @@ def render_skill_md(skill: dict[str, Any]) -> str:
     )
     if not progressive:
         progressive = "1. Load the cheapest direct evidence first, then expand only when it can distinguish remaining root-cause candidates."
+    mandatory_workflow = "\n".join(
+        (
+            f"{index}. **{str(phase.get('id') or f'Phase {index}')}** "
+            f"{'(MUST)' if phase.get('must', True) else '(optional)'} — "
+            f"{str(phase.get('description') or 'Complete this phase before advancing.')}"
+        )
+        for index, phase in enumerate(workflow_phases, 1)
+    )
+    if not mandatory_workflow:
+        mandatory_workflow = (
+            "1. **target_discovery (MUST)** — Resolve the exact target before scenario routing.\n"
+            "2. **diagnosis (MUST)** — Collect direct evidence and select one root-cause path.\n"
+            "3. **verification (MUST)** — Verify observable recovery after an approved change."
+        )
     body = f"""
 # {title}
 
@@ -124,6 +150,10 @@ Collect and validate these evidence classes before proposing a change:
 ## Workflow
 
 {workflow}
+
+## Mandatory Phase Workflow
+
+{mandatory_workflow}
 
 ## Progressive Evidence Plan
 
@@ -146,7 +176,8 @@ Do not report success until the following observable conditions hold:
 - Distinguish symptoms from root cause and cite the evidence supporting each conclusion.
 - Preview the target, impact, diff, risk, and rollback before any mutation.
 - Use the smallest reversible change and require human approval for production or high-risk actions.
-- Stop when required evidence is missing, the target is outside scope, or recovery cannot be verified.
+- Evidence failure policy: {evidence_failure_policy}
+- Completion contract: {completion_contract}
 - Never invent credentials, storage paths, image tags, Secret values, or successful execution results.
 - Roll back with: {rollback}
 
@@ -188,6 +219,11 @@ def render_ops_policy(skill: dict[str, Any]) -> str:
             "selection_role": str(skill.get("selection_role") or "primary"),
             "dimensions": list(skill.get("dimensions") or []),
             "progressive_evidence": deepcopy(skill.get("progressive_evidence") or []),
+            "routing_only": bool(skill.get("routing_only", False)),
+            "handoff_required": bool(skill.get("handoff_required", False)),
+            "workflow_phases": deepcopy(skill.get("workflow_phases") or []),
+            "evidence_failure_policy": str(skill.get("evidence_failure_policy") or ""),
+            "completion_contract": str(skill.get("completion_contract") or ""),
         },
         "guardrails": {
             "risk": str(skill.get("risk") or "medium"),
@@ -337,6 +373,11 @@ def read_package(package_dir: Path) -> dict[str, Any]:
         "selection_role": str(workflow.get("selection_role") or "primary"),
         "dimensions": list(workflow.get("dimensions") or []),
         "progressive_evidence": list(workflow.get("progressive_evidence") or []),
+        "routing_only": bool(workflow.get("routing_only", False)),
+        "handoff_required": bool(workflow.get("handoff_required", False)),
+        "workflow_phases": list(workflow.get("workflow_phases") or []),
+        "evidence_failure_policy": str(workflow.get("evidence_failure_policy") or ""),
+        "completion_contract": str(workflow.get("completion_contract") or ""),
         "package_path": str(package_dir),
         "package_files": sum(1 for path in package_dir.rglob("*") if path.is_file()),
         "bundled_scripts": script_files,

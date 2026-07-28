@@ -187,8 +187,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.13")
-APP_CODE_SIGNATURE = "progressive-skill-orchestration-v19"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.14")
+APP_CODE_SIGNATURE = "active-evidence-skill-handoff-v20"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -7570,6 +7570,37 @@ def _merge_ops_evidence(priority: dict, deep: dict) -> dict:
     return merged
 
 
+def _recent_runtime_evidence(plan: dict, *, max_age_seconds: int = 120) -> dict:
+    """Return same-plan evidence that is fresh enough to survive a transient retry.
+
+    A just-completed Skill refresh is already live Kubernetes evidence. The
+    approval pass still tries every collector again, but a single transient
+    timeout must not replace that proof with an empty error object.
+    """
+    evidence = plan.get("_runtime_evidence")
+    if not isinstance(evidence, dict) or not (
+        evidence.get("pod") or evidence.get("logs") or evidence.get("workload")
+    ):
+        return {}
+    captured = str(
+        plan.get("_runtime_evidence_captured_at")
+        or evidence.get("captured_at")
+        or ""
+    ).strip()
+    if not captured:
+        return {}
+    try:
+        captured_at = datetime.fromisoformat(captured.replace("Z", "+00:00"))
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - captured_at).total_seconds()
+    except (TypeError, ValueError):
+        return {}
+    if age < 0 or age > max(5, max_age_seconds):
+        return {}
+    return copy.deepcopy(evidence)
+
+
 async def _collect_plan_deep_evidence(plan: dict) -> dict:
     namespace = plan.get("namespace") or "default"
     pod_name = _target_pod_from_plan(plan)
@@ -7896,6 +7927,83 @@ async def _collect_ops_step(step: dict, plan: dict) -> dict:
     # through to title matching and loses the already collected evidence.
     probe_id = str(step.get("id") or step.get("probe") or "")
     deep = plan.get("_runtime_evidence") or {}
+    if probe_id == "skill_evidence_refresh":
+        evidence_ids = [
+            str(item).strip()
+            for item in (step.get("evidence_ids") or [])
+            if str(item).strip()
+        ]
+        before = _collected_skill_evidence({"evidence": deep})
+        priority_refresh: dict = {}
+        deep_refresh: dict = {}
+        refresh_errors: list[str] = []
+        try:
+            priority_refresh = await _collect_plan_priority_evidence(plan)
+        except Exception as exc:
+            refresh_errors.append(
+                f"priority:{type(exc).__name__}: {_redact_text(str(exc))}"
+            )
+        try:
+            deep_refresh = await _collect_plan_deep_evidence(plan)
+        except Exception as exc:
+            refresh_errors.append(
+                f"deep:{type(exc).__name__}: {_redact_text(str(exc))}"
+            )
+        refreshed = _merge_ops_evidence(
+            _merge_ops_evidence(deep, priority_refresh),
+            deep_refresh,
+        )
+        refreshed["log_triage"] = _redact_sensitive(
+            triage_kubernetes_logs(refreshed.get("logs") or {})
+        )
+        plan["_runtime_evidence"] = refreshed
+        after = _collected_skill_evidence({"evidence": refreshed})
+        required_ids = [
+            str(item).strip()
+            for item in (step.get("evidence_required") or [])
+            if str(item).strip()
+        ]
+        any_of_groups = [
+            [str(item).strip() for item in group if str(item).strip()]
+            for group in (step.get("evidence_any_of") or [])
+            if isinstance(group, (list, tuple))
+        ]
+        remaining = [item for item in required_ids if item not in after]
+        for group in any_of_groups:
+            if group and not any(item in after for item in group):
+                remaining.extend(group)
+        remaining = list(dict.fromkeys(remaining))
+        newly_collected = sorted(after - before)
+        status = "completed" if not remaining else "warning"
+        captured_at = datetime.now(timezone.utc).isoformat()
+        refreshed["captured_at"] = captured_at
+        plan["_runtime_evidence_captured_at"] = captured_at
+        plan["_skill_evidence_refresh_completed"] = {
+            "requested": evidence_ids,
+            "newly_collected": newly_collected,
+            "remaining": remaining,
+            "errors": refresh_errors,
+        }
+        logs.append(
+            f"[skill-evidence] requested={','.join(evidence_ids) or '-'} "
+            f"new={','.join(newly_collected) or '-'} remaining={','.join(remaining) or '-'}"
+        )
+        logs.extend(f"[warn] {error}" for error in refresh_errors)
+        artifacts.update({
+            "probe_id": probe_id,
+            "requested_evidence": evidence_ids,
+            "newly_collected": newly_collected,
+            "remaining_evidence": remaining,
+            "collection_errors": refresh_errors,
+            "log_triage": refreshed.get("log_triage") or {},
+        })
+        return {
+            **step,
+            "status": status,
+            "logs": _redact_sensitive(logs),
+            "artifacts": _redact_sensitive(artifacts),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
     if probe_id and deep and not deep.get("error"):
         artifacts["probe_id"] = probe_id
         if probe_id in {"current_logs", "previous_logs"}:
@@ -7941,8 +8049,16 @@ async def _collect_ops_step(step: dict, plan: dict) -> dict:
                 for event in artifacts["events"]
             )
         elif probe_id == "workload_spec":
-            artifacts["workload"] = deep.get("workload") or {}
-            logs.append("[workload] fetched live workload template and rollout status")
+            workload = deep.get("workload") or {}
+            artifacts["workload"] = workload
+            if not workload or workload.get("error"):
+                status = "warning"
+                logs.append(
+                    f"[warn] workload YAML unavailable: "
+                    f"{_redact_text(str(workload.get('error') or 'empty response'))}"
+                )
+            else:
+                logs.append("[workload] fetched live workload template and rollout status")
         elif probe_id in {"service_endpoints", "dns", "network_policy", "mesh_routes", "dependency_topology"}:
             artifacts["network"] = {"services": deep.get("services", []), "pod": deep.get("pod", {})}
             logs.append(f"[network] services/endpoints evidence count={len(deep.get('services') or [])}")
@@ -11033,8 +11149,11 @@ async def _evidence_based_replan(
                 "Pod/容器 securityContext、挂载、PVC/PV、最近配置与匹配 Skill，再给出实际 YAML Patch、重新发布方式或受审批命令。"
                 "不要只识别 permission denied 字面量。unable/can't open database file、readonly database、lock/WAL/PID/temp file "
                 "创建或打开失败都可能是写路径权限、错误路径/挂载、磁盘满或数据库损坏；必须列出支持与反证，并用 YAML/Events 关联后再选 Skill。"
-                "写路径权限类新故障必须先保持业务容器非 root 并对齐 UID/GID/fsGroup；只有该阶段执行后新 Pod 验证仍失败，"
-                "才允许在下一张独立审批单中把实际失败容器升级为 root。不能在首次方案中跳过非 root 阶段。"
+                "写路径权限类新故障优先保持业务容器非 root 并对齐 UID/GID/fsGroup；如果实时 Workload 已完整采用同值"
+                "非 root securityContext，而当前日志仍明确报同一挂载路径不可写，该实时失败配置即视为非 root 阶段已失败，"
+                "禁止重复同值 Patch，可以在独立审批单中提出完整 root 兜底。"
+                "skill-crashloop-root-cause 只是非终态分流器，不拥有写动作；它必须补采证据并交接给具体可执行 Skill，"
+                "不能作为最终 selected_skill_id。普通证据探针失败要记录后继续其他通道。"
                 "只有匹配 Skill 允许时才可提出 run_shell/exec_pod/exec_node，并必须给 command、明确目标、timeout_seconds、reason、rollback。"
                 "通常只执行最高匹配的一个 Skill；只有两个根因跨不同领域且后一个明确依赖前一个结果时，才串行给 secondary_skill_ids，"
                 "并为每条依赖给出 {from_skill_id,to_skill_id,reason,gate_evidence}。缺少依赖原因或启动证据时 secondary_skill_ids 必须为空，不能并行乱用多个。"
@@ -11774,8 +11893,26 @@ async def _execute_ops_plan_once(
         )
     except Exception as exc:
         deep_enrichment = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
-    plan["_runtime_evidence"] = _merge_ops_evidence(priority_evidence, deep_enrichment)
+    newly_collected_evidence = _merge_ops_evidence(
+        priority_evidence,
+        deep_enrichment,
+    )
+    recent_evidence = _recent_runtime_evidence(
+        plan,
+        max_age_seconds=max(
+            30,
+            int(os.getenv("OPS_RECENT_EVIDENCE_REUSE_SECONDS", "120")),
+        ),
+    )
+    plan["_runtime_evidence"] = (
+        _merge_ops_evidence(recent_evidence, newly_collected_evidence)
+        if recent_evidence else
+        newly_collected_evidence
+    )
     deep_evidence = plan.get("_runtime_evidence") or {}
+    captured_at = datetime.now(timezone.utc).isoformat()
+    deep_evidence["captured_at"] = captured_at
+    plan["_runtime_evidence_captured_at"] = captured_at
     deep_evidence["log_triage"] = _redact_sensitive(
         triage_kubernetes_logs(deep_evidence.get("logs") or {})
     )
@@ -12134,6 +12271,73 @@ async def _execute_ops_plan_once(
             level="warning" if step_status == "warning" else "success",
         )
 
+    refresh_receipt = plan.get("_skill_evidence_refresh_completed")
+    if (
+        isinstance(refresh_receipt, dict)
+        and not plan.get("changes")
+        and runtime_skill_replacement is None
+    ):
+        await emit(
+            "skill_evidence_refreshed",
+            (
+                "主 Skill 缺失证据已主动补采，正在用新增日志、Pod/Workload YAML、"
+                "Events 与存储状态立即重新路由。"
+            ),
+            evidence_refresh=refresh_receipt,
+            level="success" if not refresh_receipt.get("remaining") else "warning",
+        )
+        refreshed_candidate = copy.deepcopy(plan)
+        refreshed_candidate["steps"] = [
+            step
+            for step in (refreshed_candidate.get("steps") or [])
+            if not (
+                isinstance(step, dict)
+                and str(step.get("id") or step.get("probe") or "")
+                == "skill_evidence_refresh"
+            )
+        ]
+        refreshed_evidence = refreshed_candidate.get("_runtime_evidence") or {}
+        _attach_operator_skills_to_plan(
+            refreshed_candidate,
+            _skill_signal_payload(
+                question=str(
+                    refreshed_candidate.get("summary")
+                    or refreshed_candidate.get("reason")
+                    or refreshed_candidate.get("title")
+                    or ""
+                ),
+                alert={
+                    "cluster": refreshed_candidate.get("cluster"),
+                    "cluster_id": refreshed_candidate.get("cluster_id"),
+                    "namespace": refreshed_candidate.get("namespace"),
+                    "target": refreshed_candidate.get("target"),
+                    "pod": _target_pod_from_plan(refreshed_candidate),
+                },
+                diagnosis={
+                    "root_cause": refreshed_candidate.get("root_cause")
+                    or refreshed_candidate.get("summary")
+                    or "",
+                    "signals": refreshed_evidence.get("events") or [],
+                },
+                evidence=refreshed_evidence,
+                plan=refreshed_candidate,
+            ),
+        )
+        if refreshed_candidate.get("changes"):
+            preflight_replans = [refreshed_candidate]
+            preflight_conflict = True
+            await emit(
+                "root_cause_diagnosed",
+                (
+                    f"补采证据后已从通用分流切换到 "
+                    f"{refreshed_candidate.get('selected_skill_id') or '具体恢复 Skill'}，"
+                    "并生成需人工确认的受控变更。"
+                ),
+                selected_skill_id=refreshed_candidate.get("selected_skill_id"),
+                skill_evidence_override=refreshed_candidate.get("skill_evidence_override"),
+                level="success",
+            )
+
     if preflight_conflict:
         meta = plan.get("_runtime_replan") or {}
         evidence_gap = str(meta.get("evidence_gap") or "实时证据与原方案冲突，需要核对新的最小变更。")
@@ -12146,7 +12350,10 @@ async def _execute_ops_plan_once(
                 if has_candidate else
                 "根因已重新定位，但缺少创建安全变更所需的批准参数；原变更已取消。"
             ),
-            "proof": "实时 Events、PVC/PV 状态与原动作不匹配，系统未提交已失效的变更。",
+            "proof": (
+                "主动补采或实时证据复核后，系统已重新匹配具体根因 Skill；"
+                "旧动作未复用，新变更必须重新审批。"
+            ),
             "blocked_reason": evidence_gap,
             "operator_steps": (
                 ["核对下方新方案的目标、资源清单与回滚方式。", "高风险存储变更需要重新勾选确认后执行。"]
@@ -13041,6 +13248,11 @@ def _public_skill_match(match: dict) -> dict:
         "execution_model": skill.get("execution_model") or "host_action_mapping",
         "runtime_handler": skill.get("runtime_handler") or "",
         "continuation_capable": bool(skill.get("continuation_capable")),
+        "routing_only": bool(skill.get("routing_only")),
+        "handoff_required": bool(skill.get("handoff_required")),
+        "workflow_phases": skill.get("workflow_phases") or [],
+        "evidence_failure_policy": skill.get("evidence_failure_policy") or "",
+        "completion_contract": skill.get("completion_contract") or "",
         "execution_authorized": bool(match.get("_execution_authorized")),
         "evidence_collected": match.get("_evidence_collected") or [],
         "evidence_missing": match.get("_evidence_missing") or [],
@@ -13105,23 +13317,26 @@ def _skill_progressive_evidence_plan(skill: dict, collected: set[str]) -> list[d
         present = [item for item in evidence_ids if item in collected]
         missing = [item for item in evidence_ids if item not in collected]
         optional = bool(stage.get("optional", False))
+        any_of = bool(stage.get("any_of", False))
+        stage_complete = bool(present) if any_of else not missing
         result.append({
             "sequence": index,
             "stage": str(stage.get("stage") or f"stage-{index}"),
             "status": (
                 "completed"
-                if not missing else
+                if stage_complete else
                 "optional"
                 if optional else
                 "pending"
             ),
             "optional": optional,
+            "any_of": any_of,
             "evidence": [
                 {"id": item, "label": labels.get(item, item), "collected": item in collected}
                 for item in evidence_ids
             ],
             "collected": present,
-            "missing": missing,
+            "missing": [] if stage_complete and any_of else missing,
             "stop_when": str(stage.get("stop_when") or ""),
         })
     return result
@@ -13333,7 +13548,7 @@ def _collected_skill_evidence(signal: dict) -> set[str]:
     if pod and "security_context" in pod:
         collected.add("pod_security_context")
     workload = evidence.get("workload") if isinstance(evidence.get("workload"), dict) else {}
-    if workload:
+    if workload and not workload.get("error"):
         collected.update({"workload_spec", "recent_changes"})
     storage = evidence.get("storage") if isinstance(evidence.get("storage"), list) else []
     if storage:
@@ -13412,6 +13627,191 @@ def _record_skill_route_once(plan: dict, skill_id: str, event: str, *, stage: st
     )
 
 
+def _promote_evidence_specific_skill(
+    plan: dict,
+    signal: dict,
+    matches: list[dict],
+) -> tuple[list[dict], dict]:
+    """Let specific live root-cause proof outrank a generic symptom router.
+
+    The statistical router remains useful when only CrashLoopBackOff is known,
+    but a direct/indirect write-path failure correlated with mounts or a
+    securityContext is stronger evidence than the generic CrashLoop label.
+    """
+    evidence = signal.get("evidence") if isinstance(signal, dict) else {}
+    evidence = evidence if isinstance(evidence, dict) else {}
+    classifier_plan = copy.deepcopy(plan)
+    classifier_plan["evidence"] = {
+        **(classifier_plan.get("evidence") or {}),
+        **evidence,
+    }
+    classifier_plan["_runtime_evidence"] = evidence
+    hypothesis = classify_volume_write_failure(
+        classifier_plan,
+        str(
+            signal.get("question")
+            or plan.get("summary")
+            or plan.get("reason")
+            or ""
+        ),
+    )
+    permission_proven = bool(
+        hypothesis.get("detected")
+        and float(hypothesis.get("confidence") or 0) >= 0.62
+    )
+    if permission_proven:
+        permission_index = next(
+            (
+                index
+                for index, match in enumerate(matches)
+                if str((match.get("skill") or {}).get("id") or "")
+                == VOLUME_PERMISSION_SKILL_ID
+            ),
+            None,
+        )
+        if permission_index is not None:
+            promoted = matches.pop(permission_index)
+            evidence_confidence = float(hypothesis.get("confidence") or 0)
+            promoted["confidence"] = max(
+                float(promoted.get("confidence") or 0),
+                evidence_confidence,
+            )
+            promoted["score"] = max(
+                float(promoted.get("score") or 0),
+                evidence_confidence,
+            )
+            promoted["why"] = (
+                f"{str(promoted.get('why') or '').strip()} "
+                "服务端实时证据覆盖：写路径错误已由日志、挂载或 securityContext "
+                "形成专用根因假设，优先于通用 CrashLoop 分流。"
+            ).strip()
+            promoted["evidence_override"] = {
+                "engine": "VolumeWriteFailureClassifier/v2",
+                "signal_class": hypothesis.get("signal_class"),
+                "confidence": evidence_confidence,
+                "candidate_path": hypothesis.get("candidate_path"),
+                "corroboration": hypothesis.get("corroboration") or [],
+            }
+            return [promoted, *matches], promoted["evidence_override"]
+
+    # Historical success must not make a concrete recovery Skill own a vague
+    # CrashLoop incident. With no specific root-cause proof, keep the explicit
+    # non-terminal router in front and let active evidence collection decide.
+    signal_text = json.dumps(
+        {
+            "question": signal.get("question"),
+            "alert": signal.get("alert"),
+            "diagnosis": signal.get("diagnosis"),
+            "evidence": evidence,
+        },
+        ensure_ascii=False,
+        default=str,
+    ).lower()
+    crashloop_signal = any(
+        term in signal_text
+        for term in ("crashloopbackoff", "back-off restarting", "backoff")
+    )
+    specific_signal = any(
+        term in signal_text
+        for term in (
+            "oomkilled", "exit code 137", "failedmount", "failedattachvolume",
+            "imagepullbackoff", "errimagepull", "probe failed",
+            "configmap not found", "secret not found", "no persistent volumes",
+            "not writable", "permission denied", "read-only file system",
+            "unable to open database", "can't open database",
+        )
+    )
+    if crashloop_signal and not specific_signal:
+        router_index = next(
+            (
+                index
+                for index, match in enumerate(matches)
+                if str((match.get("skill") or {}).get("id") or "")
+                == "skill-crashloop-root-cause"
+            ),
+            None,
+        )
+        if router_index is not None:
+            router = matches.pop(router_index)
+            router["confidence"] = max(
+                float(router.get("confidence") or 0),
+                0.72,
+            )
+            router["score"] = max(float(router.get("score") or 0), 0.72)
+            router["why"] = (
+                f"{str(router.get('why') or '').strip()} "
+                "当前只有 CrashLoop 症状而没有具体根因证据，必须先由非终态分流器主动取证。"
+            ).strip()
+            override = {
+                "engine": "CrashLoopEvidenceGate/v1",
+                "signal_class": "generic_crashloop_only",
+                "confidence": 0.72,
+            }
+            return [router, *matches], override
+    return matches, {}
+
+
+def _missing_skill_evidence_ids(skill: dict, collected: set[str]) -> list[str]:
+    missing = [
+        str(item).strip()
+        for item in (skill.get("evidence_required") or [])
+        if str(item).strip() and str(item).strip() not in collected
+    ]
+    for group in skill.get("evidence_any_of") or []:
+        if not isinstance(group, (list, tuple)):
+            continue
+        values = [str(item).strip() for item in group if str(item).strip()]
+        if values and not any(item in collected for item in values):
+            missing.extend(values)
+    return list(dict.fromkeys(missing))
+
+
+def _ensure_active_skill_evidence_step(
+    plan: dict,
+    skill: dict,
+    collected: set[str],
+) -> list[str]:
+    """Turn a missing Skill contract into an executable refresh, not a dead end."""
+    missing = _missing_skill_evidence_ids(skill, collected)
+    if not missing:
+        return []
+    steps = [
+        step if isinstance(step, dict) else {"title": str(step)}
+        for step in (plan.get("steps") or [])
+    ]
+    steps = [
+        step
+        for step in steps
+        if str(step.get("id") or step.get("probe") or "") != "skill_evidence_refresh"
+    ]
+    steps.insert(0, {
+        "id": "skill_evidence_refresh",
+        "probe": "skill_evidence_refresh",
+        "title": f"主动补采主 Skill 证据：{skill.get('name') or skill.get('id')}",
+        "description": (
+            "重新读取目标 Pod current/previous logs、状态 YAML、Events、"
+            "拥有它的 Workload 和存储链；普通探针失败会记录后继续，补采后立即重新路由。"
+        ),
+        "evidence_ids": missing,
+        "evidence_required": [
+            str(item).strip()
+            for item in (skill.get("evidence_required") or [])
+            if str(item).strip()
+        ],
+        "evidence_any_of": [
+            [str(item).strip() for item in group if str(item).strip()]
+            for group in (skill.get("evidence_any_of") or [])
+            if isinstance(group, (list, tuple))
+        ],
+        "status": "pending",
+        "sequence": 0,
+        "must_continue": True,
+    })
+    plan["steps"] = steps
+    plan["skill_next_evidence"] = missing
+    return missing
+
+
 def _attach_operator_skills_to_plan(
     plan: dict,
     signal: dict,
@@ -13472,6 +13872,11 @@ def _attach_operator_skills_to_plan(
         )
     ]
     matches = matches[:max(5, top_k)]
+    matches, evidence_override = _promote_evidence_specific_skill(
+        plan,
+        signal,
+        matches,
+    )
     for index, match in enumerate(matches, start=1):
         match["rank"] = index
         skill_id = str((match.get("skill") or {}).get("id") or "")
@@ -13519,6 +13924,8 @@ def _attach_operator_skills_to_plan(
     plan["skill_execution_mode"] = "adaptive_serial"
     plan["skill_execution_threshold"] = float(result.get("execution_threshold") or 0.70)
     plan["skill_selection_algorithm"] = copy.deepcopy(result.get("selection_algorithm") or {})
+    if evidence_override:
+        plan["skill_evidence_override"] = evidence_override
     if active_skill_id:
         _record_skill_route_once(plan, active_skill_id, "selected")
     plan["skill_evidence"] = {
@@ -13545,6 +13952,29 @@ def _attach_operator_skills_to_plan(
     ]
     if skill_steps:
         plan["skill_suggested_steps"] = skill_steps[:3]
+    missing_probe_ids = _ensure_active_skill_evidence_step(
+        plan,
+        active_skill,
+        collected_evidence,
+    )
+    routing_only = bool(
+        active_skill.get("routing_only")
+        or active_skill.get("skill_type") == "router"
+    )
+    plan["skill_workflow_state"] = {
+        "skill_id": active_skill_id,
+        "phase": (
+            "evidence_collection"
+            if missing_probe_ids else
+            "scenario_handoff"
+            if routing_only else
+            "change_planning"
+        ),
+        "must_continue": bool(missing_probe_ids or routing_only),
+        "next_evidence": missing_probe_ids,
+        "routing_only": routing_only,
+        "handoff_required": bool(active_skill.get("handoff_required")),
+    }
     criteria = list(plan.get("success_criteria") or [])
     for item in (active_skill.get("success_criteria") or []):
         if item not in criteria:
@@ -13569,6 +13999,30 @@ def _attach_operator_skills_to_plan(
                 f"最高匹配 Skill 置信度 {active_confidence:.0%} 低于 70%；"
                 "本轮只执行该 Skill 的只读诊断步骤，取得新证据后重新排序。"
             )
+    if routing_only:
+        execution_matches = []
+        if plan.get("changes"):
+            plan["_blocked_router_changes"] = copy.deepcopy(plan.get("changes") or [])
+            plan["changes"] = []
+        plan["decision"] = (
+            "skill_router_collecting_evidence"
+            if missing_probe_ids else
+            "skill_router_handoff_in_progress"
+        )
+        plan["evidence_gap"] = (
+            f"{active_skill.get('name') or active_skill_id} 是非终态分流 Skill；"
+            + (
+                f"系统将主动补采 {', '.join(missing_probe_ids)}，然后立即重新匹配具体恢复 Skill。"
+                if missing_probe_ids else
+                "已有证据将立即重新路由到具体恢复 Skill；它不能作为最终方案，也不拥有写动作。"
+            )
+        )
+    elif missing_probe_ids:
+        plan["decision"] = "skill_evidence_collection_in_progress"
+        plan["evidence_gap"] = (
+            f"主 Skill 执行契约缺少 {', '.join(missing_probe_ids)}；"
+            "系统已把缺口转成主动补采步骤，完成后自动重新路由，不需要操作员重新发起诊断。"
+        )
     if execution_matches and OPS_SKILL_RUNTIME.is_executable(active_skill_id):
         runtime_plan = _materialize_executable_skill(plan, signal, active_skill_id)
         if runtime_plan:
@@ -13637,9 +14091,10 @@ def _attach_operator_skills_to_plan(
             for item in (match.get("_evidence_missing") or [])
         })
         plan["changes"] = []
-        plan["decision"] = "skill_evidence_required" if missing else "execution_ready_skill_required"
+        plan["decision"] = "skill_evidence_collection_in_progress" if missing else "execution_ready_skill_required"
         plan["evidence_gap"] = (
-            f"匹配到 Skill，但执行前仍缺少证据：{', '.join(missing)}；已阻断动作：{', '.join(rejected_actions)}。"
+            f"匹配到 Skill，系统正在主动补采执行证据：{', '.join(missing)}；"
+            f"补采并重新路由前已暂存动作：{', '.join(rejected_actions)}。"
             if missing else
             f"匹配到的 Skill 仅可用于诊断，尚未发布为 execution-ready；已阻断动作：{', '.join(rejected_actions)}。"
         )

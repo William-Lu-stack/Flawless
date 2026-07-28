@@ -42,7 +42,7 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
             "unable to open database file", "can't open database file",
             "attempt to write a readonly database", "database is read-only",
             "failed to create lock file", "failed to open pid file", "failed to create wal",
-            "data directory is not writable", "CrashLoopBackOff",
+            "data directory is not writable",
         ],
         "applies_to": ["Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "PVC", "PV"],
         "evidence_required": ["workload_spec", "pod_security_context"],
@@ -62,26 +62,117 @@ DEFAULT_OPERATOR_SKILLS: list[dict[str, Any]] = [
         "runtime_handler": "volume-write-permission-recovery",
         "execution_model": "executable_builtin_skill",
         "continuation_capable": True,
+        "workflow_phases": [
+            {
+                "id": "target_discovery",
+                "must": True,
+                "description": "锁定异常 Pod、拥有它的 Workload、失败容器和实际挂载路径；目标不存在才暂停。",
+            },
+            {
+                "id": "direct_evidence",
+                "must": True,
+                "description": "优先读取 ERROR/WARNING、current/previous logs、Pod 状态和 Workload securityContext。",
+            },
+            {
+                "id": "scenario_recovery",
+                "must": True,
+                "description": "按证据选择非 root 组权限、受限目录修复或完整 root 兜底，每次只提交一个需人工批准的阶段。",
+            },
+            {
+                "id": "recovery_verification",
+                "must": True,
+                "description": "重新发布后持续读取新 Pod、rollout、Events 和日志；未恢复必须带新证据进入下一方案。",
+            },
+        ],
+        "evidence_failure_policy": "普通日志或补充探针失败时记录具体错误并继续其他证据通道；仅目标不存在或 Kubernetes 读取权限不足时暂停变更。",
+        "completion_contract": "只有 rollout 完成、新 Pod Ready、重启次数稳定且原写路径错误消失，才能标记恢复成功。",
+        "progressive_evidence": [
+            {
+                "stage": "target_discovery",
+                "evidence": ["workload_spec", "pod_security_context", "last_state"],
+                "stop_when": "目标 Workload 或失败容器不存在时暂停；否则必须继续。",
+            },
+            {
+                "stage": "failure_signature",
+                "evidence": ["current_logs", "previous_logs", "events"],
+                "any_of": True,
+                "stop_when": "任一日志或 Events 已给出可关联的写路径错误后进入场景恢复。",
+            },
+            {
+                "stage": "storage_correlation",
+                "evidence": ["storage_chain", "pvc_binding"],
+                "optional": True,
+                "stop_when": "本地日志、挂载与 securityContext 已闭合权限根因时停止扩大取证。",
+            },
+        ],
     },
     {
         "id": "skill-crashloop-root-cause",
         "name": "CrashLoop 根因分流",
         "category": "runtime",
-        "summary": "把 CrashLoopBackOff 按 OOM、探针、配置、挂载、镜像和依赖故障分流，避免只会重启。",
-        "symptoms": ["CrashLoopBackOff", "Back-off restarting", "exit code 137", "probe failed", "permission denied"],
+        "summary": "非终态路由 Skill：把 CrashLoopBackOff 按 OOM、探针、配置、挂载、权限、镜像和依赖故障分流，并把控制权交给证据最匹配的可执行恢复 Skill。",
+        "symptoms": ["CrashLoopBackOff", "Back-off restarting", "exit code 137", "probe failed"],
         "applies_to": ["Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"],
-        "evidence_required": ["previous_logs", "events", "last_state", "workload_spec", "recent_changes"],
+        "evidence_required": ["last_state", "workload_spec"],
+        "evidence_any_of": [["current_logs", "previous_logs", "events"]],
         "diagnostic_steps": [
             "读取 current/previous logs 和 lastState，先判定退出码与信号。",
             "按时间线合并 Events、镜像、挂载、探针、依赖超时和最近发布。",
-            "只有证据能指向模板级问题时才提出 patch，否则继续收集证据。",
+            "形成候选根因后必须切换到最匹配的具体恢复 Skill；本 Skill 不拥有任何写动作，也不能作为最终执行结论。",
         ],
-        "allowed_actions": ["patch_workload", "recreate_pod", "rollback_workload"],
+        "allowed_actions": [],
         "success_criteria": ["pod_ready", "restart_count_stable", "events_no_new_backoff"],
         "risk": "medium",
         "owner": "Flawless",
         "enabled": True,
         "builtin": True,
+        "execution_ready": False,
+        "skill_type": "router",
+        "routing_only": True,
+        "handoff_required": True,
+        "workflow_phases": [
+            {
+                "id": "target_discovery",
+                "must": True,
+                "description": "确认目标 Workload、异常 Pod 和失败容器；目标不存在才停止。",
+            },
+            {
+                "id": "failure_signature",
+                "must": True,
+                "description": "优先读取 ERROR/WARNING、current/previous logs、lastState 与 Events；单个通道失败不能结束流程。",
+            },
+            {
+                "id": "scenario_routing",
+                "must": True,
+                "description": "把证据路由到权限、PVC/PV、OOM、探针、配置、镜像或依赖等具体 Skill。",
+            },
+            {
+                "id": "handoff",
+                "must": True,
+                "description": "具体 Skill 未接管前不得提出或执行变更；缺证据时主动补采并重新路由。",
+            },
+        ],
+        "evidence_failure_policy": "任何普通取证失败都记录错误并继续其他通道；只有目标不存在或读取 RBAC 缺失才暂停。",
+        "completion_contract": "本 Skill 的完成条件是成功交接给具体根因 Skill，不代表故障恢复；最终仍必须经过变更审批和恢复验证。",
+        "progressive_evidence": [
+            {
+                "stage": "target_discovery",
+                "evidence": ["last_state", "workload_spec"],
+                "stop_when": "目标不存在时暂停，否则继续读取失败签名。",
+            },
+            {
+                "stage": "failure_signature",
+                "evidence": ["current_logs", "previous_logs", "events"],
+                "any_of": True,
+                "stop_when": "任一证据足以区分候选根因后立即重新路由。",
+            },
+            {
+                "stage": "scenario_handoff",
+                "evidence": ["recent_changes"],
+                "optional": True,
+                "stop_when": "只有前两阶段无法区分根因时读取最近变更；随后必须交接，不能停在本 Skill。",
+            },
+        ],
     },
     {
         "id": "skill-storage-pvc-pv",
@@ -928,6 +1019,8 @@ class OpsSkillRegistry:
                                 "success_criteria", "risk", "rollback", "script_policy", "execution_ready",
                                 "runtime_handler", "execution_model", "continuation_capable", "skill_type",
                                 "selection_role", "dimensions", "progressive_evidence",
+                                "routing_only", "handoff_required", "workflow_phases",
+                                "evidence_failure_policy", "completion_contract",
                             }
                             if any(record.get(key) != builtin.get(key) for key in policy_fields if key in builtin):
                                 upgraded_builtin_ids.add(str(record["id"]))
@@ -1062,11 +1155,25 @@ class OpsSkillRegistry:
                         if str(value).strip()
                     ][:16],
                     "optional": bool(stage.get("optional", False)),
+                    "any_of": bool(stage.get("any_of", False)),
                     "stop_when": _clip(stage.get("stop_when") or "", 800),
                 }
                 for index, stage in enumerate(item.get("progressive_evidence") or [])
                 if isinstance(stage, dict)
             ][:8],
+            "routing_only": bool(item.get("routing_only", False)),
+            "handoff_required": bool(item.get("handoff_required", False)),
+            "workflow_phases": [
+                {
+                    "id": str(phase.get("id") or f"phase-{index + 1}").strip()[:80],
+                    "must": bool(phase.get("must", True)),
+                    "description": _clip(phase.get("description") or "", 1200),
+                }
+                for index, phase in enumerate(item.get("workflow_phases") or [])
+                if isinstance(phase, dict)
+            ][:12],
+            "evidence_failure_policy": _clip(item.get("evidence_failure_policy") or "", 2000),
+            "completion_contract": _clip(item.get("completion_contract") or "", 2000),
             "package_path": str(item.get("package_path") or self.root / skill_id),
             "package_files": int(item.get("package_files") or 0),
             "bundled_scripts": [str(x) for x in item.get("bundled_scripts") or []],
@@ -1080,7 +1187,7 @@ class OpsSkillRegistry:
             normalized["lifecycle"] = "published" if normalized["enabled"] else "candidate"
         if normalized["enabled"] and normalized["lifecycle"] == "candidate":
             normalized["lifecycle"] = "published"
-        if normalized["skill_type"] not in {"recovery", "inspection", "analysis", "ingestion", "modeling"}:
+        if normalized["skill_type"] not in {"recovery", "inspection", "analysis", "ingestion", "modeling", "router"}:
             normalized["skill_type"] = "recovery" if normalized["execution_ready"] else "analysis"
         if normalized["selection_role"] not in {"primary", "supporting"}:
             normalized["selection_role"] = "primary"

@@ -115,6 +115,11 @@ class OpsSkillDefinition(BaseModel):
     selection_role: str = "primary"
     dimensions: list[str] = Field(default_factory=list)
     progressive_evidence: list[dict] = Field(default_factory=list)
+    routing_only: bool = False
+    handoff_required: bool = False
+    workflow_phases: list[dict] = Field(default_factory=list)
+    evidence_failure_policy: str = ""
+    completion_contract: str = ""
     script_policy: OpsSkillScriptPolicy = Field(default_factory=OpsSkillScriptPolicy)
 
 
