@@ -38,6 +38,21 @@ ACTION_CATALOG: dict[str, dict[str, Any]] = {
         "risk": "high", "auto_allowed": False, "rollback": "delete the newly created workload after approval",
         "description": "Create one validated apps/v1 Deployment, StatefulSet or DaemonSet from the release gate.",
     },
+    "progressive_rollout": {
+        "risk": "high", "auto_allowed": False,
+        "rollback": "abort the Argo Rollout and restore the previous stable ReplicaSet",
+        "description": "Create an Argo Rollout from a live Deployment and stop at the algorithm-approved canary ceiling.",
+    },
+    "promote_progressive_rollout": {
+        "risk": "high", "auto_allowed": False,
+        "rollback": "abort the Argo Rollout and restore the previous stable ReplicaSet",
+        "description": "Fully promote a validated canary after a second human approval and a fresh SRE gate check.",
+    },
+    "abort_progressive_rollout": {
+        "risk": "high", "auto_allowed": False,
+        "rollback": "submit a new release from the desired immutable image after the incident is understood",
+        "description": "Abort a progressive release and return traffic/capacity to the previous stable ReplicaSet.",
+    },
     "patch_workload": {
         "risk": "medium", "auto_allowed": True, "rollback": "restore the previous workload template",
         "description": "Patch Deployment, StatefulSet or DaemonSet pod template/replicas.",
@@ -177,6 +192,9 @@ ACTION_OPERATOR_GUIDANCE: dict[str, dict[str, str]] = {
     "exec_pod": {"label": "执行 Pod 命令", "when_to_use": "需要进入明确的 Pod/container 收集证据或执行处置。", "operator_note": "完整命令和目标必须逐步确认并审计 stdout/stderr。"},
     "exec_node": {"label": "执行节点命令", "when_to_use": "必须在指定 Kubernetes 节点主机完成诊断或处置。", "operator_note": "通过受控节点执行器运行，属于高风险逐步确认动作。"},
     "create_workload": {"label": "创建新 Workload", "when_to_use": "发布治理已校验完整 YAML，需要创建新的 Deployment、StatefulSet 或 DaemonSet。", "operator_note": "高风险；创建前必须检查命名空间、镜像、资源、探针、ServiceAccount 和回滚方式。"},
+    "progressive_rollout": {"label": "启动 SRE 灰度发布", "when_to_use": "现有 Deployment 的不可变镜像或模板变更已通过错误预算与爆炸半径门禁。", "operator_note": "高风险；Argo Rollouts 只推进到算法批准的灰度上限，每批都执行 AnalysisRun，之后必须再次人工批准全量。"},
+    "promote_progressive_rollout": {"label": "批准灰度全量晋级", "when_to_use": "全部灰度批次、实时 SLI 和错误预算复核均已通过。", "operator_note": "高风险；会跳过剩余暂停点并把新版本提升为 stableRS，执行前再次展示实时门禁结果。"},
+    "abort_progressive_rollout": {"label": "中止灰度并回退", "when_to_use": "AnalysisRun、Pod 健康或业务 SLI 失败，需要立即限制爆炸半径。", "operator_note": "高风险；恢复上一 stableRS，并验证 Ready/Available 副本收敛。"},
     "patch_workload": {"label": "修改 Workload 配置", "when_to_use": "证据确认 Deployment/StatefulSet/DaemonSet 的镜像、探针、资源、副本、环境变量或安全上下文配置有误。", "operator_note": "只修改受控字段，执行前展示差异；可通过恢复原模板回滚。"},
     "restart": {"label": "滚动重启组件", "when_to_use": "配置已正确但进程卡死、连接未刷新或需要让 Workload 重新拉起 Pod。", "operator_note": "不会修复错误配置；必须先确认有足够副本和 PDB 允许滚动。"},
     "scale_out": {"label": "增加副本", "when_to_use": "CPU、并发或流量证据显示容量不足，且应用支持水平扩展。", "operator_note": "只在副本上限内扩容，并观察下游依赖和资源配额。"},

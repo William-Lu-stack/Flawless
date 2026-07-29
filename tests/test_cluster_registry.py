@@ -93,6 +93,34 @@ class ClusterRegistryTests(unittest.TestCase):
                 "application/strategic-merge-patch+json",
             )
 
+    def test_crd_status_patch_uses_discovered_status_subresource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ClusterRegistry(Path(directory) / "clusters.db")
+            status_resource = MagicMock()
+            status_resource.patch.return_value = {}
+            resource = MagicMock(namespaced=True)
+            resource.subresources = {"status": status_resource}
+            dynamic = MagicMock()
+            dynamic.resources.get.return_value = resource
+            with (
+                patch.object(registry, "api_client", return_value=MagicMock()),
+                patch("backend.app.services.cluster_registry.DynamicClient", return_value=dynamic),
+            ):
+                registry.patch_resource_status(
+                    "cluster-a",
+                    api_version="argoproj.io/v1alpha1",
+                    kind="Rollout",
+                    name="api-flawless",
+                    namespace="default",
+                    patch={"status": {"promoteFull": True}},
+                )
+            status_resource.patch.assert_called_once()
+            self.assertEqual(
+                status_resource.patch.call_args.kwargs["body"],
+                {"status": {"promoteFull": True}},
+            )
+            resource.patch.assert_not_called()
+
     def test_sqlite_open_failure_uses_configured_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             primary = Path(directory) / "readonly" / "clusters.db"

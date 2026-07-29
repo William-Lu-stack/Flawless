@@ -42,6 +42,12 @@ class ReleaseRequest(BaseModel):
     history: list[dict[str, Any]] = Field(default_factory=list)
     candidates: list[dict[str, Any]] = Field(default_factory=list)
     observation: dict[str, Any] = Field(default_factory=dict)
+    error_rate_promql: str = Field(default="", max_length=8000)
+    latency_p99_promql: str = Field(default="", max_length=8000)
+    max_error_rate: float = Field(default=0.01, gt=0.0, le=1.0)
+    max_p99_latency_ms: float = Field(default=1000.0, gt=0.0, le=3600000.0)
+    analysis_interval_seconds: int = Field(default=60, ge=10, le=3600)
+    analysis_count: int = Field(default=3, ge=1, le=20)
 
 
 class ApprovalRequest(BaseModel):

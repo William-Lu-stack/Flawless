@@ -1,0 +1,190 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flawless-rollout-e2e
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analysis-gate
+  namespace: flawless-rollout-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analysis-gate
+  template:
+    metadata:
+      labels:
+        app: analysis-gate
+    spec:
+      containers:
+        - name: gate
+          image: flawless-local:latest
+          imagePullPolicy: Never
+          command: ["python", "-c"]
+          args:
+            - |
+              import json
+              from http.server import BaseHTTPRequestHandler, HTTPServer
+              class Handler(BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      abort = self.path.startswith("/abort")
+                      body = json.dumps({"data": {"safe": not abort, "abort": abort}}).encode()
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  def log_message(self, *_):
+                      return
+              HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: analysis-gate
+  namespace: flawless-rollout-e2e
+spec:
+  selector:
+    app: analysis-gate
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: sre-pass
+  namespace: flawless-rollout-e2e
+spec:
+  metrics:
+    - name: sre-pass
+      count: 1
+      failureLimit: 0
+      inconclusiveLimit: 0
+      successCondition: result.safe == true
+      failureCondition: result.abort == true
+      provider:
+        web:
+          url: http://analysis-gate.flawless-rollout-e2e.svc.cluster.local:8080/safe
+          jsonPath: "{$.data}"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: sre-abort
+  namespace: flawless-rollout-e2e
+spec:
+  metrics:
+    - name: sre-abort
+      count: 1
+      failureLimit: 0
+      inconclusiveLimit: 0
+      successCondition: result.safe == true
+      failureCondition: result.abort == true
+      provider:
+        web:
+          url: http://analysis-gate.flawless-rollout-e2e.svc.cluster.local:8080/abort
+          jsonPath: "{$.data}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+  namespace: flawless-rollout-e2e
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: orders
+  template:
+    metadata:
+      labels:
+        app: orders
+      annotations:
+        e2e.flawless.io/version: stable
+    spec:
+      containers:
+        - name: app
+          image: rancher/mirrored-pause:3.6
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: orders-flawless
+  namespace: flawless-rollout-e2e
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: orders
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orders
+    scaleDown: progressively
+  strategy:
+    canary:
+      maxUnavailable: 0
+      maxSurge: 1
+      steps:
+        - setWeight: 10
+        - analysis:
+            templates:
+              - templateName: sre-pass
+        - pause: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments
+  namespace: flawless-rollout-e2e
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: payments
+  template:
+    metadata:
+      labels:
+        app: payments
+      annotations:
+        e2e.flawless.io/version: stable
+    spec:
+      containers:
+        - name: app
+          image: rancher/mirrored-pause:3.6
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payments-flawless
+  namespace: flawless-rollout-e2e
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: payments
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payments
+    scaleDown: progressively
+  progressDeadlineAbort: true
+  strategy:
+    canary:
+      maxUnavailable: 0
+      maxSurge: 1
+      steps:
+        - setWeight: 10
+        - analysis:
+            templates:
+              - templateName: sre-abort
+        - pause: {}

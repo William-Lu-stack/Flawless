@@ -90,6 +90,14 @@ from backend.app.api.reliability import ReliabilityDependencies, build_reliabili
 from backend.app.domain.slo import evaluate_error_budget
 from backend.app.services.reliability_store import ReliabilityStore
 from backend.app.services.release_execution import submit_release_job
+from backend.app.services.progressive_delivery import (
+    ARGO_ROLLOUTS_API_VERSION,
+    build_analysis_template,
+    build_rollout,
+    derive_canary_policy,
+    progressive_status,
+    rollout_name as progressive_rollout_name,
+)
 from backend.app.schemas.chat import ChatRequest, ChatResponse, ChatRiskRankRequest
 from backend.app.schemas.integrations import CollaborationNotificationRequest
 from backend.app.schemas.knowledge import KnowledgeAskRequest, KnowledgeDocumentRequest, KnowledgeReindexRequest
@@ -187,7 +195,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.17")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.3.0")
 APP_CODE_SIGNATURE = "bounded-llm-skill-router-v23"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -6675,6 +6683,18 @@ def _permission_guidance(error_payload: dict | str, plan: dict, change: dict | N
         "cordon_node": (["get", "patch"], ["nodes"]),
         "evict_pod": (["get", "create"], ["pods", "pods/eviction"]),
         "create_configmap": (["get", "create"], ["configmaps"]),
+        "progressive_rollout": (
+            ["get", "create", "patch", "update"],
+            ["deployments", "rollouts.argoproj.io", "analysistemplates.argoproj.io", "analysisruns.argoproj.io"],
+        ),
+        "promote_progressive_rollout": (
+            ["get", "patch", "update"],
+            ["rollouts.argoproj.io/status"],
+        ),
+        "abort_progressive_rollout": (
+            ["get", "patch", "update"],
+            ["rollouts.argoproj.io/status"],
+        ),
     }
     verbs, resources = requirements.get(action, (["get", "patch", "update"], ["目标 Kubernetes 资源"]))
     service_account_namespace = os.getenv("PLATFORM_NAMESPACE", "k8s-agent")
@@ -6772,6 +6792,28 @@ def _change_access_requirement(change: dict, plan: dict) -> dict | None:
             "group": workload_group,
             "resource": workload_resource,
             "name": workload_name,
+            "action": action,
+        }
+    if action == "progressive_rollout":
+        return {
+            "namespace": namespace,
+            "verb": "patch",
+            "group": "apps",
+            "resource": "deployments",
+            "name": workload_name,
+            "action": action,
+            "additional_requirements": [
+                "argoproj.io rollouts/rollouts/status create,get,patch,update",
+                "argoproj.io analysistemplates/analysisruns create,get,list,watch,patch,update",
+            ],
+        }
+    if action in {"promote_progressive_rollout", "abort_progressive_rollout"}:
+        return {
+            "namespace": namespace,
+            "verb": "patch",
+            "group": "argoproj.io",
+            "resource": "rollouts/status",
+            "name": str(change.get("rollout_name") or progressive_rollout_name(workload_name)),
             "action": action,
         }
     if action == "replace_immutable_workload":
@@ -8159,6 +8201,241 @@ async def _collect_ops_step(step: dict, plan: dict) -> dict:
     }
 
 
+async def _execute_progressive_change(
+    change: dict,
+    plan: dict,
+    *,
+    cluster_id: str,
+    namespace: str,
+    use_managed_cluster: bool,
+    use_rancher: bool,
+) -> dict:
+    """Execute one approved Argo Rollouts lifecycle command."""
+    if not (use_managed_cluster or use_rancher):
+        raise RuntimeError(
+            "真实灰度发布需要 Rancher 或 Web 上传 kubeconfig；当前 MCP 执行面不支持 Argo CRD status 子资源"
+        )
+
+    workload_name = str(change.get("workload_name") or "")
+    name = str(change.get("rollout_name") or progressive_rollout_name(workload_name))
+
+    async def read(api_version: str, kind: str, resource_name: str) -> dict:
+        if use_managed_cluster:
+            return await asyncio.to_thread(
+                CLUSTER_REGISTRY.read_resource,
+                cluster_id,
+                api_version=api_version,
+                kind=kind,
+                name=resource_name,
+                namespace=namespace,
+            )
+        _, item_path = await _rancher_dynamic_resource_paths(
+            cluster_id,
+            api_version=api_version,
+            kind=kind,
+            namespace=namespace,
+            name=resource_name,
+        )
+        return await _rancher_k8s_get(cluster_id, item_path, timeout=30)
+
+    async def apply(manifest: dict) -> dict:
+        if use_managed_cluster:
+            return await asyncio.to_thread(
+                CLUSTER_REGISTRY.apply_manifest,
+                cluster_id,
+                manifest,
+            )
+        return await _rancher_apply_manifest(cluster_id, manifest, namespace=namespace)
+
+    async def patch(
+        api_version: str,
+        kind: str,
+        resource_name: str,
+        body: dict,
+    ) -> dict:
+        if use_managed_cluster:
+            return await asyncio.to_thread(
+                CLUSTER_REGISTRY.patch_resource,
+                cluster_id,
+                api_version=api_version,
+                kind=kind,
+                name=resource_name,
+                namespace=namespace,
+                patch=body,
+            )
+        _, item_path = await _rancher_dynamic_resource_paths(
+            cluster_id,
+            api_version=api_version,
+            kind=kind,
+            namespace=namespace,
+            name=resource_name,
+        )
+        return await _rancher_k8s_patch(
+            cluster_id,
+            item_path,
+            body,
+            timeout=40,
+            content_type=(
+                "application/strategic-merge-patch+json"
+                if api_version == "apps/v1" and kind == "Deployment"
+                else "application/merge-patch+json"
+            ),
+        )
+
+    async def patch_status(body: dict) -> dict:
+        if use_managed_cluster:
+            return await asyncio.to_thread(
+                CLUSTER_REGISTRY.patch_resource_status,
+                cluster_id,
+                api_version=ARGO_ROLLOUTS_API_VERSION,
+                kind="Rollout",
+                name=name,
+                namespace=namespace,
+                patch=body,
+            )
+        _, item_path = await _rancher_dynamic_resource_paths(
+            cluster_id,
+            api_version=ARGO_ROLLOUTS_API_VERSION,
+            kind="Rollout",
+            namespace=namespace,
+            name=name,
+        )
+        return await _rancher_k8s_patch(
+            cluster_id,
+            f"{item_path}/status",
+            body,
+            timeout=40,
+            content_type="application/merge-patch+json",
+        )
+
+    command = str(change.get("type") or "")
+    if command == "progressive_rollout":
+        live = await read("apps/v1", "Deployment", workload_name)
+        replicas = int((live.get("spec") or {}).get("replicas") or 1)
+        release = copy.deepcopy(change.get("release") or {})
+        policy = derive_canary_policy(release, replicas)
+        if policy.get("unsupported"):
+            raise ValueError(str(policy.get("blocked_reason")))
+        analysis_url = os.getenv(
+            "GRAY_RELEASE_ANALYSIS_URL",
+            "http://flawless.k8s-agent.svc.cluster.local:8080",
+        ).strip()
+        if not analysis_url.startswith(("http://", "https://")):
+            raise ValueError("GRAY_RELEASE_ANALYSIS_URL 必须是 Argo AnalysisRun 可访问的 HTTP(S) 地址")
+        analysis_template = build_analysis_template(release, policy, analysis_url)
+        rollout = build_rollout(release, live, policy)
+        release_patch = _materialize_patch(change.get("patch") or {})
+        valid, reason = _validate_workload_patch(release_patch)
+        if not valid:
+            raise ValueError(f"发布 patch 被安全策略拒绝：{reason}")
+
+        analysis_receipt = await apply(analysis_template)
+        rollout_receipt = await apply(rollout)
+        baseline_timeout = max(
+            30,
+            int(os.getenv("GRAY_RELEASE_BASELINE_TIMEOUT_SECONDS", "180")),
+        )
+        baseline_deadline = time.monotonic() + baseline_timeout
+        baseline = {}
+        while time.monotonic() < baseline_deadline:
+            baseline = await read(
+                ARGO_ROLLOUTS_API_VERSION,
+                "Rollout",
+                str((rollout.get("metadata") or {}).get("name") or ""),
+            )
+            baseline_status = baseline.get("status") or {}
+            baseline_phase = str(baseline_status.get("phase") or "")
+            if (
+                baseline_phase == "Healthy"
+                and baseline_status.get("currentPodHash")
+                and baseline_status.get("currentPodHash") == baseline_status.get("stableRS")
+            ):
+                break
+            if baseline_phase == "Degraded" or baseline_status.get("abort"):
+                raise RuntimeError(
+                    f"Rollout 基线初始化失败：phase={baseline_phase or 'Unknown'} "
+                    f"message={baseline_status.get('message') or ''}"
+                )
+            await asyncio.sleep(2)
+        else:
+            raise TimeoutError(
+                f"Argo Rollout 在 {baseline_timeout} 秒内没有形成 Healthy stableRS；"
+                "Deployment 尚未写入新版本"
+            )
+        deployment_receipt = await patch(
+            "apps/v1",
+            "Deployment",
+            workload_name,
+            release_patch,
+        )
+        return {
+            "operation": "progressive_rollout_started",
+            "engine": "ArgoRolloutsCanary/v1",
+            "rollout_name": (rollout.get("metadata") or {}).get("name"),
+            "analysis_template_name": (analysis_template.get("metadata") or {}).get("name"),
+            "policy": policy,
+            "expected_steps": len((((rollout.get("spec") or {}).get("strategy") or {}).get("canary") or {}).get("steps") or []),
+            "analysis_template": {
+                "operation": analysis_receipt.get("operation"),
+                "name": (analysis_template.get("metadata") or {}).get("name"),
+            },
+            "rollout": {
+                "operation": rollout_receipt.get("operation"),
+                "name": (rollout.get("metadata") or {}).get("name"),
+                "baseline_phase": (baseline.get("status") or {}).get("phase"),
+                "baseline_stable_rs": (baseline.get("status") or {}).get("stableRS"),
+            },
+            "deployment": {
+                "name": workload_name,
+                "generation": ((deployment_receipt.get("metadata") or {}).get("generation")),
+            },
+        }
+
+    current = await read(ARGO_ROLLOUTS_API_VERSION, "Rollout", name)
+    if command == "promote_progressive_rollout":
+        current_status = current.get("status") or {}
+        phase = str(current_status.get("phase") or "")
+        steps = (
+            ((((current.get("spec") or {}).get("strategy") or {}).get("canary") or {}).get("steps"))
+            or []
+        )
+        step_index = int(current_status.get("currentStepIndex") or 0)
+        pause_reasons = {
+            str(item.get("reason") or "")
+            for item in (current_status.get("pauseConditions") or [])
+            if isinstance(item, dict)
+        }
+        at_final_manual_pause = (
+            phase == "Paused"
+            and bool(steps)
+            and step_index >= len(steps) - 1
+            and "CanaryPauseStep" in pause_reasons
+        )
+        if not at_final_manual_pause:
+            raise ValueError(
+                f"Rollout/{name} 当前 phase={phase or 'Unknown'} step={step_index}/{max(0, len(steps)-1)}，"
+                "尚未通过全部 AnalysisRun 并到达最终人工晋级点"
+            )
+        receipt = await patch_status({"status": {"promoteFull": True}})
+        return {
+            "operation": "progressive_rollout_promoted",
+            "rollout_name": name,
+            "previous_phase": phase,
+            "status_patch": {"promoteFull": True},
+            "resource_version": ((receipt.get("metadata") or {}).get("resourceVersion")),
+        }
+    if command == "abort_progressive_rollout":
+        receipt = await patch_status({"status": {"abort": True}})
+        return {
+            "operation": "progressive_rollout_aborted",
+            "rollout_name": name,
+            "previous_phase": (current.get("status") or {}).get("phase"),
+            "status_patch": {"abort": True},
+            "resource_version": ((receipt.get("metadata") or {}).get("resourceVersion")),
+        }
+    raise ValueError(f"unsupported progressive delivery command: {command}")
+
+
 async def _execute_change(change: dict, plan: dict) -> dict:
     ctype = change.get("type")
     namespace = change.get("namespace", plan.get("namespace", "default"))
@@ -8172,7 +8449,12 @@ async def _execute_change(change: dict, plan: dict) -> dict:
         "restart", "patch_workload", "patch_workload_volume", "patch_workload_runtime_security",
         "patch", "scale_out", "rollback_workload",
     }
-    if ctype in workload_change_types and not workload_name:
+    progressive_change_types = {
+        "progressive_rollout",
+        "promote_progressive_rollout",
+        "abort_progressive_rollout",
+    }
+    if ctype in workload_change_types | progressive_change_types and not workload_name:
         return {
             "change": _redact_sensitive(change),
             "status": "failed",
@@ -8212,7 +8494,16 @@ async def _execute_change(change: dict, plan: dict) -> dict:
         }
 
     try:
-        if ctype in {"run_shell", "exec_pod", "exec_node"}:
+        if ctype in progressive_change_types:
+            result = await _execute_progressive_change(
+                change,
+                plan,
+                cluster_id=cluster_id,
+                namespace=namespace,
+                use_managed_cluster=use_managed_cluster,
+                use_rancher=use_rancher,
+            )
+        elif ctype in {"run_shell", "exec_pod", "exec_node"}:
             command = str(change.get("command") or "").strip()
             timeout_seconds = max(1, min(int(change.get("timeout_seconds") or 120), 900))
             if not command or len(command) > 20000 or "\x00" in command:
@@ -8798,12 +9089,199 @@ async def _execute_change(change: dict, plan: dict) -> dict:
     return outcome
 
 
+async def _restore_progressive_source_template(
+    *,
+    cluster_id: str,
+    namespace: str,
+    workload_name: str,
+    rollout_name: str,
+    rollout: dict,
+    use_managed: bool,
+    use_rancher: bool,
+) -> dict:
+    """Restore the source Deployment template from Argo's stable ReplicaSet.
+
+    Argo abort restores running replicas to stableRS, but with workloadRef the
+    source Deployment can still contain the rejected template.  Restoring the
+    desired state prevents the same failed version from being observed again
+    on the next reconciliation or release.
+    """
+    status = rollout.get("status") or {}
+    stable_hash = str(status.get("stableRS") or "").strip()
+    if not stable_hash or not re.fullmatch(r"[a-z0-9-]+", stable_hash):
+        raise RuntimeError("Rollout 没有可验证的 stableRS，不能恢复源 Deployment 模板")
+    stable_rs_name = f"{rollout_name}-{stable_hash}"
+
+    if use_managed:
+        stable_rs = await asyncio.to_thread(
+            CLUSTER_REGISTRY.read_resource,
+            cluster_id,
+            api_version="apps/v1",
+            kind="ReplicaSet",
+            name=stable_rs_name,
+            namespace=namespace,
+        )
+    elif use_rancher:
+        _, rs_path = await _rancher_dynamic_resource_paths(
+            cluster_id,
+            api_version="apps/v1",
+            kind="ReplicaSet",
+            namespace=namespace,
+            name=stable_rs_name,
+        )
+        stable_rs = await _rancher_k8s_get(cluster_id, rs_path, timeout=25)
+    else:
+        raise RuntimeError("当前执行面不能读取 stableRS")
+
+    template = copy.deepcopy(((stable_rs.get("spec") or {}).get("template") or {}))
+    if not template.get("spec"):
+        raise RuntimeError(f"ReplicaSet/{stable_rs_name} 没有可恢复的 Pod template")
+    template_metadata = template.setdefault("metadata", {})
+    labels = template_metadata.get("labels")
+    if isinstance(labels, dict):
+        labels.pop("rollouts-pod-template-hash", None)
+        labels.pop("pod-template-hash", None)
+    annotations = template_metadata.get("annotations")
+    if isinstance(annotations, dict):
+        annotations.pop("rollout.argoproj.io/revision", None)
+        annotations.pop("rollouts.argoproj.io/revision", None)
+
+    restore_patch = {"spec": {"template": template}}
+    if use_managed:
+        receipt = await asyncio.to_thread(
+            CLUSTER_REGISTRY.patch_resource,
+            cluster_id,
+            api_version="apps/v1",
+            kind="Deployment",
+            name=workload_name,
+            namespace=namespace,
+            patch=restore_patch,
+        )
+    else:
+        _, deployment_path = await _rancher_dynamic_resource_paths(
+            cluster_id,
+            api_version="apps/v1",
+            kind="Deployment",
+            namespace=namespace,
+            name=workload_name,
+        )
+        receipt = await _rancher_k8s_patch(
+            cluster_id,
+            deployment_path,
+            restore_patch,
+            timeout=40,
+            content_type="application/strategic-merge-patch+json",
+        )
+    return {
+        "source_desired_state_restored": True,
+        "source_workload": f"Deployment/{workload_name}",
+        "stable_replicaset": stable_rs_name,
+        "deployment_generation": ((receipt.get("metadata") or {}).get("generation")),
+    }
+
+
 async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     if any(r.get("status") in {"failed", "blocked"} for r in results):
         return {"status": "skipped", "recovered": False, "message": "存在变更 API 失败，跳过恢复验证并进入替代策略。"}
 
     first_change = (plan.get("changes") or [{}])[0]
     change_type = first_change.get("type")
+    if change_type in {
+        "progressive_rollout",
+        "promote_progressive_rollout",
+        "abort_progressive_rollout",
+    }:
+        namespace = str(first_change.get("namespace") or plan.get("namespace") or "default")
+        workload_name = str(first_change.get("workload_name") or "")
+        result_payload = next(
+            (
+                item.get("result") or {}
+                for item in reversed(results)
+                if isinstance(item, dict) and isinstance(item.get("result"), dict)
+            ),
+            {},
+        )
+        name = str(
+            result_payload.get("rollout_name")
+            or first_change.get("rollout_name")
+            or progressive_rollout_name(workload_name)
+        )
+        expected_steps = int(result_payload.get("expected_steps") or 0)
+        cluster_id = str(plan.get("cluster_id") or first_change.get("cluster_id") or "local")
+        use_managed = cluster_id in {str(item.get("id") or "") for item in CLUSTER_REGISTRY.list()}
+        use_rancher = _ops_uses_rancher(plan)
+        try:
+            if use_managed:
+                rollout = await asyncio.to_thread(
+                    CLUSTER_REGISTRY.read_resource,
+                    cluster_id,
+                    api_version=ARGO_ROLLOUTS_API_VERSION,
+                    kind="Rollout",
+                    name=name,
+                    namespace=namespace,
+                )
+            elif use_rancher:
+                _, item_path = await _rancher_dynamic_resource_paths(
+                    cluster_id,
+                    api_version=ARGO_ROLLOUTS_API_VERSION,
+                    kind="Rollout",
+                    namespace=namespace,
+                    name=name,
+                )
+                rollout = await _rancher_k8s_get(cluster_id, item_path, timeout=25)
+            else:
+                raise RuntimeError("当前执行面不能读取 Argo Rollout CRD")
+        except Exception as exc:
+            return {
+                "status": "unknown",
+                "recovered": None,
+                "progressive_phase": "status_unavailable",
+                "rollout": name,
+                "namespace": namespace,
+                "message": "无法读取 Argo Rollout 状态，不能宣称灰度发布成功。",
+                "errors": [f"{type(exc).__name__}: {_redact_text(str(exc))}"],
+            }
+        command = {
+            "promote_progressive_rollout": "promote",
+            "abort_progressive_rollout": "abort",
+        }.get(str(change_type), "start")
+        progressive_result = progressive_status(
+            rollout,
+            command=command,
+            expected_steps=expected_steps,
+        )
+        if progressive_result.get("progressive_phase") == "rolled_back":
+            try:
+                restore_receipt = await _restore_progressive_source_template(
+                    cluster_id=cluster_id,
+                    namespace=namespace,
+                    workload_name=workload_name,
+                    rollout_name=name,
+                    rollout=rollout,
+                    use_managed=use_managed,
+                    use_rancher=use_rancher,
+                )
+            except Exception as exc:
+                return {
+                    **progressive_result,
+                    "status": "progressing",
+                    "recovered": None,
+                    "source_desired_state_restored": False,
+                    "message": (
+                        "stableRS 的运行副本已恢复，但源 Deployment 的失败模板尚未恢复；"
+                        "系统不会把本次回滚误报为完成。"
+                    ),
+                    "errors": [f"{type(exc).__name__}: {_redact_text(str(exc))}"],
+                }
+            return {
+                **progressive_result,
+                **restore_receipt,
+                "message": (
+                    f"{progressive_result.get('message') or ''}"
+                    " 源 Deployment 模板也已恢复为 stableRS 对应版本。"
+                ).strip(),
+            }
+        return progressive_result
     namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
     workload_scoped = str(workload_type or "").lower() in {
         "deployment", "statefulset", "daemonset", "replicaset", "job", "cronjob", "pod",
@@ -9390,7 +9868,20 @@ async def _verify_plan_recovery(
     if not plan.get("changes") or any(r.get("status") == "failed" for r in results):
         return await _probe_plan_recovery(plan, results)
 
-    timeout_seconds = max(0, int(os.getenv("OPS_VERIFY_TIMEOUT_SECONDS", "45")))
+    progressive_verification = str(((plan.get("changes") or [{}])[0]).get("type") or "") in {
+        "progressive_rollout",
+        "promote_progressive_rollout",
+        "abort_progressive_rollout",
+    }
+    timeout_seconds = max(
+        0,
+        int(
+            os.getenv(
+                "GRAY_RELEASE_VERIFY_TIMEOUT_SECONDS" if progressive_verification else "OPS_VERIFY_TIMEOUT_SECONDS",
+                "3600" if progressive_verification else "45",
+            )
+        ),
+    )
     interval_seconds = max(1, int(os.getenv("OPS_VERIFY_INTERVAL_SECONDS", "5")))
     initial_grace_seconds = max(0, int(os.getenv("OPS_VERIFY_INITIAL_GRACE_SECONDS", "15")))
     stability_seconds = max(0, int(os.getenv("OPS_RECOVERY_STABILITY_SECONDS", "0")))
@@ -9458,6 +9949,17 @@ async def _verify_plan_recovery(
         attempts += 1
         await asyncio.sleep(min(interval_seconds, max(0.0, deadline - time.monotonic())))
         last = await _probe_plan_recovery(plan, results)
+    if last.get("recovered") is True and progressive_verification:
+        return {
+            **last,
+            "attempts": attempts + 1,
+            "initial_grace_seconds": initial_grace_seconds,
+            "required_stability_seconds": 0,
+            "waited_seconds": min(timeout_seconds, initial_grace_seconds + attempts * interval_seconds),
+            "proof": (
+                "Argo Rollout phase、step index、stableRS/currentPodHash 与 Ready/Available 副本已达到当前阶段判据"
+            ),
+        }
     if last.get("recovered") is True:
         try:
             criteria, pod_evaluations = await assess_all_recovered_pods(last)
@@ -12767,7 +13269,17 @@ async def _execute_ops_plan_once(
                 "replicas": change.get("replicas"),
             },
         )
-        change_timeout = max(10, int(os.getenv("OPS_CHANGE_TIMEOUT_SECONDS", "45")))
+        if str(change.get("type") or "") in {
+            "progressive_rollout",
+            "promote_progressive_rollout",
+            "abort_progressive_rollout",
+        }:
+            change_timeout = max(
+                60,
+                int(os.getenv("GRAY_RELEASE_CHANGE_TIMEOUT_SECONDS", "240")),
+            )
+        else:
+            change_timeout = max(10, int(os.getenv("OPS_CHANGE_TIMEOUT_SECONDS", "45")))
         try:
             change_result = await run_with_heartbeat(
                 _execute_change(change, plan),
@@ -13042,6 +13554,65 @@ async def _execute_ops_plan_once(
         verification=verification,
         level="success" if verification.get("recovered") is True else "warning",
     )
+    progressive_action = str(((plan.get("changes") or [{}])[0]).get("type") or "")
+    if (
+        progressive_action in {
+            "progressive_rollout",
+            "promote_progressive_rollout",
+        }
+        and verification.get("recovered") is not True
+        and not failed
+    ):
+        abort_plan = {
+            **copy.deepcopy(plan),
+            "id": f"{plan.get('id') or 'release'}-abort",
+            "title": f"中止灰度并恢复 stableRS：{plan.get('service') or plan.get('target')}",
+            "summary": (
+                "AnalysisRun、Pod 健康或实时 SLI 没有满足当前批次的晋级条件；"
+                "停止扩大爆炸半径，并恢复上一稳定 ReplicaSet。"
+            ),
+            "changes": [{
+                "type": "abort_progressive_rollout",
+                "namespace": plan.get("namespace") or "default",
+                "workload_type": "Deployment",
+                "workload_name": _workload_identity_from_plan(plan)[2],
+                "rollout_name": verification.get("rollout"),
+                "reason": verification.get("message") or "灰度验证未通过",
+            }],
+            "high_risk_confirmed": False,
+            "operator_force_execute": False,
+            "stepwise_confirmation": True,
+            "requires_confirmation": True,
+            "skill_execution_exempt": True,
+            "progressive_delivery": {
+                **(plan.get("progressive_delivery") or {}),
+                "command": "abort",
+            },
+        }
+        _enrich_plan_change_policies(abort_plan)
+        operator_steps = [
+            "灰度已停止扩大；核对 AnalysisRun、错误率、P99 和 Rollout message。",
+            "批准下方 abort_progressive_rollout 后，系统会恢复上一 stableRS 并验证 Ready/Available 副本。",
+        ]
+        return {
+            "status": "planned",
+            "executed": True,
+            "steps": executed_steps,
+            "changes": plan.get("changes") or [],
+            "results": results,
+            "release_gate": release_gate,
+            "permission_preflight": permission_preflight,
+            "verification": verification,
+            "alternative_plans": [abort_plan],
+            "operator_steps": operator_steps,
+            "next_steps": _ops_terminal_next_steps(
+                plan,
+                verification,
+                [abort_plan],
+                operator_steps,
+            ),
+            "message": "灰度未通过 SRE 验证，已停在当前批次并生成需人工确认的回退动作。",
+        }
     if (
         verification.get("recovered") is not True
         and str(plan.get("permission_recovery_stage") or "") == "nonroot_hardening"
@@ -14070,6 +14641,18 @@ def _attach_operator_skills_to_plan(
     if not isinstance(plan, dict):
         return plan
     _enrich_plan_change_policies(plan)
+    if plan.get("skill_execution_exempt"):
+        # Application releases are governed by the release risk algorithm,
+        # error budget, blast-radius envelope, Argo AnalysisRuns and two human
+        # approvals.  Sending them through incident-remediation Skill matching
+        # would incorrectly replace a release action with a fault runbook.
+        plan["skill_execution_mode"] = "release_governance_exempt"
+        plan["skill_match_policy"] = str(
+            plan.get("skill_execution_exempt_reason")
+            or "发布治理计划不进入故障修复 Skill 路由。"
+        )
+        plan["decision"] = "ready_for_approval"
+        return plan
     preferred_skill_ids = [str(item) for item in preferred_skill_ids or [] if str(item)]
     match_signal = copy.deepcopy(signal)
     # Never let yesterday's route become today's evidence.  Plans are passed
@@ -15284,6 +15867,49 @@ async def _wait_for_continuous_recheck(
         return True
 
 
+def _sync_release_from_ops_result(plan: dict, job_id: str, result: dict) -> str:
+    """Persist the Argo lifecycle state next to the release audit record."""
+    release_id = str(plan.get("release_id") or "")
+    if not release_id:
+        return ""
+    verification = result.get("verification") or {}
+    phase = str(verification.get("progressive_phase") or "")
+    status = {
+        "canary_validated": "canary_validated",
+        "fully_promoted": "completed",
+        "rolled_back": "aborted",
+        "degraded": "failed",
+        "analysis_inconclusive": "paused",
+    }.get(phase)
+    if not status and result.get("status") == "completed":
+        status = "completed"
+    if not status:
+        return ""
+    rollout_name = str(verification.get("rollout") or "")
+    if not rollout_name:
+        rollout_name = next(
+            (
+                str((item.get("result") or {}).get("rollout_name") or "")
+                for item in result.get("results") or []
+                if isinstance(item, dict) and isinstance(item.get("result"), dict)
+                and (item.get("result") or {}).get("rollout_name")
+            ),
+            "",
+        )
+    try:
+        RELIABILITY_STORE.update_release(
+            release_id,
+            status=status,
+            rollout_name=rollout_name,
+            progressive_phase=phase,
+            last_ops_job_id=job_id,
+            last_verification=_redact_sensitive(verification),
+        )
+        return ""
+    except Exception as exc:
+        return f"{type(exc).__name__}: {_redact_text(str(exc))}"
+
+
 async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel_event: asyncio.Event):
     current = _apply_ops_continuation_context(copy.deepcopy(initial_plan))
     current["_lineage_id"] = current.get("_lineage_id") or job_id
@@ -15665,6 +16291,9 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                 await _append_ops_job_event(job_id, "summarizing", "生成恢复结论和验证证据", status="running")
                 result["ai_summary"] = await _llm_ops_summary(current, result.get("steps") or [], result.get("results") or [])
                 result = _ensure_effectiveness_record(current, result)
+                release_sync_warning = _sync_release_from_ops_result(current, job_id, result)
+                if release_sync_warning:
+                    result["release_audit_warning"] = release_sync_warning
                 await _append_ops_job_event(
                     job_id,
                     "recovered",

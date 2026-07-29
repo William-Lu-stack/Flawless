@@ -322,6 +322,173 @@ def _actor(request: Request) -> str:
     return str(request.headers.get("x-auth-request-user") or request.headers.get("x-forwarded-user") or (request.client.host if request.client else "unknown"))[:120]
 
 
+def _render_promql(query: str, release: dict[str, Any]) -> str:
+    rendered = str(query or "")
+    replacements = {
+        "{service}": str(release.get("service") or ""),
+        "{namespace}": str(release.get("namespace") or "default"),
+        "{workload}": str(release.get("workload_name") or ""),
+        "{cluster}": str(release.get("cluster") or "local"),
+    }
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value.replace("\\", "\\\\").replace('"', '\\"'))
+    return rendered
+
+
+async def _prometheus_scalar(query: str) -> dict[str, Any]:
+    base = os.getenv("PROMETHEUS_URL", "").strip().rstrip("/")
+    if not base:
+        return {"status": "unavailable", "error": "PROMETHEUS_URL 未配置"}
+    if not query.strip():
+        return {"status": "not_configured", "error": "PromQL 未配置"}
+    try:
+        verify = os.getenv("OUTBOUND_VERIFY_SSL", "true").lower() not in {"0", "false", "no"}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=4.0), verify=verify) as client:
+            response = await client.get(f"{base}/api/v1/query", params={"query": query})
+            response.raise_for_status()
+            payload = response.json()
+        data = payload.get("data") or {}
+        values = data.get("result") or []
+        if data.get("resultType") == "scalar" and isinstance(values, list) and len(values) >= 2:
+            value = float(values[1])
+        elif isinstance(values, list) and values:
+            samples = [
+                float((item.get("value") or [None, "nan"])[1])
+                for item in values
+                if isinstance(item, dict) and isinstance(item.get("value"), list)
+            ]
+            finite = [item for item in samples if item == item and item not in {float("inf"), float("-inf")}]
+            if not finite:
+                raise ValueError("Prometheus 查询没有返回有限数值")
+            value = max(finite)
+        else:
+            raise ValueError("Prometheus 查询没有返回时间序列")
+        return {"status": "ok", "value": value, "series": len(values) if isinstance(values, list) else 1}
+    except Exception as exc:
+        return {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"[:1000]}
+
+
+async def _evaluate_progressive_analysis(
+    store: ReliabilityStore,
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    objective = store.objective_for(
+        str(release.get("service") or ""),
+        str(release.get("cluster") or "local"),
+        str(release.get("namespace") or "default"),
+    )
+    budget = evaluate_error_budget(objective)
+    error_query = _render_promql(
+        str(release.get("error_rate_promql") or os.getenv("GRAY_RELEASE_DEFAULT_ERROR_RATE_PROMQL", "")),
+        release,
+    )
+    latency_query = _render_promql(
+        str(release.get("latency_p99_promql") or os.getenv("GRAY_RELEASE_DEFAULT_P99_LATENCY_PROMQL", "")),
+        release,
+    )
+    error_metric, latency_metric = await _scan_progressive_metrics(error_query, latency_query)
+    max_error_rate = max(0.000001, float(release.get("max_error_rate") or 0.01))
+    max_p99_ms = max(1.0, float(release.get("max_p99_latency_ms") or 1000.0))
+    require_prometheus = os.getenv("GRAY_RELEASE_REQUIRE_PROMETHEUS", "true").lower() in {
+        "1", "true", "yes", "on",
+    }
+    checks = {
+        "error_rate": {
+            **error_metric,
+            "threshold": max_error_rate,
+            "passed": (
+                error_metric.get("status") == "ok"
+                and float(error_metric.get("value") or 0.0) <= max_error_rate
+            ),
+        },
+        "p99_latency_ms": {
+            **latency_metric,
+            "threshold": max_p99_ms,
+            "required": bool(latency_query),
+            "passed": (
+                not latency_query
+                or (
+                    latency_metric.get("status") == "ok"
+                    and float(latency_metric.get("value") or 0.0) <= max_p99_ms
+                )
+            ),
+        },
+    }
+    metric_evidence_ready = (
+        checks["error_rate"]["status"] == "ok"
+        if require_prometheus else
+        checks["error_rate"]["status"] in {"ok", "not_configured"}
+    ) and (
+        not latency_query or checks["p99_latency_ms"]["status"] == "ok"
+    )
+    abort = bool(
+        budget.get("freeze_changes")
+        or (
+            checks["error_rate"]["status"] == "ok"
+            and float(checks["error_rate"].get("value") or 0.0) > max_error_rate * 2.0
+        )
+        or (
+            latency_query
+            and checks["p99_latency_ms"]["status"] == "ok"
+            and float(checks["p99_latency_ms"].get("value") or 0.0) > max_p99_ms * 1.5
+        )
+    )
+    safe = bool(
+        not abort
+        and not budget.get("freeze_changes")
+        and metric_evidence_ready
+        and checks["error_rate"]["passed"]
+        and checks["p99_latency_ms"]["passed"]
+    )
+    reasons: list[str] = []
+    if budget.get("freeze_changes"):
+        reasons.append(str(budget.get("freeze_reason") or "错误预算已耗尽"))
+    if checks["error_rate"]["status"] != "ok":
+        reasons.append(
+            "错误率 PromQL 没有取得实时数值；灰度保持暂停，不会把缺失指标当成成功。"
+        )
+    elif not checks["error_rate"]["passed"]:
+        reasons.append(
+            f"错误率 {float(checks['error_rate']['value']):.6f} 超过门槛 {max_error_rate:.6f}。"
+        )
+    if latency_query and checks["p99_latency_ms"]["status"] != "ok":
+        reasons.append("P99 PromQL 没有取得实时数值。")
+    elif latency_query and not checks["p99_latency_ms"]["passed"]:
+        reasons.append(
+            f"P99 {float(checks['p99_latency_ms']['value']):.2f}ms 超过门槛 {max_p99_ms:.2f}ms。"
+        )
+    if safe:
+        reasons.append("实时错误率、可选 P99 和当前错误预算均在批准边界内。")
+    return {
+        "safe": safe,
+        "abort": abort,
+        "release_id": release.get("id"),
+        "service": release.get("service"),
+        "budget": budget,
+        "metrics": checks,
+        "metric_evidence_ready": metric_evidence_ready,
+        "reasons": reasons,
+        "gate_snapshot": {
+            "verdict": (release.get("gate") or {}).get("verdict"),
+            "risk": (release.get("gate") or {}).get("risk") or {},
+            "blast_radius": (release.get("gate") or {}).get("blast_radius") or {},
+        },
+    }
+
+
+async def _scan_progressive_metrics(
+    error_query: str,
+    latency_query: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    error_metric = await _prometheus_scalar(error_query)
+    latency_metric = (
+        await _prometheus_scalar(latency_query)
+        if latency_query else
+        {"status": "not_configured"}
+    )
+    return error_metric, latency_metric
+
+
 def build_reliability_router(deps: ReliabilityDependencies) -> APIRouter:
     router = APIRouter(tags=["SRE reliability governance"])
 
@@ -353,6 +520,21 @@ def build_reliability_router(deps: ReliabilityDependencies) -> APIRouter:
     @router.get("/api/releases")
     async def list_releases():
         return {"status": "ok", "releases": deps.store.releases()}
+
+    @router.get("/api/releases/{release_id}/analysis")
+    async def release_analysis(release_id: str):
+        """Read-only Argo AnalysisRun callback.
+
+        Missing or unreachable telemetry is inconclusive, never successful.
+        A hard SLO/SLI violation returns ``abort=true`` so Argo restores the
+        stable ReplicaSet without waiting for an LLM decision.
+        """
+        release = deps.store.release(release_id)
+        if not release:
+            raise HTTPException(status_code=404, detail="发布申请不存在")
+        analysis = await _evaluate_progressive_analysis(deps.store, release)
+        deps.store.update_release(release_id, latest_analysis=analysis)
+        return {"status": "ok", "data": analysis}
 
     @router.post("/api/releases")
     async def create_release(req: ReleaseRequest, request: Request):
@@ -455,6 +637,23 @@ def build_reliability_router(deps: ReliabilityDependencies) -> APIRouter:
             }
         status = "blocked" if gate.get("verdict") in {"blocked", "rollback"} else "awaiting_approval"
         release_report = _build_release_report(payload, gate, budget, manifest_validation, image_scan)
+        progressive_delivery = {
+            "enabled": bool(
+                payload.get("release_mode") == "existing"
+                and payload.get("change_channel") == "standard"
+                and payload.get("workload_kind") == "Deployment"
+            ),
+            "engine": "ArgoRolloutsCanary/v1",
+            "traffic_routing": "replica_weighted",
+            "manual_full_promotion": True,
+            "analysis_required": True,
+            "analysis_evidence": (
+                "configured"
+                if payload.get("error_rate_promql") or os.getenv("GRAY_RELEASE_DEFAULT_ERROR_RATE_PROMQL", "")
+                else "missing_error_rate_promql"
+            ),
+            "requested_strategy": gate.get("selected_strategy") or {},
+        }
         try:
             release = deps.store.add_release({
                 **payload,
@@ -464,6 +663,7 @@ def build_reliability_router(deps: ReliabilityDependencies) -> APIRouter:
                 "gate": gate,
                 "report": release_report,
                 "error_budget": budget,
+                "progressive_delivery": progressive_delivery,
                 "submitted_by": _actor(request),
                 "emergency_audit": {
                     "enabled": is_emergency,
@@ -514,8 +714,77 @@ def build_reliability_router(deps: ReliabilityDependencies) -> APIRouter:
             raise HTTPException(status_code=409, detail="发布必须先通过门禁并由人工批准")
         if (release.get("error_budget") or {}).get("freeze_changes") and release.get("change_channel") != "emergency_recovery":
             raise HTTPException(status_code=409, detail="错误预算已耗尽，禁止执行发布")
+        if (
+            (release.get("progressive_delivery") or {}).get("enabled")
+            and os.getenv("GRAY_RELEASE_ENABLED", "true").lower() not in {"1", "true", "yes", "on"}
+        ):
+            raise HTTPException(status_code=503, detail="GRAY_RELEASE_ENABLED=false，不能执行 Argo Rollouts 灰度发布")
         job = await deps.submit_release(release, _actor(request))
         updated = deps.store.update_release(release_id, status="executing", ops_job_id=job.get("id"), execution=job)
+        return {"status": "accepted", "release": updated, "job": job}
+
+    @router.post("/api/releases/{release_id}/promote")
+    async def promote_release(release_id: str, req: ApprovalRequest, request: Request):
+        release = deps.store.release(release_id)
+        if not release:
+            raise HTTPException(status_code=404, detail="发布申请不存在")
+        if release.get("status") != "canary_validated":
+            raise HTTPException(status_code=409, detail="只有全部灰度批次和 AnalysisRun 已通过的发布才能申请全量晋级")
+        if not req.confirm:
+            raise HTTPException(status_code=409, detail="必须明确确认全量影响范围后才能晋级")
+        analysis = await _evaluate_progressive_analysis(deps.store, release)
+        if analysis.get("safe") is not True:
+            deps.store.update_release(release_id, latest_analysis=analysis)
+            raise HTTPException(status_code=409, detail={
+                "message": "全量晋级前的实时 SRE 门禁未通过；灰度继续保持暂停。",
+                "analysis": analysis,
+            })
+        actor = _actor(request)
+        job = await deps.submit_release(
+            {
+                **release,
+                "progressive_command": "promote",
+                "approved_by": actor,
+                "promotion_comment": req.comment,
+            },
+            actor,
+        )
+        updated = deps.store.update_release(
+            release_id,
+            status="promoting",
+            promotion_approved_by=actor,
+            promotion_comment=req.comment,
+            promotion_ops_job_id=job.get("id"),
+            latest_analysis=analysis,
+        )
+        return {"status": "accepted", "release": updated, "job": job}
+
+    @router.post("/api/releases/{release_id}/abort")
+    async def abort_release(release_id: str, req: ApprovalRequest, request: Request):
+        release = deps.store.release(release_id)
+        if not release:
+            raise HTTPException(status_code=404, detail="发布申请不存在")
+        if release.get("status") not in {"executing", "canary_validated", "promoting", "failed"}:
+            raise HTTPException(status_code=409, detail="当前发布状态没有可中止的 Argo Rollout")
+        if not req.confirm:
+            raise HTTPException(status_code=409, detail="必须明确确认后才能中止灰度")
+        actor = _actor(request)
+        job = await deps.submit_release(
+            {
+                **release,
+                "progressive_command": "abort",
+                "approved_by": actor,
+                "abort_comment": req.comment,
+            },
+            actor,
+        )
+        updated = deps.store.update_release(
+            release_id,
+            status="aborting",
+            abort_approved_by=actor,
+            abort_comment=req.comment,
+            abort_ops_job_id=job.get("id"),
+        )
         return {"status": "accepted", "release": updated, "job": job}
 
     return router

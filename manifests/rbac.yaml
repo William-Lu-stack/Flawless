@@ -116,6 +116,16 @@ rules:
       - gateways
     verbs: [get, list]
 
+  - apiGroups: ["argoproj.io"]
+    resources:
+      - rollouts
+      - rollouts/status
+      - rollouts/scale
+      - analysistemplates
+      - analysisruns
+      - experiments
+    verbs: [get, list, watch]
+
 ---
 # ClusterRoleBinding — 绑定到 k8s-agent-sa
 apiVersion: rbac.authorization.k8s.io/v1
@@ -184,6 +194,15 @@ rules:
       - configmaps
       - secrets
     verbs: [get, create, patch, update, delete]
+  - apiGroups: ["argoproj.io"]
+    resources:
+      - rollouts
+      - rollouts/status
+      - rollouts/scale
+      - analysistemplates
+      - analysisruns
+      - experiments
+    verbs: [get, list, watch, create, patch, update, delete]
 
 ---
 # Optional high-risk node containment capability. It deliberately has no
@@ -215,6 +234,9 @@ rules:
   - apiGroups: ["policy"]
     resources: [poddisruptionbudgets]
     verbs: [get, patch]
+  - apiGroups: ["argoproj.io"]
+    resources: [rollouts, rollouts/status, rollouts/scale, analysistemplates, analysisruns, experiments]
+    verbs: [get, list, watch, create, patch, update, delete]
 
 ---
 # Optional high-risk storage provisioning capability. It deliberately has no

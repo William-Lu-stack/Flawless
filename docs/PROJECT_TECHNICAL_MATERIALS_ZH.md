@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：3.2.17
+版本：3.3.0
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -172,7 +172,7 @@ Skill Router 使用上下文贝叶斯效用排序，综合：
 
 ### 4.4 防卡死状态机
 
-3.2.17 将根因诊断拆成独立可观测阶段：
+3.3.0 将根因诊断拆成独立可观测阶段：
 
 ```text
 root_cause_diagnosing
@@ -214,6 +214,20 @@ root_cause_diagnosing
 - 验证 Ready、重启次数、终止原因、日志错误、Events 和原始成功判据。
 - 仅当 `verification.recovered=true` 时，事故状态才能进入 `completed`。
 - 未恢复时保存 `_last_failure` 和动作指纹，禁止只改写理由后重复同一无效方案。
+
+### 5.3 灰度发布的 SRE 落地
+
+3.3.0 把原有“展示灰度策略、一次性 patch Deployment”升级为真实 Argo Rollouts canary：
+
+1. 现有 BFS 依赖图算法计算故障域、可达节点、关键依赖和 blast radius。
+2. 发布风险算法根据错误预算、近期异常、依赖影响面和变更通道选择首批比例、增长步长、最大比例和观察窗口。
+3. 副本离散化算法计算一个 Pod 对应的真实最小权重；若超过批准上限则阻断，不隐式扩大爆炸半径。
+4. Argo 在每个 `setWeight` 后运行一次 AnalysisRun，实时回调 Flawless 查询 SLO 状态和 Prometheus 错误率/P99。
+5. 指标缺失是 inconclusive，硬性阈值违规是 failed；二者都不能继续扩大。
+6. 达到算法上限后无限暂停，必须由操作员二次批准 `promoteFull`。
+7. 失败时先恢复 stableRS，再从该 ReplicaSet 恢复源 Deployment template；运行态和声明态同时恢复才关闭回滚链。
+
+这套设计体现了 SRE 的错误预算门禁、渐进式交付、最小爆炸半径、自动回退、人工高风险审批和可验证恢复，而不只是 Kubernetes RollingUpdate。
 
 ## 6. 数据与持久化
 
@@ -271,7 +285,7 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-3.2.17 已完成：
+3.3.0 已完成：
 
 - Python 全量测试：185 passed，另有 9 个 subtests passed。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。

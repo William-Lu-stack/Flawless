@@ -11,7 +11,7 @@ namespaceOverride: k8s-agent
 
 image:
   repository: ghcr.dockerproxy.net/your-org/flawless
-  tag: 3.2.17
+  tag: 3.3.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -190,6 +190,15 @@ config:
   PROMETHEUS_CLUSTER_LABEL: cluster
   PROMETHEUS_CLUSTER_LABELS: cluster,cluster_id,rancher_cluster_id,cluster_name
   PROMETHEUS_URL: http://k8s-agent-prometheus.k8s-agent.svc.cluster.local:9090
+  GRAY_RELEASE_ENABLED: "true"
+  GRAY_RELEASE_BASELINE_TIMEOUT_SECONDS: "180"
+  GRAY_RELEASE_CHANGE_TIMEOUT_SECONDS: "240"
+  GRAY_RELEASE_REQUIRE_PROMETHEUS: "true"
+  GRAY_RELEASE_VERIFY_TIMEOUT_SECONDS: "3600"
+  # Query results must be ratios (0.01 = 1%) and milliseconds respectively.
+  # Placeholders: {service}, {namespace}, {workload}, {cluster}.
+  GRAY_RELEASE_DEFAULT_ERROR_RATE_PROMQL: ""
+  GRAY_RELEASE_DEFAULT_P99_LATENCY_PROMQL: ""
 
   # RANCHER_TOKEN is injected from Secret k8s-agent-oauth.
   RANCHER_CLUSTER_IDS: all

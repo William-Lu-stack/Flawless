@@ -19,6 +19,7 @@ data:
   POSTMORTEM_AGENT_URL: {{ printf "http://%s-agents:8103/a2a/tasks" (include "flawless.fullname" .) | quote }}
   MCP_SERVER_URL: {{ printf "http://%s-agents:8105/mcp" (include "flawless.fullname" .) | quote }}
   ADAPTER_URL: {{ printf "http://%s-agents:8200" (include "flawless.fullname" .) | quote }}
+  GRAY_RELEASE_ANALYSIS_URL: {{ printf "http://%s.%s.svc.cluster.local:%v" (include "flawless.fullname" .) (include "flawless.namespace" .) .Values.service.apiPort | quote }}
   MODEL_PROFILES_STORE: /var/lib/flawless/model-profiles.json
   KNOWLEDGE_STORE_PATH: /var/lib/flawless/knowledge-base.json
   OPS_SKILL_ROOT: /var/lib/flawless/ops-skills

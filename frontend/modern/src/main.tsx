@@ -2369,7 +2369,27 @@ function ReliabilityPage() {
   const [releaseState, refreshReleases] = useAsync<any>(() => apiGet("/api/releases"), []);
   const [inventory] = useAsync<any>(() => apiGet("/api/rancher/inventory").catch(() => ({ clusters: [], inventory: [] })), []);
   const [objective, setObjective] = useState({ service: "", target_percent: "99.9", window_days: "30", observed_availability_percent: "100", observed_minutes: "43200", downtime_minutes: "0" });
-  const [release, setRelease] = useState({ release_mode: "existing", change_channel: "standard", emergency_action: "rollback", emergency_reason: "", service: "", cluster: "local", namespace: "default", workload_kind: "Deployment", workload_name: "", container_name: "app", image: "", change_summary: "", manifest_yaml: "" });
+  const [release, setRelease] = useState({
+    release_mode: "existing",
+    change_channel: "standard",
+    emergency_action: "rollback",
+    emergency_reason: "",
+    service: "",
+    cluster: "local",
+    namespace: "default",
+    workload_kind: "Deployment",
+    workload_name: "",
+    container_name: "app",
+    image: "",
+    change_summary: "",
+    manifest_yaml: "",
+    error_rate_promql: "",
+    latency_p99_promql: "",
+    max_error_rate: "0.01",
+    max_p99_latency_ms: "1000",
+    analysis_interval_seconds: "60",
+    analysis_count: "3",
+  });
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -2381,6 +2401,13 @@ function ReliabilityPage() {
   const scopedInventory = asList(inventory.data?.inventory).filter((item: any) => !release.cluster || release.cluster === item.cluster?.id || release.cluster === item.cluster?.name);
   const namespaces = Array.from(new Set(scopedInventory.flatMap((item: any) => asList(item.namespaces).map((entry: any) => String(entry.name))))).sort();
   const workloads = scopedInventory.flatMap((item: any) => asList(item.workloads)).filter((item: any) => !release.namespace || item.namespace === release.namespace);
+  const selectedWorkload = workloads.find((item: any) => item.kind === release.workload_kind && item.name === release.workload_name);
+
+  useEffect(() => {
+    if (!releases.some((item: any) => ["executing", "promoting", "aborting"].includes(item.status))) return;
+    const timer = window.setInterval(() => refreshReleases(), 2500);
+    return () => window.clearInterval(timer);
+  }, [releases.map((item: any) => `${item.id}:${item.status}`).join("|")]);
 
   function generateManifest() {
     const name = release.workload_name || "new-application";
@@ -2417,6 +2444,12 @@ function ReliabilityPage() {
       container_name: release.container_name.trim(),
       image: release.image.trim(),
       manifest_yaml: release.manifest_yaml.trim(),
+      error_rate_promql: release.error_rate_promql.trim(),
+      latency_p99_promql: release.latency_p99_promql.trim(),
+      max_error_rate: Number(release.max_error_rate),
+      max_p99_latency_ms: Number(release.max_p99_latency_ms),
+      analysis_interval_seconds: Number(release.analysis_interval_seconds),
+      analysis_count: Number(release.analysis_count),
     };
     if (payload.release_mode === "existing" && !payload.workload_name) {
       setBusy("");
@@ -2479,6 +2512,34 @@ function ReliabilityPage() {
     finally { setBusy(""); }
   }
 
+  async function promote(id: string) {
+    setBusy(id); setError(""); setNotice("");
+    try {
+      const response = await apiPost<any>(`/api/releases/${encodeURIComponent(id)}/promote`, {
+        confirm: true,
+        comment: "已复核灰度批次、实时 SLI、错误预算和全量爆炸半径，同意全量晋级",
+      });
+      setJobs((current) => ({ ...current, [id]: response.job }));
+      refreshReleases();
+      setNotice("全量晋级已进入独立人工审批的受控任务；完成后必须看到 stableRS 与 Ready/Available 副本收敛。");
+    } catch (requestError: any) { setError(requestError.message); }
+    finally { setBusy(""); }
+  }
+
+  async function abortRelease(id: string) {
+    setBusy(id); setError(""); setNotice("");
+    try {
+      const response = await apiPost<any>(`/api/releases/${encodeURIComponent(id)}/abort`, {
+        confirm: true,
+        comment: "确认停止扩大灰度并恢复上一稳定 ReplicaSet",
+      });
+      setJobs((current) => ({ ...current, [id]: response.job }));
+      refreshReleases();
+      setNotice("中止任务已提交；只有上一 stableRS 与 Ready/Available 副本恢复后才会结束。");
+    } catch (requestError: any) { setError(requestError.message); }
+    finally { setBusy(""); }
+  }
+
   return <section className="workspace-grid reliability-workspace">
     <div className="reliability-hero span-all">
       <div><span><ShieldCheck size={16} />SRE 发布控制面</span><h2>稳定性决定发布速度</h2><p>默认 99.9% SLO 对应月度约 43.2 分钟错误预算。预算用完后冻结常规发布，只放行故障恢复和回滚。</p></div>
@@ -2528,6 +2589,13 @@ function ReliabilityPage() {
         </div>
         {release.release_mode === "existing" ? <label>现有 Workload<select value={release.workload_name ? `${release.workload_kind}|${release.workload_name}` : ""} onChange={(e) => { const [kind, name] = e.target.value.split("|"); setRelease({ ...release, workload_kind: kind || "Deployment", workload_name: name || "", service: release.service || name || "" }); }}><option value="">选择 Workload</option>{workloads.map((item: any) => <option key={`${item.namespace}-${item.kind}-${item.name}`} value={`${item.kind}|${item.name}`}>{item.kind}/{item.name}</option>)}</select></label> : <div className="form-pair"><label>资源类型<select value={release.workload_kind} onChange={(e) => setRelease({ ...release, workload_kind: e.target.value })}><option>Deployment</option><option>StatefulSet</option><option>DaemonSet</option></select></label><label>新 Workload 名称<input value={release.workload_name} onChange={(e) => setRelease({ ...release, workload_name: e.target.value, service: release.service || e.target.value })} placeholder="new-application" /></label></div>}
         {(release.change_channel === "standard" || release.emergency_action === "rollback") && <div className="form-pair"><label>Container<input value={release.container_name} onChange={(e) => setRelease({ ...release, container_name: e.target.value })} /></label><label>{release.change_channel === "emergency_recovery" ? "上一稳定镜像" : "不可变镜像"}<input placeholder="registry/app:v1.2.3" value={release.image} onChange={(e) => setRelease({ ...release, image: e.target.value })} /></label></div>}
+        {release.change_channel === "standard" && release.release_mode === "existing" && release.workload_kind === "Deployment" && <>
+          <div className="progressive-policy-note"><Workflow size={14} /><span>真实灰度由 Argo Rollouts 执行：每批调用 Prometheus/SLO AnalysisRun，到达算法批准上限后强制暂停，必须再次人工批准才会到 100%。当前是副本权重模式；{selectedWorkload ? `目标有 ${Number(selectedWorkload.replicas || 0)} 个副本。` : "执行时会读取真实副本数。"}少副本无法精确表示 1%/5% 时会阻断，不会偷偷放大流量。</span></div>
+          <label>错误率 PromQL（查询结果为 0~1 比例）<textarea value={release.error_rate_promql} onChange={(e) => setRelease({ ...release, error_rate_promql: e.target.value })} placeholder={'可留空使用 ConfigMap 的 GRAY_RELEASE_DEFAULT_ERROR_RATE_PROMQL；支持 {service}、{namespace}、{workload}、{cluster} 占位符'} /></label>
+          <label>P99 PromQL（可选，查询结果为毫秒）<textarea value={release.latency_p99_promql} onChange={(e) => setRelease({ ...release, latency_p99_promql: e.target.value })} placeholder="可留空；填写后每个批次必须同时通过延迟门槛" /></label>
+          <div className="form-pair"><label>最大错误率<input type="number" min="0.000001" max="1" step="0.0001" value={release.max_error_rate} onChange={(e) => setRelease({ ...release, max_error_rate: e.target.value })} /></label><label>最大 P99（ms）<input type="number" min="1" value={release.max_p99_latency_ms} onChange={(e) => setRelease({ ...release, max_p99_latency_ms: e.target.value })} /></label></div>
+          <div className="form-pair"><label>采样间隔（秒）<input type="number" min="10" max="3600" value={release.analysis_interval_seconds} onChange={(e) => setRelease({ ...release, analysis_interval_seconds: e.target.value })} /></label><label>连续成功次数<input type="number" min="1" max="20" value={release.analysis_count} onChange={(e) => setRelease({ ...release, analysis_count: e.target.value })} /></label></div>
+        </>}
         {(release.change_channel === "standard" || release.emergency_action === "restore_config") && <label className="manifest-editor-label"><span>{release.emergency_action === "restore_config" ? "恢复后的期望状态 YAML" : "期望状态 YAML"} <button type="button" className="ghost tiny" onClick={generateManifest}><FileUp size={13} />生成生产模板</button></span><textarea className="manifest-editor" value={release.manifest_yaml} onChange={(e) => setRelease({ ...release, manifest_yaml: e.target.value })} placeholder={release.release_mode === "new" ? "新应用必须提交完整 apps/v1 Workload YAML" : "提交完整期望 YAML；平台会校验并生成可审计差异"} /></label>}
         <div className="manifest-policy"><ShieldCheck size={14} /><span>提交前检查：目标一致性、不可变镜像、非特权运行、ServiceAccount Token、hostPath、Linux capabilities。Secret 不允许进入该入口。</span></div>
         {release.change_channel === "emergency_recovery" && <label>紧急修复理由<textarea value={release.emergency_reason} onChange={(e) => setRelease({ ...release, emergency_reason: e.target.value })} placeholder="说明当前故障、业务影响、为什么必须立即恢复，以及失败时如何停止或回退" /></label>}
@@ -2540,9 +2608,9 @@ function ReliabilityPage() {
       <PanelTitle icon={Workflow} title="发布审计链" subtitle="申请、预算快照、算法判定、审批和执行任务可追溯" action={<button className="ghost tiny" onClick={refreshReleases}><RefreshCcw size={13} />刷新</button>} />
       <div className="release-list">
         {releases.map((item: any) => <article className="release-row" key={item.id}>
-          <div className="release-main"><div className="release-badges"><span className={cx("release-status", item.status)}>{item.status}</span>{item.change_channel === "emergency_recovery" && <span className="release-status emergency">紧急修复 · {item.emergency_action}</span>}</div><strong>{item.service} · {item.workload_kind}/{item.workload_name}</strong><small>{item.cluster}/{item.namespace} · {item.release_mode === "new" ? "新建" : "变更"} · {item.manifest_validation ? `YAML 已校验 ${item.manifest_validation.digest}` : item.image || (item.emergency_action === "restart_component" ? "受控重启" : "配置变更")}</small></div>
-          <div className="release-decision"><b>{item.gate?.verdict || "-"}</b><span>风险 {item.gate?.risk?.diff_risk ?? item.gate?.risk?.amplification_factor ?? "-"} · 预算剩余 {Math.round(Number(item.error_budget?.remaining_ratio || 0) * 100)}%</span><small>{item.gate?.reason}</small></div>
-          <div className="release-actions">{item.status === "awaiting_approval" && <button className="ghost" disabled={busy === item.id} onClick={() => approve(item)}><CheckCircle2 size={14} />批准</button>}{item.status === "approved" && <button className="primary" disabled={busy === item.id} onClick={() => execute(item.id)}><Play size={14} />{item.change_channel === "emergency_recovery" ? "执行修复" : "执行发布"}</button>}{item.status === "blocked" && <span className="release-block-note">门禁阻断</span>}</div>
+          <div className="release-main"><div className="release-badges"><span className={cx("release-status", item.status)}>{item.status}</span>{item.change_channel === "emergency_recovery" && <span className="release-status emergency">紧急修复 · {item.emergency_action}</span>}{item.progressive_delivery?.enabled && <span className="release-status progressive">Argo 灰度 · {item.progressive_phase || "待启动"}</span>}</div><strong>{item.service} · {item.workload_kind}/{item.workload_name}</strong><small>{item.cluster}/{item.namespace} · {item.release_mode === "new" ? "新建" : "变更"} · {item.manifest_validation ? `YAML 已校验 ${item.manifest_validation.digest}` : item.image || (item.emergency_action === "restart_component" ? "受控重启" : "配置变更")}</small></div>
+          <div className="release-decision"><b>{item.gate?.verdict || "-"}</b><span>风险 {item.gate?.risk?.diff_risk ?? item.gate?.risk?.amplification_factor ?? "-"} · 预算剩余 {Math.round(Number(item.error_budget?.remaining_ratio || 0) * 100)}%</span><small>{item.latest_analysis ? `实时门禁：${item.latest_analysis.safe ? "通过" : item.latest_analysis.abort ? "回滚" : "证据不足/暂停"} · ${asList(item.latest_analysis.reasons).join(" ")}` : item.gate?.reason}</small></div>
+          <div className="release-actions">{item.status === "awaiting_approval" && <button className="ghost" disabled={busy === item.id} onClick={() => approve(item)}><CheckCircle2 size={14} />批准</button>}{item.status === "approved" && <button className="primary" disabled={busy === item.id} onClick={() => execute(item.id)}><Play size={14} />{item.change_channel === "emergency_recovery" ? "执行修复" : "启动灰度"}</button>}{item.status === "canary_validated" && <button className="primary" disabled={busy === item.id} onClick={() => promote(item.id)}><CheckCircle2 size={14} />复核并全量晋级</button>}{["executing", "canary_validated", "promoting", "failed", "paused"].includes(item.status) && item.progressive_delivery?.enabled && <button className="ghost danger" disabled={busy === item.id} onClick={() => abortRelease(item.id)}><Activity size={14} />中止并回退</button>}{item.status === "blocked" && <span className="release-block-note">门禁阻断</span>}</div>
           <ReleaseReportPanel report={item.report} />
           {jobs[item.id] && <div className="release-job"><ReleaseJobTracker initial={jobs[item.id]} /></div>}
         </article>)}

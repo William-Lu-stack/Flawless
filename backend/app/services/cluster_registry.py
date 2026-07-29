@@ -666,6 +666,34 @@ class ClusterRegistry:
         result = resource.patch(**kwargs)
         return result.to_dict() if hasattr(result, "to_dict") else dict(result)
 
+    def patch_resource_status(
+        self,
+        cluster_id: str,
+        *,
+        api_version: str,
+        kind: str,
+        name: str,
+        namespace: str,
+        patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Patch a CRD status subresource for an operator-approved command."""
+        resource = DynamicClient(self.api_client(cluster_id)).resources.get(
+            api_version=api_version,
+            kind=kind,
+        )
+        status_resource = resource.subresources.get("status")
+        if status_resource is None:
+            raise RuntimeError(f"{api_version} {kind} 没有声明 status 子资源")
+        kwargs: dict[str, Any] = {
+            "name": name,
+            "body": patch,
+            "content_type": "application/merge-patch+json",
+        }
+        if resource.namespaced:
+            kwargs["namespace"] = namespace or "default"
+        result = status_resource.patch(**kwargs)
+        return result.to_dict() if hasattr(result, "to_dict") else dict(result)
+
     def read_resource(self, cluster_id: str, *, api_version: str, kind: str, name: str, namespace: str = "") -> dict[str, Any]:
         resource = DynamicClient(self.api_client(cluster_id)).resources.get(api_version=api_version, kind=kind)
         kwargs: dict[str, Any] = {"name": name}
