@@ -16,14 +16,14 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.3.0**.
+Current release: **3.3.1**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
 
-Release 3.3.0 replaces the display-only Deployment canary with real Argo
+Release 3.3.1 replaces the display-only Deployment canary with real Argo
 Rollouts progressive delivery.  The existing blast-radius algorithm now
 produces an enforceable replica-weight envelope; each batch runs a live
 Prometheus/SLO AnalysisRun, the approved ceiling pauses for a second human

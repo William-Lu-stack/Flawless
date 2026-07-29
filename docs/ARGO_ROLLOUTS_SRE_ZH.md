@@ -95,7 +95,7 @@ helm upgrade --install flawless ./charts/flawless \
 AnalysisRun 从 Argo 控制器所在 namespace 回调 Flawless，因此地址必须使用跨 namespace 可解析的 FQDN，例如：
 
 ```text
-http://flawless.k8s-agent.svc.cluster.local:8080
+http://k8s-agent-api.k8s-agent.svc.cluster.local:8080
 ```
 
 Chart 会按 Helm release 名称和 namespace 自动生成这个 FQDN。

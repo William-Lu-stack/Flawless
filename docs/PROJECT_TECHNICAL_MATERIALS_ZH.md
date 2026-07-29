@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：3.3.0
+版本：3.3.1
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -172,7 +172,7 @@ Skill Router 使用上下文贝叶斯效用排序，综合：
 
 ### 4.4 防卡死状态机
 
-3.3.0 将根因诊断拆成独立可观测阶段：
+3.3.1 将根因诊断拆成独立可观测阶段：
 
 ```text
 root_cause_diagnosing
@@ -217,7 +217,7 @@ root_cause_diagnosing
 
 ### 5.3 灰度发布的 SRE 落地
 
-3.3.0 把原有“展示灰度策略、一次性 patch Deployment”升级为真实 Argo Rollouts canary：
+3.3.1 把原有“展示灰度策略、一次性 patch Deployment”升级为真实 Argo Rollouts canary：
 
 1. 现有 BFS 依赖图算法计算故障域、可达节点、关键依赖和 blast radius。
 2. 发布风险算法根据错误预算、近期异常、依赖影响面和变更通道选择首批比例、增长步长、最大比例和观察窗口。
@@ -285,7 +285,7 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-3.3.0 已完成：
+3.3.1 已完成：
 
 - Python 全量测试：185 passed，另有 9 个 subtests passed。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。

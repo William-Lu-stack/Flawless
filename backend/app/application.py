@@ -195,7 +195,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.3.0")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.3.1")
 APP_CODE_SIGNATURE = "bounded-llm-skill-router-v23"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -8318,7 +8318,7 @@ async def _execute_progressive_change(
             raise ValueError(str(policy.get("blocked_reason")))
         analysis_url = os.getenv(
             "GRAY_RELEASE_ANALYSIS_URL",
-            "http://flawless.k8s-agent.svc.cluster.local:8080",
+            "http://k8s-agent-api.k8s-agent.svc.cluster.local:8080",
         ).strip()
         if not analysis_url.startswith(("http://", "https://")):
             raise ValueError("GRAY_RELEASE_ANALYSIS_URL 必须是 Argo AnalysisRun 可访问的 HTTP(S) 地址")
