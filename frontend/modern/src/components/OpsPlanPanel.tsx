@@ -24,7 +24,10 @@ const ACTIVE_STATUSES = new Set(["queued", "running", "awaiting_approval", "resu
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "unresolved", "blocked"]);
 const ACTIVE_EVENT_STAGES = new Set([
   "queued", "starting", "attempt", "collecting_priority_logs", "collecting_evidence", "step_start", "step_waiting",
-  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "skill_routed", "evidence_plan_ready", "skill_evidence_refreshed", "skill_chain_ready", "execution_preflight", "change_start", "change_waiting", "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
+  "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "llm_planning", "skill_router_processing",
+  "deterministic_replan_start", "deterministic_replan", "skill_routed", "evidence_plan_ready",
+  "skill_evidence_refreshed", "skill_chain_ready", "execution_preflight", "change_start", "change_waiting",
+  "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
   "continuation_wait", "resume_pending",
 ]);
 const EXECUTION_PHASES = ["采集证据", "根因诊断", "提交变更", "恢复验证"];
@@ -62,6 +65,18 @@ function stageLabel(stage: unknown) {
     diagnosing: "根因诊断",
     diagnosis_waiting: "根因诊断进行中",
     root_cause_diagnosing: "根因诊断进行中",
+    llm_planning: "LLM 根因规划",
+    llm_planning_done: "LLM 诊断已返回",
+    llm_planning_failed: "LLM 诊断已降级",
+    skill_router_processing: "Skill Router 处理中",
+    skill_router_done: "Skill Router 已完成",
+    skill_router_timeout: "Skill Router 已熔断",
+    skill_router_failed: "Skill Router 异常终止",
+    deterministic_replan_start: "确定性根因规划",
+    deterministic_replan: "确定性根因规划",
+    deterministic_replan_done: "确定性根因规划完成",
+    deterministic_replan_timeout: "确定性根因规划已熔断",
+    deterministic_replan_failed: "确定性根因规划异常终止",
     root_cause_diagnosed: "根因诊断完成",
     diagnosis_done: "根因诊断完成",
     skill_routed: "Skill 动态路由",
@@ -135,7 +150,7 @@ function eventIcon(event: any, active: boolean) {
 function phaseIndex(stage: unknown) {
   const value = String(stage || "");
   if (["queued", "starting", "attempt", "release_gate", "collecting_priority_logs", "pod_logs_collected", "pod_logs_unavailable", "collecting_evidence", "collecting_evidence_done"].includes(value)) return 0;
-  if (["log_triage_done", "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "root_cause_diagnosed", "diagnosis_done", "skill_routed", "skill_evidence_refreshed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
+  if (["log_triage_done", "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "llm_planning", "llm_planning_done", "llm_planning_failed", "skill_router_processing", "skill_router_done", "skill_router_timeout", "skill_router_failed", "deterministic_replan_start", "deterministic_replan", "deterministic_replan_done", "deterministic_replan_timeout", "deterministic_replan_failed", "root_cause_diagnosed", "diagnosis_done", "skill_routed", "skill_evidence_refreshed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
   if (["execution_preflight", "execution_preflight_done", "execution_permission_blocked", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting", "change_done"].includes(value)) return 2;
   if (["verifying", "verification_done", "recovered"].includes(value)) return 3;
   return 1;
@@ -212,6 +227,10 @@ function renderEventDetails(event: any) {
   const logErrors = event?.log_errors && typeof event.log_errors === "object"
     ? Object.entries(event.log_errors)
     : [];
+  const elapsedSeconds = Number(event?.elapsed_seconds);
+  const remainingSeconds = Number(event?.remaining_seconds);
+  const hasDeadlineProgress = Number.isFinite(elapsedSeconds) && Number.isFinite(remainingSeconds);
+  const timeoutSeconds = Number(event?.timeout_seconds);
   return (
     <>
       {evidence && (
@@ -294,8 +313,16 @@ function renderEventDetails(event: any) {
       {event?.waiting_on && (
         <div className="ops-event-chips">
           <span>等待：{event.waiting_on}</span>
-          <span>已用 {Math.round(Number(event.elapsed_seconds || 0))} 秒</span>
-          <span>剩余 {Math.max(0, Math.round(Number(event.remaining_seconds || 0)))} 秒后熔断</span>
+          {hasDeadlineProgress ? (
+            <>
+              <span>已用 {Math.max(0, Math.round(elapsedSeconds))} 秒</span>
+              <span>剩余 {Math.max(0, Math.ceil(remainingSeconds))} 秒后熔断</span>
+            </>
+          ) : Number.isFinite(timeoutSeconds) ? (
+            <span>硬超时上限 {Math.max(1, Math.round(timeoutSeconds))} 秒</span>
+          ) : (
+            <span>等待后端阶段回执</span>
+          )}
         </div>
       )}
       {event?.timed_out_stage && <div className="ops-event-chips"><span className="danger-text">已终止慢调用：{event.timed_out_stage}</span></div>}

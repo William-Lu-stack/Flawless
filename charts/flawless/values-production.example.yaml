@@ -11,7 +11,7 @@ namespaceOverride: k8s-agent
 
 image:
   repository: ghcr.dockerproxy.net/your-org/flawless
-  tag: 3.2.16
+  tag: 3.2.17
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -170,6 +170,8 @@ config:
   OPS_PRIORITY_EVIDENCE_TIMEOUT_SECONDS: "30"
   OPS_PRIORITY_LOG_REQUEST_TIMEOUT_SECONDS: "12"
   OPS_ROOT_CAUSE_TIMEOUT_SECONDS: "120"
+  OPS_SKILL_ROUTER_TIMEOUT_SECONDS: "18"
+  OPS_DETERMINISTIC_REPLAN_TIMEOUT_SECONDS: "20"
   OPS_MAX_CONCURRENT_JOBS: "4"
   OPS_CONTINUATION_INTERVAL_SECONDS: "30"
   OPS_STEP_APPROVAL_TIMEOUT_SECONDS: "0"

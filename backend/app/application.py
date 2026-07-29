@@ -187,8 +187,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.16")
-APP_CODE_SIGNATURE = "builtin-skill-idempotent-migration-v22"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.2.17")
+APP_CODE_SIGNATURE = "bounded-llm-skill-router-v23"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -11028,7 +11028,20 @@ async def _evidence_based_replan(
     attempted_actions: set[str] | None = None,
     *,
     include_llm: bool = True,
+    progress=None,
 ) -> list[dict]:
+    async def notify(stage: str, message: str, **extra) -> None:
+        """Expose sub-stage progress without letting a slow event sink block diagnosis."""
+        if not progress:
+            return
+        try:
+            await asyncio.wait_for(progress(stage, message, **extra), timeout=1.0)
+        except Exception:
+            # The outer stage heartbeat and hard timeout remain authoritative.
+            # Progress persistence is observability, never a prerequisite for
+            # producing or safely rejecting a repair plan.
+            return
+
     deep = plan.get("_runtime_evidence") or {}
     failed_context = plan.get("_last_failure") or {}
     blocked_change_fingerprints = {
@@ -11074,6 +11087,12 @@ async def _evidence_based_replan(
         # Direct log + Workload/storage evidence is stronger than a generic
         # CrashLoop runbook label. Resolve this deterministic Skill before any
         # LLM call so a model/network stall cannot hold root-cause diagnosis.
+        await notify(
+            "skill_router_processing",
+            "实时日志与 Workload/PVC 证据已命中写路径权限根因，正在实例化最高匹配的权限恢复 Skill。",
+            router="deterministic_evidence_override",
+            candidate_count=1,
+        )
         plan["_runtime_replan"]["runbook_id"] = "storage_permission"
         progressive = _materialize_executable_skill(
             plan,
@@ -11087,6 +11106,13 @@ async def _evidence_based_replan(
             VOLUME_PERMISSION_SKILL_ID,
         )
         if not progressive:
+            await notify(
+                "skill_router_done",
+                "权限恢复 Skill 已匹配，但当前证据无法生成可审批的具体变更。",
+                selected_skill_id=VOLUME_PERMISSION_SKILL_ID,
+                alternative_plan_count=0,
+                level="warning",
+            )
             return []
         plan["_runtime_replan"]["planning"] = {
             "source": "UnifiedExecutableOpsSkillRuntime/v1",
@@ -11094,8 +11120,21 @@ async def _evidence_based_replan(
             "stage": progressive.get("permission_recovery_stage") or "administrator_boundary",
             "rejected_candidates": [],
         }
+        await notify(
+            "skill_router_done",
+            "权限恢复 Skill 已生成具体 YAML 变更，等待进入审批。",
+            selected_skill_id=VOLUME_PERMISSION_SKILL_ID,
+            alternative_plan_count=1,
+            level="success",
+        )
         return [progressive]
     if str(engine_plan.get("runbook_id") or "") == "storage_mount":
+        await notify(
+            "skill_router_processing",
+            "实时 Pod/PVC/PV 证据已命中存储绑定根因，正在实例化 PVC/PV 恢复 Skill。",
+            router="deterministic_evidence_override",
+            candidate_count=1,
+        )
         storage_plan = _materialize_executable_skill(
             plan,
             _skill_signal_payload(
@@ -11114,13 +11153,29 @@ async def _evidence_based_replan(
                 "stage": storage_plan.get("storage_recovery_stage") or "storage_diagnosis",
                 "rejected_candidates": [],
             }
+            await notify(
+                "skill_router_done",
+                "PVC/PV 恢复 Skill 已生成具体存储变更，等待进入审批。",
+                selected_skill_id=PVC_PV_SKILL_ID,
+                alternative_plan_count=1,
+                level="success",
+            )
             return [storage_plan]
     candidates = list(engine_plan.get("changes") or [])
     planner_meta: dict = {"source": "EvidenceRunbookEngine", "hypotheses": engine_plan.get("hypotheses", [])}
+    planner_timeout = max(5, min(int(os.getenv("OPS_LLM_PLANNER_TIMEOUT_SECONDS", "60")), 180))
 
     try:
         if not include_llm:
             raise RuntimeError("deterministic preflight")
+        await notify(
+            "llm_planning",
+            "EvidenceRunbookEngine 已完成候选根因分流，正在等待 LLM 返回结构化根因与首选 Skill。",
+            waiting_on="LLM",
+            elapsed_seconds=0.0,
+            remaining_seconds=float(planner_timeout),
+            timeout_seconds=planner_timeout,
+        )
         def call_planner() -> dict:
             from agents.llm_client import get_llm
             planner_max_tokens = max(512, min(int(os.getenv("OPS_LLM_PLANNER_MAX_TOKENS", "4096")), 8192))
@@ -11179,9 +11234,15 @@ async def _evidence_based_replan(
             response = llm.invoke(prompt, response_format={"type": "json_object"})
             return _extract_json_object(getattr(response, "content", str(response)))
 
-        planner_timeout = max(5, min(int(os.getenv("OPS_LLM_PLANNER_TIMEOUT_SECONDS", "60")), 180))
         llm_plan = await asyncio.wait_for(asyncio.to_thread(call_planner), timeout=planner_timeout)
         planner_meta = {"source": "llm+EvidenceRunbookEngine", **_redact_sensitive(llm_plan)}
+        await notify(
+            "llm_planning_done",
+            "LLM 已返回结构化根因诊断；开始校验动作目录并交给 Skill Router。",
+            selected_skill_id=llm_plan.get("selected_skill_id"),
+            proposed_change_count=len(llm_plan.get("changes") or []),
+            level="success",
+        )
         if llm_plan.get("changes"):
             # AI+Skill 针对本轮证据的方案取代确定性模板；确定性引擎只在模型
             # 无可用方案时降级，不得再次覆盖模型选择。
@@ -11189,6 +11250,12 @@ async def _evidence_based_replan(
     except Exception as exc:
         if include_llm:
             planner_meta["llm_error"] = f"{type(exc).__name__}: {_redact_text(str(exc))}"
+            await notify(
+                "llm_planning_failed",
+                "LLM 根因规划未在边界内完成；继续使用确定性 EvidenceRunbookEngine 候选。",
+                error=planner_meta["llm_error"],
+                level="warning",
+            )
 
     normalized: list[dict] = []
     rejected: list[str] = []
@@ -11229,6 +11296,15 @@ async def _evidence_based_replan(
         "rejected_candidates": rejected[:8],
     }
     if not normalized:
+        await notify(
+            "skill_router_done",
+            "候选动作完成安全校验，但没有可提交的差异化变更。",
+            selected_skill_id=planner_meta.get("selected_skill_id"),
+            accepted_change_count=0,
+            rejected_candidate_count=len(rejected),
+            alternative_plan_count=0,
+            level="warning",
+        )
         return []
     namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
     replanned = {
@@ -11262,30 +11338,84 @@ async def _evidence_based_replan(
         ],
     ]
     planner_preferred_skill_ids = [item for item in planner_preferred_skill_ids if item]
-    replanned = _attach_operator_skills_to_plan(
-        replanned,
-        _skill_signal_payload(
-            question=str(replanned.get("summary") or plan.get("summary") or ""),
-            alert=alert,
-            diagnosis=diagnosis,
-            evidence=deep,
-            plan=replanned,
-        ),
-        preferred_skill_ids=planner_preferred_skill_ids or None,
-        routing={
-            "engine": "DeepSeekRootCauseSkillRouter/v2",
-            "source": planner_meta.get("source") or "evidence_router",
-            "selected_skill_ids": planner_preferred_skill_ids,
-            "secondary_skill_ids": [
-                str(item) for item in (planner_meta.get("secondary_skill_ids") or [])
-                if str(item)
-            ],
-            "skill_dependencies": [
-                item for item in (planner_meta.get("skill_dependencies") or [])
-                if isinstance(item, dict)
-            ],
-            "rationale": planner_meta.get("reason") or "",
-        } if planner_preferred_skill_ids else None,
+    router_signal = _skill_signal_payload(
+        question=str(replanned.get("summary") or plan.get("summary") or ""),
+        alert=alert,
+        diagnosis=diagnosis,
+        evidence=deep,
+        plan=replanned,
+    )
+    router_context = {
+        "engine": "DeepSeekRootCauseSkillRouter/v2",
+        "source": planner_meta.get("source") or "evidence_router",
+        "selected_skill_ids": planner_preferred_skill_ids,
+        "secondary_skill_ids": [
+            str(item) for item in (planner_meta.get("secondary_skill_ids") or [])
+            if str(item)
+        ],
+        "skill_dependencies": [
+            item for item in (planner_meta.get("skill_dependencies") or [])
+            if isinstance(item, dict)
+        ],
+        "rationale": planner_meta.get("reason") or "",
+    } if planner_preferred_skill_ids else None
+    router_timeout = max(
+        0.05,
+        min(float(os.getenv("OPS_SKILL_ROUTER_TIMEOUT_SECONDS", "18")), 60.0),
+    )
+    await notify(
+        "skill_router_processing",
+        "结构化根因和动作已校验，正在按实时证据、历史成功率与风险选择一个主 Skill。",
+        waiting_on="Skill Router",
+        elapsed_seconds=0.0,
+        remaining_seconds=float(router_timeout),
+        timeout_seconds=router_timeout,
+        candidate_count=len(normalized),
+    )
+    try:
+        # Skill matching also records route metrics. Production Skill storage
+        # may be a slow PVC, so this synchronous registry/filesystem work must
+        # not run on the asyncio event loop or defeat the parent hard timeout.
+        replanned = await asyncio.wait_for(
+            asyncio.to_thread(
+                _attach_operator_skills_to_plan,
+                replanned,
+                router_signal,
+                preferred_skill_ids=planner_preferred_skill_ids or None,
+                routing=router_context,
+            ),
+            timeout=router_timeout,
+        )
+    except asyncio.TimeoutError:
+        plan["_runtime_replan"]["planning"]["skill_router_error"] = (
+            f"Skill Router exceeded {router_timeout}s hard timeout"
+        )
+        await notify(
+            "skill_router_timeout",
+            f"Skill Router 超过 {router_timeout:g} 秒硬超时；本轮已安全终止路由，不会无限等待或提交未授权变更。",
+            timed_out_stage="skill_router",
+            timeout_seconds=router_timeout,
+            level="error",
+        )
+        return []
+    except Exception as exc:
+        plan["_runtime_replan"]["planning"]["skill_router_error"] = (
+            f"{type(exc).__name__}: {_redact_text(str(exc))}"
+        )
+        await notify(
+            "skill_router_failed",
+            "Skill Router 异常终止；本轮不会提交未完成授权的变更。",
+            error=plan["_runtime_replan"]["planning"]["skill_router_error"],
+            level="error",
+        )
+        return []
+    await notify(
+        "skill_router_done",
+        "Skill Router 已完成主 Skill 选择和执行契约校验。",
+        selected_skill_id=replanned.get("selected_skill_id"),
+        accepted_change_count=len(replanned.get("changes") or []),
+        alternative_plan_count=1 if replanned.get("changes") else 0,
+        level="success" if replanned.get("changes") else "warning",
     )
     return [replanned] if replanned.get("changes") else []
 
@@ -11762,6 +11892,95 @@ async def _execute_ops_plan_once(
                 level="info",
             )
         return report
+
+    def root_cause_timeout_seconds() -> int:
+        # The parent deadline must leave enough room for both independently
+        # bounded children. Otherwise a model returning near its own deadline
+        # would make the Router look stuck even though it never received its
+        # configured execution window.
+        configured = max(10, int(os.getenv("OPS_ROOT_CAUSE_TIMEOUT_SECONDS", "75")))
+        planner = max(
+            5.0,
+            min(float(os.getenv("OPS_LLM_PLANNER_TIMEOUT_SECONDS", "60")), 180.0),
+        )
+        router = max(
+            0.05,
+            min(float(os.getenv("OPS_SKILL_ROUTER_TIMEOUT_SECONDS", "18")), 60.0),
+        )
+        return max(configured, int(planner + router + 6.0))
+
+    async def deterministic_replan(
+        current_plan: dict,
+        current_steps: list[dict],
+        current_attempted_actions: set[str],
+        *,
+        reason: str,
+        timed_out_stage: str,
+    ) -> list[dict]:
+        """Run the no-LLM fallback under its own deadline and visible terminal event."""
+        fallback_timeout = max(
+            0.05,
+            min(60.0, float(os.getenv("OPS_DETERMINISTIC_REPLAN_TIMEOUT_SECONDS", "20"))),
+        )
+        await emit(
+            "deterministic_replan_start",
+            reason,
+            waiting_on="EvidenceRunbookEngine/Skill Router（无 LLM）",
+            elapsed_seconds=0.0,
+            remaining_seconds=float(fallback_timeout),
+            timeout_seconds=fallback_timeout,
+            level="warning",
+        )
+        try:
+            replans = await run_with_heartbeat(
+                _evidence_based_replan(
+                    current_plan,
+                    current_steps,
+                    current_attempted_actions,
+                    include_llm=False,
+                    progress=emit,
+                ),
+                stage="deterministic_replan",
+                timeout_seconds=fallback_timeout,
+                heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
+                cancel_event=cancel_event,
+                on_heartbeat=heartbeat(
+                    "deterministic_replan",
+                    "EvidenceRunbookEngine/Skill Router（无 LLM）",
+                ),
+            )
+        except StageTimeoutError:
+            replans = []
+            current_plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
+                f"确定性根因规划超过 {fallback_timeout} 秒硬超时。"
+            )
+            await emit(
+                "deterministic_replan_timeout",
+                f"确定性根因规划超过 {fallback_timeout} 秒；已结束本轮诊断等待，未提交任何变更。",
+                timed_out_stage=timed_out_stage,
+                timeout_seconds=fallback_timeout,
+                level="error",
+            )
+        except Exception as exc:
+            replans = []
+            current_plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
+                f"确定性根因规划失败：{type(exc).__name__}: {_redact_text(str(exc))}"
+            )
+            await emit(
+                "deterministic_replan_failed",
+                "确定性根因规划异常终止；已结束本轮诊断等待，未提交任何变更。",
+                timed_out_stage=timed_out_stage,
+                error=f"{type(exc).__name__}: {_redact_text(str(exc))}",
+                level="error",
+            )
+        else:
+            await emit(
+                "deterministic_replan_done",
+                "确定性 EvidenceRunbookEngine 与 Skill Router 已完成。",
+                alternative_plan_count=len(replans),
+                level="success" if replans else "warning",
+            )
+        return replans
 
     if cancel_event and cancel_event.is_set():
         return {"status": "cancelled", "executed": False, "message": "任务已中断，未执行新的运维动作。"}
@@ -12698,15 +12917,23 @@ async def _execute_ops_plan_once(
                 "next_steps": next_steps,
                 "message": current_health["message"],
             }
-        root_cause_timeout = max(10, int(os.getenv("OPS_ROOT_CAUSE_TIMEOUT_SECONDS", "75")))
+        root_cause_timeout = root_cause_timeout_seconds()
         await emit(
             "root_cause_diagnosing",
             "根因诊断正在根据实时证据重排候选根因，并选择最高匹配的可执行 Skill。",
             waiting_on="EvidenceRunbookEngine/LLM/Skill Router",
+            elapsed_seconds=0.0,
+            remaining_seconds=float(root_cause_timeout),
+            timeout_seconds=root_cause_timeout,
         )
         try:
             evidence_replans = await run_with_heartbeat(
-                _evidence_based_replan(plan, executed_steps, attempted_actions),
+                _evidence_based_replan(
+                    plan,
+                    executed_steps,
+                    attempted_actions,
+                    progress=emit,
+                ),
                 stage="root_cause_diagnosing",
                 timeout_seconds=root_cause_timeout,
                 heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
@@ -12721,18 +12948,13 @@ async def _execute_ops_plan_once(
                 timeout_seconds=root_cause_timeout,
                 level="warning",
             )
-            try:
-                evidence_replans = await _evidence_based_replan(
-                    plan,
-                    executed_steps,
-                    attempted_actions,
-                    include_llm=False,
-                )
-            except Exception as exc:
-                evidence_replans = []
-                plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
-                    f"确定性根因规划也失败：{type(exc).__name__}: {_redact_text(str(exc))}"
-                )
+            evidence_replans = await deterministic_replan(
+                plan,
+                executed_steps,
+                attempted_actions,
+                reason="AI 根因规划已熔断，正在执行不依赖模型的确定性根因与 Skill 路由。",
+                timed_out_stage="deterministic_root_cause_planning",
+            )
         except Exception as exc:
             await emit(
                 "stage_timeout",
@@ -12741,18 +12963,13 @@ async def _execute_ops_plan_once(
                 error=f"{type(exc).__name__}: {_redact_text(str(exc))}",
                 level="warning",
             )
-            try:
-                evidence_replans = await _evidence_based_replan(
-                    plan,
-                    executed_steps,
-                    attempted_actions,
-                    include_llm=False,
-                )
-            except Exception as fallback_exc:
-                evidence_replans = []
-                plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
-                    f"确定性根因规划失败：{type(fallback_exc).__name__}: {_redact_text(str(fallback_exc))}"
-                )
+            evidence_replans = await deterministic_replan(
+                plan,
+                executed_steps,
+                attempted_actions,
+                reason="AI 根因规划异常，正在执行不依赖模型的确定性根因与 Skill 路由。",
+                timed_out_stage="deterministic_root_cause_planning",
+            )
         evidence_gap = str(
             ((plan.get("planning") or {}).get("evidence_gap"))
             or (plan.get("_runtime_replan") or {}).get("evidence_gap")
@@ -13010,10 +13227,24 @@ async def _execute_ops_plan_once(
             },
             level="warning" if (plan.get("_runtime_evidence") or {}).get("error") else "success",
         )
-        root_cause_timeout = max(10, int(os.getenv("OPS_ROOT_CAUSE_TIMEOUT_SECONDS", "75")))
+        root_cause_timeout = root_cause_timeout_seconds()
+        await emit(
+            "root_cause_diagnosing",
+            "失败后根因诊断正在比较新旧日志与变更回执，并重新选择差异化 Skill。",
+            waiting_on="失败后 EvidenceRunbookEngine/LLM/Skill Router",
+            elapsed_seconds=0.0,
+            remaining_seconds=float(root_cause_timeout),
+            timeout_seconds=root_cause_timeout,
+            level="warning",
+        )
         try:
             evidence_replans = await run_with_heartbeat(
-                _evidence_based_replan(plan, executed_steps, attempted_actions),
+                _evidence_based_replan(
+                    plan,
+                    executed_steps,
+                    attempted_actions,
+                    progress=emit,
+                ),
                 stage="root_cause_diagnosing",
                 timeout_seconds=root_cause_timeout,
                 heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
@@ -13031,18 +13262,13 @@ async def _execute_ops_plan_once(
                 timeout_seconds=root_cause_timeout,
                 level="warning",
             )
-            try:
-                evidence_replans = await _evidence_based_replan(
-                    plan,
-                    executed_steps,
-                    attempted_actions,
-                    include_llm=False,
-                )
-            except Exception as exc:
-                evidence_replans = []
-                plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
-                    f"失败后确定性根因规划失败：{type(exc).__name__}: {_redact_text(str(exc))}"
-                )
+            evidence_replans = await deterministic_replan(
+                plan,
+                executed_steps,
+                attempted_actions,
+                reason="失败后 AI 根因规划已熔断，正在执行确定性差异化根因与 Skill 路由。",
+                timed_out_stage="post_failure_deterministic_root_cause_planning",
+            )
         except Exception as exc:
             await emit(
                 "stage_timeout",
@@ -13051,19 +13277,13 @@ async def _execute_ops_plan_once(
                 error=f"{type(exc).__name__}: {_redact_text(str(exc))}",
                 level="warning",
             )
-            try:
-                evidence_replans = await _evidence_based_replan(
-                    plan,
-                    executed_steps,
-                    attempted_actions,
-                    include_llm=False,
-                )
-            except Exception as fallback_exc:
-                evidence_replans = []
-                plan.setdefault("_runtime_replan", {})["evidence_gap"] = (
-                    f"失败后确定性根因规划失败：{type(fallback_exc).__name__}: "
-                    f"{_redact_text(str(fallback_exc))}"
-                )
+            evidence_replans = await deterministic_replan(
+                plan,
+                executed_steps,
+                attempted_actions,
+                reason="失败后 AI 根因规划异常，正在执行确定性差异化根因与 Skill 路由。",
+                timed_out_stage="post_failure_deterministic_root_cause_planning",
+            )
         await emit(
             "root_cause_diagnosed",
             "失败后根因诊断完成，已生成差异化下一轮策略。",
@@ -15871,7 +16091,56 @@ async def get_ops_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="运维任务不存在或已过期")
     task = OPS_JOB_TASKS.get(job_id)
-    if job.get("status") in {"queued", "running", "awaiting_approval", "cancelling"} and task is not None and task.done():
+    active_statuses = {"queued", "running", "awaiting_approval", "cancelling"}
+    if (
+        job.get("status") in active_statuses
+        and task is None
+        and job.get("status") != "awaiting_approval"
+    ):
+        # A process restart or an earlier worker defect can leave a persisted
+        # job marked running after its process-local asyncio Task disappeared.
+        # Do not let the console poll that orphan forever: invalidate all old
+        # approvals and resume from fresh evidence on this single-worker API.
+        plan = copy.deepcopy(job.get("plan") or {})
+        if plan and (plan.get("steps") or plan.get("changes")):
+            plan["high_risk_confirmed"] = False
+            plan["operator_force_execute"] = False
+            plan["operator_override_reason"] = ""
+            for change in plan.get("changes") or []:
+                if isinstance(change, dict):
+                    change.pop("human_approved", None)
+                    change.pop("operator_confirmed", None)
+                    change.pop("approval_receipt", None)
+            await _append_ops_job_event(
+                job_id,
+                "resume_pending",
+                "检测到执行协程已丢失；正在从实时证据恢复故障会话，所有旧审批均已作废。",
+                status="resume_pending",
+                pending_approval=None,
+                approved_change_index=0,
+                level="warning",
+            )
+            cancel_event = asyncio.Event()
+            OPS_JOB_CANCEL_EVENTS[job_id] = cancel_event
+            OPS_JOB_TASKS[job_id] = asyncio.create_task(
+                _run_ops_job(job_id, plan, bool(job.get("autonomous")), cancel_event)
+            )
+            task = OPS_JOB_TASKS[job_id]
+        else:
+            await _append_ops_job_event(
+                job_id,
+                "failed",
+                "检测到执行协程已丢失，且持久化记录缺少可恢复计划；已关闭无限等待。",
+                status="failed",
+                result=job.get("result") or {
+                    "status": "failed",
+                    "executed": False,
+                    "message": "执行协程丢失且没有可恢复计划。",
+                },
+                level="error",
+            )
+            task = None
+    if job.get("status") in active_statuses and task is not None and task.done():
         error = ""
         if not task.cancelled():
             try:

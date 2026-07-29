@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import httpx
+import json
 import os
 import tempfile
 import time
@@ -956,6 +957,134 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         skill_runtime.assert_called_once()
         llm_factory.assert_not_called()
 
+    async def test_llm_return_and_skill_router_are_independently_observable(self):
+        plan = {
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "summary": "container cannot open its database file",
+            "_runtime_evidence": {
+                "logs": {"grafana": {"current": "database initialization failed"}},
+                "workload": {"kind": "Deployment", "metadata": {"name": "grafana"}},
+            },
+        }
+        engine_plan = {
+            "runbook_id": "generic_crashloop",
+            "reason": "container repeatedly exits",
+            "hypotheses": [{"confidence": 0.51}],
+            "changes": [],
+            "steps": [],
+        }
+        llm_payload = {
+            "root_cause": "runtime configuration mismatch",
+            "selected_skill_id": "workload-runtime-recovery",
+            "secondary_skill_ids": [],
+            "skill_dependencies": [],
+            "reason": "live evidence supports one workload patch",
+            "changes": [{"type": "patch_workload"}],
+        }
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content=json.dumps(llm_payload))
+        normalized_change = {
+            "type": "patch_workload",
+            "namespace": "monitoring",
+            "workload_type": "Deployment",
+            "workload_name": "grafana",
+            "patch": {"spec": {"template": {"metadata": {"annotations": {"repair": "approved"}}}}},
+            "risk": "high",
+        }
+        stages = []
+
+        async def progress(stage, _message, **_extra):
+            stages.append(stage)
+
+        def attach_skill(candidate, _signal, **_kwargs):
+            candidate["selected_skill_id"] = "workload-runtime-recovery"
+            return candidate
+
+        with patch.object(server, "build_remediation_plan", return_value=engine_plan), patch(
+            "agents.llm_client.get_llm",
+            return_value=llm,
+        ), patch.object(
+            server,
+            "_normalize_planner_change",
+            return_value=(normalized_change, ""),
+        ), patch.object(
+            server,
+            "_attach_operator_skills_to_plan",
+            side_effect=attach_skill,
+        ):
+            replans = await server._evidence_based_replan(
+                plan,
+                [],
+                set(),
+                include_llm=True,
+                progress=progress,
+            )
+
+        self.assertEqual(replans[0]["selected_skill_id"], "workload-runtime-recovery")
+        self.assertLess(stages.index("llm_planning"), stages.index("llm_planning_done"))
+        self.assertLess(stages.index("llm_planning_done"), stages.index("skill_router_processing"))
+        self.assertLess(stages.index("skill_router_processing"), stages.index("skill_router_done"))
+
+    async def test_returned_llm_cannot_be_hidden_by_stuck_skill_router(self):
+        plan = {
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "summary": "container cannot open its database file",
+            "_runtime_evidence": {"logs": {"grafana": {"current": "database initialization failed"}}},
+        }
+        engine_plan = {
+            "runbook_id": "generic_crashloop",
+            "reason": "container repeatedly exits",
+            "hypotheses": [{"confidence": 0.51}],
+            "changes": [],
+            "steps": [],
+        }
+        llm_payload = {
+            "root_cause": "runtime configuration mismatch",
+            "selected_skill_id": "workload-runtime-recovery",
+            "changes": [{"type": "patch_workload"}],
+        }
+        llm = MagicMock()
+        llm.invoke.return_value = MagicMock(content=json.dumps(llm_payload))
+        stages = []
+
+        async def progress(stage, _message, **_extra):
+            stages.append(stage)
+
+        def blocked_router(candidate, _signal, **_kwargs):
+            time.sleep(0.2)
+            return candidate
+
+        with patch.object(server, "build_remediation_plan", return_value=engine_plan), patch(
+            "agents.llm_client.get_llm",
+            return_value=llm,
+        ), patch.object(
+            server,
+            "_normalize_planner_change",
+            return_value=({"type": "patch_workload", "risk": "high"}, ""),
+        ), patch.object(
+            server,
+            "_attach_operator_skills_to_plan",
+            side_effect=blocked_router,
+        ), patch.dict(
+            os.environ,
+            {"OPS_SKILL_ROUTER_TIMEOUT_SECONDS": "0.05"},
+        ):
+            started = time.monotonic()
+            replans = await server._evidence_based_replan(
+                plan,
+                [],
+                set(),
+                include_llm=True,
+                progress=progress,
+            )
+
+        self.assertEqual(replans, [])
+        self.assertLess(time.monotonic() - started, 0.15)
+        self.assertIn("llm_planning_done", stages)
+        self.assertIn("skill_router_timeout", stages)
+
     async def test_ops_progress_does_not_wait_for_record_store_io(self):
         job_id = "ops-nonblocking-store"
         server.OPS_JOBS[job_id] = {
@@ -990,6 +1119,48 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             server.OPS_JOBS.pop(job_id, None)
             server.OPS_JOB_PERSIST_TASK = old_task
             server.OPS_JOB_PERSIST_DIRTY = old_dirty
+
+    async def test_job_poll_resumes_orphaned_running_diagnosis(self):
+        job_id = "ops-orphaned-root-cause"
+        server.OPS_JOBS[job_id] = {
+            "id": job_id,
+            "status": "running",
+            "stage": "root_cause_diagnosing",
+            "autonomous": False,
+            "events": [],
+            "plan": {
+                "namespace": "monitoring",
+                "target": "Deployment/grafana",
+                "steps": [{"id": "current_logs", "title": "read logs"}],
+                "changes": [],
+                "high_risk_confirmed": True,
+            },
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        started = asyncio.Event()
+
+        async def recovered_worker(_job_id, recovered_plan, _autonomous, cancel_event):
+            self.assertFalse(recovered_plan["high_risk_confirmed"])
+            started.set()
+            await cancel_event.wait()
+
+        try:
+            with patch.object(server, "_run_ops_job", side_effect=recovered_worker):
+                public = await server.get_ops_job(job_id)
+                await asyncio.wait_for(started.wait(), timeout=0.2)
+            self.assertEqual(public["status"], "resume_pending")
+            self.assertEqual(public["stage"], "resume_pending")
+            self.assertIn(job_id, server.OPS_JOB_TASKS)
+            self.assertIn(job_id, server.OPS_JOB_CANCEL_EVENTS)
+        finally:
+            event = server.OPS_JOB_CANCEL_EVENTS.pop(job_id, None)
+            if event:
+                event.set()
+            task = server.OPS_JOB_TASKS.pop(job_id, None)
+            if task:
+                await asyncio.wait_for(task, timeout=0.2)
+            server.OPS_JOBS.pop(job_id, None)
 
     async def test_sre_diagnosis_timeout_falls_back_without_blocking_event_loop(self):
         from agents import sre_graph

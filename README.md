@@ -16,9 +16,22 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.2.16**.
+Current release: **3.2.17**.
 
-Release 3.2.16 makes the built-in Skill migration idempotent. Once a stale
+中文技术架构、工程实现、测试证据和项目工具材料见
+[`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
+
+Release 3.2.17 closes the post-LLM diagnosis stall. The LLM response, action
+normalization, and Skill Router are now independently observable stages; the
+Router runs outside the asyncio event loop with its own hard timeout, and the
+deterministic no-LLM fallback is bounded as well. Missing timing fields no
+longer render as a false `0 秒 / 0 秒` deadline, and an orphaned persisted job is
+resumed from fresh evidence with all old approvals invalidated. This release is
+covered by a real DeepSeek response-path test and a real K3s workflow that
+patches a broken Deployment through two human approvals and verifies the new
+Pod recovered.
+
+Release 3.2.16 made the built-in Skill migration idempotent. Once a stale
 legacy definition has been materialized as a current standard Skill package,
 later restarts keep enforcing the shipped policy without emitting duplicate
 migration receipts or rewriting the package.

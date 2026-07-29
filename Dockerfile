@@ -16,7 +16,9 @@ ARG NODE_IMAGE=node:24-slim
 ARG PYTHON_IMAGE=python:3.13-slim
 ARG NGINX_IMAGE=nginxinc/nginx-unprivileged:stable-alpine3.23@sha256:b3f2436575bd5be7386518084d842dac414ab4962712afa31e99e0942a56e3b2
 
-FROM ${NODE_IMAGE} AS frontend-builder
+# 前端产物是与 CPU 架构无关的静态文件。始终在构建节点原生架构上执行
+# TypeScript/Vite，避免多架构构建时通过 QEMU 运行 Node.js 导致不稳定。
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS frontend-builder
 
 WORKDIR /frontend/modern
 
