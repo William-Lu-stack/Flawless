@@ -487,6 +487,11 @@ class ClusterRegistry:
             for status in statuses
             if status.get("name")
         }
+        status_by_name = {
+            str(status.get("name") or ""): status
+            for status in statuses
+            if status.get("name")
+        }
         pod_spec = raw_pod.get("spec") or {}
         names: list[str] = []
         for item in [
@@ -501,15 +506,35 @@ class ClusterRegistry:
         logs: dict[str, Any] = {}
         for name in names[:16]:
             current = previous = current_error = previous_error = ""
-            try:
-                current = core.read_namespaced_pod_log(
-                    pod_name,
-                    namespace,
-                    container=name,
-                    tail_lines=tail_lines,
+            container_status = status_by_name.get(name) or {}
+            state = container_status.get("state") or {}
+            state_name = next(iter(state.keys()), "")
+            state_detail = state.get(state_name) or {}
+            reason = str(state_detail.get("reason") or "")
+            message = str(state_detail.get("message") or "")
+            never_started = state_name == "waiting" and restart_counts.get(name, 0) == 0
+            if never_started:
+                current_error = (
+                    "Kubernetes 日志暂不可用：容器尚未启动"
+                    f"（state=waiting, reason={reason or 'Waiting'}"
+                    f"{', message=' + message[:600] if message else ''}）。"
+                    "应先使用 Pod 状态与 Events 诊断。"
                 )
-            except Exception as exc:
-                current_error = f"{type(exc).__name__}: {exc}"
+            else:
+                try:
+                    current = core.read_namespaced_pod_log(
+                        pod_name,
+                        namespace,
+                        container=name,
+                        tail_lines=tail_lines,
+                    )
+                except Exception as exc:
+                    body = str(getattr(exc, "body", "") or "").strip()
+                    current_error = (
+                        f"HTTP {getattr(exc, 'status', '?')}: {body[:1800]}"
+                        if body
+                        else f"{type(exc).__name__}: {exc}"
+                    )
             if restart_counts.get(name, 0) > 0:
                 try:
                     previous = core.read_namespaced_pod_log(
@@ -526,6 +551,12 @@ class ClusterRegistry:
                 "previous": previous[-10000:],
                 "current_error": current_error,
                 "previous_error": previous_error,
+                "container_state": {
+                    "state": state_name,
+                    "reason": reason,
+                    "message": message[:1000],
+                    "restart_count": restart_counts.get(name, 0),
+                },
             }
         return logs
 

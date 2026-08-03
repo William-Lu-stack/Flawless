@@ -672,6 +672,104 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["transport"], "rancher")
         self.assertEqual(plan["pod_name"], "api-new-rancher")
 
+    async def test_rancher_log_collection_uses_pod_state_before_unstarted_container_log(self):
+        pod = {
+            "containers": [{
+                "name": "grafana",
+                "state": "waiting",
+                "reason": "ContainerCreating",
+                "state_detail": {"message": "containers with unready status"},
+                "restart_count": 0,
+            }],
+        }
+        rancher_get = AsyncMock()
+        with patch.object(server, "_rancher_k8s_get", rancher_get):
+            logs = await server._collect_rancher_pod_logs(
+                "cluster-a", "monitoring", "grafana-new", pod,
+            )
+        rancher_get.assert_not_called()
+        self.assertIn("容器尚未启动", logs["grafana"]["current_error"])
+        self.assertIn("ContainerCreating", logs["grafana"]["current_error"])
+        self.assertEqual(logs["grafana"]["container_state"]["state"], "waiting")
+
+    async def test_rancher_log_http_error_keeps_kubernetes_status_message(self):
+        request = httpx.Request("GET", "https://rancher.example/k8s/clusters/cluster-a/log")
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"kind": "Status", "message": "container grafana is waiting to start: ContainerCreating"},
+        )
+        error = httpx.HTTPStatusError("400 Bad Request", request=request, response=response)
+        with patch.object(server, "_rancher_k8s_get", AsyncMock(side_effect=error)):
+            logs = await server._collect_rancher_pod_logs(
+                "cluster-a",
+                "monitoring",
+                "grafana-new",
+                {"containers": [{"name": "grafana", "state": "running", "restart_count": 0}]},
+            )
+        self.assertEqual(
+            logs["grafana"]["current_error"],
+            "HTTP 400: container grafana is waiting to start: ContainerCreating",
+        )
+
+    async def test_rancher_uses_sibling_crashloop_log_when_selected_pod_has_not_started(self):
+        def raw_pod(name: str, phase: str, state: dict, restart_count: int) -> dict:
+            return {
+                "metadata": {
+                    "name": name,
+                    "namespace": "monitoring",
+                    "ownerReferences": [{"kind": "Deployment", "name": "grafana"}],
+                },
+                "spec": {"containers": [{"name": "grafana"}]},
+                "status": {
+                    "phase": phase,
+                    "containerStatuses": [{
+                        "name": "grafana",
+                        "ready": False,
+                        "restartCount": restart_count,
+                        "state": state,
+                    }],
+                },
+            }
+
+        pending = raw_pod(
+            "grafana-new", "Pending", {"waiting": {"reason": "ContainerCreating"}}, 0,
+        )
+        crashloop = raw_pod(
+            "grafana-old", "Running", {"waiting": {"reason": "CrashLoopBackOff"}}, 12,
+        )
+        rancher_get = AsyncMock(side_effect=[
+            pending,
+            {"items": []},
+            {"items": [pending, crashloop]},
+            crashloop,
+        ])
+        collect_logs = AsyncMock(side_effect=[
+            {"grafana": {"current": "", "current_error": "container has not started"}},
+            {"grafana": {"current": "GF_PATHS_DATA is not writable", "current_error": ""}},
+        ])
+        plan = {
+            "cluster_id": "cluster-a",
+            "source": "rancher",
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "pod_name": "grafana-new",
+            "changes": [{
+                "namespace": "monitoring",
+                "workload_type": "Deployment",
+                "workload_name": "grafana",
+            }],
+        }
+        with patch.object(server, "_ops_cluster_transport", return_value="rancher"), patch.object(
+            server, "_rancher_k8s_get", rancher_get,
+        ), patch.object(server, "_collect_rancher_pod_logs", collect_logs):
+            evidence = await server._collect_plan_priority_evidence(plan)
+        self.assertEqual(evidence["pod_name"], "grafana-old")
+        self.assertEqual(evidence["logs"]["grafana"]["current"], "GF_PATHS_DATA is not writable")
+        self.assertTrue(evidence["log_fallback"]["used"])
+        self.assertEqual(evidence["log_fallback"]["unavailable_pod_name"], "grafana-new")
+        self.assertTrue(evidence["pod_lineage"]["reselected_for_logs"])
+
     async def test_http_deep_diagnosis_reaches_permission_change_approval(self):
         """Exercise the browser's real POST -> background job -> GET polling path.
 
@@ -2075,6 +2173,161 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             payload = await server.cmdb_topology()
         self.assertEqual(payload["summary"]["ebpf_observed_edges"], 1)
         self.assertTrue(any(edge.get("source_system") == "ebpf_beyla" for edge in payload["edges"]))
+        self.assertEqual(payload["diagnostics"]["ebpf_flow_status"][0]["status"], "connected")
+
+    def test_beyla_loki_parser_accepts_json_wrapped_logs_and_alloy_label_aliases(self):
+        line = json.dumps({
+            "message": (
+                "network_flow: k8s.src.namespace=apps k8s.src.owner.name=api "
+                "k8s.src.owner.type=Deployment k8s.dst.namespace=data "
+                "k8s.dst.owner.name=postgres k8s.dst.owner.type=StatefulSet "
+                "src.address=10.0.0.2 dst.address=10.0.0.3 dst.port=5432 transport=TCP"
+            ),
+        })
+        payload = {
+            "data": {"result": [{
+                "stream": {
+                    "namespace_name": "observability",
+                    "pod_name": "beyla-node-a",
+                    "container_name": "beyla",
+                },
+                "values": [["1", line]],
+            }]},
+        }
+        lines, raw_lines, labels = server._beyla_loki_payload_lines(payload)
+        self.assertEqual(raw_lines, 1)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("network_flow:"))
+        self.assertEqual(labels[0]["namespace_name"], "observability")
+        parsed = server._parse_beyla_network_flow_line(lines[0], cluster_hint="cluster-a")
+        self.assertEqual(parsed["source"]["name"], "api")
+        self.assertEqual(parsed["destination"]["name"], "postgres")
+
+    async def test_beyla_loki_query_falls_back_to_alloy_label_names(self):
+        flow_line = (
+            "network_flow: k8s.src.namespace=apps k8s.src.owner.name=api "
+            "k8s.src.owner.type=Deployment k8s.dst.namespace=data "
+            "k8s.dst.owner.name=postgres k8s.dst.owner.type=StatefulSet "
+            "src.address=10.0.0.2 dst.address=10.0.0.3 dst.port=5432 transport=TCP"
+        )
+
+        class Response:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class LokiClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, _url, *, params):
+                if "namespace_name" in params["query"]:
+                    return Response({"data": {"result": [{
+                        "stream": {
+                            "namespace_name": "observability",
+                            "pod_name": "beyla-node-a",
+                            "container_name": "beyla",
+                        },
+                        "values": [["1", flow_line]],
+                    }]}})
+                return Response({"data": {"result": []}})
+
+        request = server.ExternalTrafficFlowRequest(
+            cluster="cluster-a",
+            cluster_id="cluster-a",
+            namespace="all",
+            workload="",
+            window="5m",
+            source="observed",
+            include_static_inference=False,
+            include_cmdb=False,
+        )
+        with (
+            patch.dict(server.SERVICES, {"loki": "http://loki.example"}),
+            patch.object(server, "_client", return_value=LokiClient()),
+            patch.dict(os.environ, {
+                "BEYLA_LOKI_FLOW_ENABLED": "true",
+                "BEYLA_LOKI_NAMESPACE": "observability",
+                "BEYLA_LOKI_POD_SELECTOR": "beyla.*",
+            }),
+        ):
+            flows, statuses = await server._fetch_beyla_loki_flows(request)
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(statuses[0]["status"], "connected")
+        self.assertIn("namespace_name", statuses[0]["effective_query"])
+        self.assertTrue(statuses[0]["query_fallback_used"])
+        self.assertGreaterEqual(len(statuses[0]["query_attempts"]), 2)
+
+    async def test_managed_topology_fuses_beyla_when_configured_cmdb_is_down(self):
+        managed = {
+            "status": "ok",
+            "source": "rancher",
+            "message": "Kubernetes topology.",
+            "nodes": [{
+                "id": "cluster-a:apps:Deployment/api",
+                "name": "api",
+                "type": "workload",
+                "cluster": "cluster-a",
+                "namespace": "apps",
+            }],
+            "edges": [],
+            "summary": {},
+        }
+        observed = [{
+            "source_system": "ebpf_beyla",
+            "observed": True,
+            "direction": "egress",
+            "source": {
+                "id": "cluster-a:apps:Deployment/api",
+                "cluster": "cluster-a",
+                "cluster_id": "cluster-a",
+                "namespace": "apps",
+                "kind": "Deployment",
+                "name": "api",
+            },
+            "destination": {
+                "id": "external:db.example",
+                "type": "external_ip",
+                "kind": "External",
+                "name": "db.example",
+                "address": "db.example",
+            },
+            "protocol": "tcp",
+            "port": 5432,
+            "bytes": 2048,
+            "confidence": 0.98,
+            "evidence": ["network_flow"],
+        }]
+
+        class BrokenClient:
+            async def __aenter__(self):
+                raise RuntimeError("cmdb unavailable")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with (
+            patch.dict(server.SERVICES, {"cmdb": "http://cmdb.invalid"}),
+            patch.object(server, "_managed_topology_payload", AsyncMock(return_value=managed)),
+            patch.object(server, "_client", return_value=BrokenClient()),
+            patch.object(
+                server,
+                "_fetch_configured_observed_flows",
+                AsyncMock(return_value=(observed, [{"id": "ebpf_beyla", "status": "connected", "flows": 1}])),
+            ),
+            patch.dict(os.environ, {"EBPF_TOPOLOGY_FUSION_ENABLED": "true"}),
+        ):
+            payload = await server.cmdb_topology()
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["summary"]["ebpf_observed_edges"], 1)
         self.assertEqual(payload["diagnostics"]["ebpf_flow_status"][0]["status"], "connected")
 
     async def test_emergency_restart_translates_to_restart_action(self):

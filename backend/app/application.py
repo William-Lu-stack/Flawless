@@ -196,8 +196,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.1")
-APP_CODE_SIGNATURE = "dual-cluster-onboarding-v25"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.2")
+APP_CODE_SIGNATURE = "state-aware-logs-ebpf-ia-v26"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -4854,37 +4854,38 @@ def _merge_topology_payload(primary: dict, extra: dict) -> dict:
     return merged
 
 
+async def _fuse_observed_flows_into_topology(topology: dict) -> dict:
+    """Fuse eBPF data on every CMDB outcome, including degraded/fallback paths."""
+    if not _env_bool("EBPF_TOPOLOGY_FUSION_ENABLED", "true"):
+        return topology
+    flow_req = ExternalTrafficFlowRequest(
+        cluster="all",
+        cluster_id="all",
+        namespace="all",
+        workload="",
+        window=os.getenv("EBPF_TOPOLOGY_WINDOW", "30m"),
+        source="observed",
+        include_static_inference=False,
+        include_cmdb=False,
+    )
+    observed_flows, observed_status = await _fetch_configured_observed_flows(flow_req)
+    flow_payload = build_external_traffic_payload(
+        [],
+        cmdb_topology={},
+        observed_flows=observed_flows,
+        scope={"cluster": "all", "namespace": "all", "window": flow_req.window},
+        options={**_external_flow_options(), "include_internal_observed": True},
+    )
+    return _merge_observed_flow_topology(topology, flow_payload, observed_status)
+
+
 async def cmdb_topology():
     """Fetch application/data-flow topology from CMDB if CMDB_URL is configured."""
     base = SERVICES.get("cmdb", "").rstrip("/")
     managed_topology = await _managed_topology_payload()
     if not base:
         if managed_topology.get("nodes"):
-            if _env_bool("EBPF_TOPOLOGY_FUSION_ENABLED", "true"):
-                flow_req = ExternalTrafficFlowRequest(
-                    cluster="all",
-                    cluster_id="all",
-                    namespace="all",
-                    workload="",
-                    window=os.getenv("EBPF_TOPOLOGY_WINDOW", "30m"),
-                    source="observed",
-                    include_static_inference=False,
-                    include_cmdb=False,
-                )
-                observed_flows, observed_status = await _fetch_configured_observed_flows(flow_req)
-                flow_payload = build_external_traffic_payload(
-                    [],
-                    cmdb_topology={},
-                    observed_flows=observed_flows,
-                    scope={"cluster": "all", "namespace": "all", "window": flow_req.window},
-                    options={**_external_flow_options(), "include_internal_observed": True},
-                )
-                managed_topology = _merge_observed_flow_topology(
-                    managed_topology,
-                    flow_payload,
-                    observed_status,
-                )
-            return managed_topology
+            return await _fuse_observed_flows_into_topology(managed_topology)
         ebpf_only = await _observed_flow_only_topology("CMDB_URL 未配置")
         if ebpf_only:
             return ebpf_only
@@ -4892,7 +4893,7 @@ async def cmdb_topology():
     flow_cfg = _observed_flow_endpoint_config()
     managed_ids = ",".join(item["id"] for item in CLUSTER_REGISTRY.list())
     cache_key = (
-        f"cmdb:topology-v2:{base}:managed:{managed_ids}:"
+        f"cmdb:topology-v3:{base}:managed:{managed_ids}:"
         f"ebpf:{flow_cfg.get('url_env','')}:{flow_cfg.get('url','')}:"
         f"beyla:{os.getenv('BEYLA_LOKI_NAMESPACE','')}:{os.getenv('BEYLA_LOKI_POD_SELECTOR','')}:"
         f"{os.getenv('BEYLA_LOKI_QUERY','')}:{os.getenv('EBPF_TOPOLOGY_WINDOW','30m')}:"
@@ -4923,26 +4924,7 @@ async def cmdb_topology():
                     **normalized,
                 }
                 payload = _merge_topology_payload(payload, managed_topology)
-                if _env_bool("EBPF_TOPOLOGY_FUSION_ENABLED", "true"):
-                    flow_req = ExternalTrafficFlowRequest(
-                        cluster="all",
-                        cluster_id="all",
-                        namespace="all",
-                        workload="",
-                        window=os.getenv("EBPF_TOPOLOGY_WINDOW", "30m"),
-                        source="observed",
-                        include_static_inference=False,
-                        include_cmdb=False,
-                    )
-                    observed_flows, observed_status = await _fetch_configured_observed_flows(flow_req)
-                    flow_payload = build_external_traffic_payload(
-                        [],
-                        cmdb_topology={},
-                        observed_flows=observed_flows,
-                        scope={"cluster": "all", "namespace": "all", "window": flow_req.window},
-                        options={**_external_flow_options(), "include_internal_observed": True},
-                    )
-                    payload = _merge_observed_flow_topology(payload, flow_payload, observed_status)
+                payload = await _fuse_observed_flows_into_topology(payload)
                 await CMDB_TOPOLOGY_CACHE.set(cache_key, payload)
                 return {**payload, "cache": {"hit": False, "ttl_seconds": CMDB_TOPOLOGY_CACHE.ttl_seconds}}
         except Exception as e:
@@ -4950,7 +4932,7 @@ async def cmdb_topology():
     if managed_topology.get("nodes"):
         managed_topology["status"] = "degraded"
         managed_topology["message"] += f" CMDB 暂不可用：{_redact_text(last_error)}"
-        return managed_topology
+        return await _fuse_observed_flows_into_topology(managed_topology)
     ebpf_only = await _observed_flow_only_topology(last_error)
     if ebpf_only:
         return ebpf_only
@@ -5064,6 +5046,69 @@ def _flow_window_seconds(raw_window: str | None, default_seconds: int = 300) -> 
 
 
 _BEYLA_FLOW_TOKEN_RE = re.compile(r"([A-Za-z0-9_.-]+)=((?:\"[^\"]*\")|(?:'[^']*')|[^\s]+)")
+_BEYLA_FLOW_LINE_RE = re.compile(r"network[_. ]flow\s*:?\s*(.+)", re.I | re.S)
+
+
+def _extract_beyla_flow_line(raw_line: str) -> str:
+    """Extract a Beyla flow from plain, prefixed, or JSON-wrapped log output."""
+    text = str(raw_line or "").strip()
+    if not text:
+        return ""
+    candidates = [text]
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            for key in ("message", "msg", "log", "body", "line"):
+                if payload.get(key) not in (None, ""):
+                    candidates.insert(0, str(payload.get(key)))
+            attributes = payload.get("attributes") or payload.get("labels") or {}
+            if isinstance(attributes, dict) and any(
+                str(key).startswith(("k8s.src.", "src.")) for key in attributes
+            ):
+                candidates.insert(0, " ".join(
+                    f'{key}="{value}"' if " " in str(value) else f"{key}={value}"
+                    for key, value in attributes.items()
+                ))
+    for candidate in candidates:
+        match = _BEYLA_FLOW_LINE_RE.search(candidate)
+        if match:
+            return f"network_flow: {match.group(1).strip()}"
+        lowered = candidate.lower()
+        if (
+            any(marker in lowered for marker in ("k8s.src.", "src.address="))
+            and any(marker in lowered for marker in ("k8s.dst.", "dst.address="))
+        ):
+            return f"network_flow: {candidate.strip()}"
+    return ""
+
+
+def _beyla_loki_payload_lines(payload: dict) -> tuple[list[str], int, list[dict]]:
+    flow_lines: list[str] = []
+    raw_lines = 0
+    stream_labels: list[dict] = []
+    streams = (((payload or {}).get("data") or {}).get("result") or [])
+    for stream in streams:
+        if isinstance(stream, dict) and isinstance(stream.get("stream"), dict):
+            stream_labels.append({
+                str(key): str(value)
+                for key, value in (stream.get("stream") or {}).items()
+                if str(key) in {
+                    "namespace", "namespace_name", "pod", "pod_name",
+                    "container", "container_name", "job", "app",
+                }
+            })
+        values = stream.get("values") if isinstance(stream, dict) else []
+        for entry in values or []:
+            if not isinstance(entry, list) or len(entry) < 2:
+                continue
+            raw_lines += 1
+            extracted = _extract_beyla_flow_line(str(entry[1] or ""))
+            if extracted:
+                flow_lines.append(extracted)
+    return flow_lines, raw_lines, stream_labels
 
 
 def _parse_beyla_network_flow_line(line: str, *, cluster_hint: str = "") -> dict:
@@ -5128,13 +5173,21 @@ async def _fetch_beyla_loki_flows(req: ExternalTrafficFlowRequest) -> tuple[list
     namespace = os.getenv("BEYLA_LOKI_NAMESPACE", "flawless-ebpf").strip() or "flawless-ebpf"
     pod_selector = os.getenv("BEYLA_LOKI_POD_SELECTOR", "flawless-beyla.*").strip() or "flawless-beyla.*"
     configured_query = os.getenv("BEYLA_LOKI_QUERY", "").strip()
-    query = configured_query or f'{{namespace="{namespace}",pod=~"{pod_selector}"}} |= "network_flow:"'
+    query = configured_query or f'{{namespace="{namespace}",pod=~"{pod_selector}"}} |= "network_flow"'
     query_candidates = list(dict.fromkeys([
         query,
-        f'{{namespace="{namespace}"}} |= "network_flow:"',
-        f'{{pod=~"{pod_selector}"}} |= "network_flow:"',
-        '{namespace=~".+"} |= "network_flow:"',
-        '{pod=~".+"} |= "network_flow:"',
+        f'{{namespace="{namespace}",pod=~"{pod_selector}"}} |= "network_flow"',
+        f'{{namespace_name="{namespace}",pod_name=~"{pod_selector}"}} |= "network_flow"',
+        f'{{namespace="{namespace}"}} |= "network_flow"',
+        f'{{namespace_name="{namespace}"}} |= "network_flow"',
+        f'{{pod=~"{pod_selector}"}} |= "network_flow"',
+        f'{{pod_name=~"{pod_selector}"}} |= "network_flow"',
+        '{container=~"(?i).*beyla.*"} |= "network_flow"',
+        '{container_name=~"(?i).*beyla.*"} |= "network_flow"',
+        '{namespace=~".+"} |= "network_flow"',
+        '{namespace_name=~".+"} |= "network_flow"',
+        '{pod=~".+"} |= "network_flow"',
+        '{pod_name=~".+"} |= "network_flow"',
     ]))
     limit = max(1, min(int(os.getenv("BEYLA_LOKI_FLOW_LIMIT", "500") or "500"), 5000))
     seconds = _flow_window_seconds(req.window or os.getenv("BEYLA_FLOW_QUERY_WINDOW", "5m"), 300)
@@ -5151,6 +5204,9 @@ async def _fetch_beyla_loki_flows(req: ExternalTrafficFlowRequest) -> tuple[list
             payload = {}
             attempts: list[dict] = []
             effective_query = query
+            selected_flow_lines: list[str] = []
+            raw_lines = 0
+            stream_labels: list[dict] = []
             for candidate in query_candidates:
                 resp = await c.get(
                     f"{loki_url}/loki/api/v1/query_range",
@@ -5159,38 +5215,42 @@ async def _fetch_beyla_loki_flows(req: ExternalTrafficFlowRequest) -> tuple[list
                 resp.raise_for_status()
                 candidate_payload = resp.json()
                 streams = (((candidate_payload or {}).get("data") or {}).get("result") or [])
-                attempts.append({"query": candidate, "streams": len(streams)})
-                if streams:
-                    payload = candidate_payload
-                    effective_query = candidate
-                    break
-                payload = candidate_payload
-        raw_flows: list[dict] = []
-        raw_lines = 0
-        malformed_lines = 0
-        stream_labels: list[dict] = []
-        for stream in (((payload or {}).get("data") or {}).get("result") or []):
-            if isinstance(stream, dict) and isinstance(stream.get("stream"), dict):
-                stream_labels.append({
-                    str(key): str(value)
-                    for key, value in (stream.get("stream") or {}).items()
-                    if str(key) in {"namespace", "namespace_name", "pod", "pod_name", "container", "job"}
+                candidate_lines, candidate_raw_lines, candidate_labels = _beyla_loki_payload_lines(candidate_payload)
+                parseable_lines = 0
+                for candidate_line in candidate_lines:
+                    candidate_flow = _parse_beyla_network_flow_line(
+                        candidate_line,
+                        cluster_hint=req.cluster_id or req.cluster or "",
+                    )
+                    if (
+                        (candidate_flow.get("source") or {}).get("name")
+                        and (candidate_flow.get("destination") or {}).get("name")
+                    ):
+                        parseable_lines += 1
+                attempts.append({
+                    "query": candidate,
+                    "streams": len(streams),
+                    "raw_lines": candidate_raw_lines,
+                    "flow_lines": len(candidate_lines),
+                    "parseable_lines": parseable_lines,
                 })
-            values = stream.get("values") if isinstance(stream, dict) else []
-            for entry in values or []:
-                if not isinstance(entry, list) or len(entry) < 2:
-                    continue
-                line = str(entry[1] or "")
-                raw_lines += 1
-                if "network_flow:" not in line:
-                    continue
-                parsed = _parse_beyla_network_flow_line(
-                    line,
-                    cluster_hint=req.cluster_id or req.cluster or "",
-                )
-                if not ((parsed.get("source") or {}).get("name") and (parsed.get("destination") or {}).get("name")):
-                    malformed_lines += 1
-                raw_flows.append(parsed)
+                payload = candidate_payload
+                effective_query = candidate
+                raw_lines = candidate_raw_lines
+                stream_labels = candidate_labels
+                if parseable_lines:
+                    selected_flow_lines = candidate_lines
+                    break
+        raw_flows: list[dict] = []
+        malformed_lines = 0
+        for line in selected_flow_lines:
+            parsed = _parse_beyla_network_flow_line(
+                line,
+                cluster_hint=req.cluster_id or req.cluster or "",
+            )
+            if not ((parsed.get("source") or {}).get("name") and (parsed.get("destination") or {}).get("name")):
+                malformed_lines += 1
+            raw_flows.append(parsed)
         flows = normalize_observed_flow_payload(
             raw_flows,
             source_system="beyla",
@@ -7578,6 +7638,23 @@ async def _collect_rancher_pod_logs(
     pod_q = quote(pod_name, safe="")
     timeout = max(5, min(20, int(os.getenv("OPS_PRIORITY_LOG_REQUEST_TIMEOUT_SECONDS", "12"))))
 
+    def response_error(exc: Exception) -> str:
+        """Keep the Kubernetes Status message; the URL/status alone is not evidence."""
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status = getattr(response, "status_code", "?")
+            body = str(getattr(response, "text", "") or "").strip()
+            if body:
+                try:
+                    payload = json.loads(body)
+                    if isinstance(payload, dict):
+                        body = str(payload.get("message") or payload.get("reason") or body)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+                return f"HTTP {status}: {_clip_text(_redact_text(body), 1800)}"
+            return f"HTTP {status}: {_redact_text(str(exc))}"
+        return f"{type(exc).__name__}: {_redact_text(str(exc))}"
+
     async def fetch_stream(name: str, previous: bool) -> tuple[str, str]:
         query_values = {"tailLines": 180, "container": name}
         if previous:
@@ -7591,14 +7668,29 @@ async def _collect_rancher_pod_logs(
             content = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
             return _clip_text(content, 10000), ""
         except Exception as exc:
-            return "", f"{type(exc).__name__}: {_redact_text(str(exc))}"
+            return "", response_error(exc)
 
     async def fetch_container(container: dict) -> tuple[str, dict]:
         name = str(container.get("name") or "")
-        current_task = fetch_stream(name, False)
+        state = str(container.get("state") or "").lower()
+        reason = str(container.get("reason") or (container.get("state_detail") or {}).get("reason") or "")
+        message = str((container.get("state_detail") or {}).get("message") or "")
+        restart_count = int(container.get("restart_count") or 0)
+        never_started = state == "waiting" and restart_count == 0
+        waiting_error = (
+            "Kubernetes 日志暂不可用：容器尚未启动"
+            f"（state=waiting, reason={reason or 'Waiting'}"
+            f"{', message=' + _clip_text(_redact_text(message), 600) if message else ''}）。"
+            "应先使用 Pod 状态与 Events 诊断，并继续检查同一 Workload 的其他异常 Pod。"
+        )
+        current_task = (
+            asyncio.sleep(0, result=("", waiting_error))
+            if never_started
+            else fetch_stream(name, False)
+        )
         previous_task = (
             fetch_stream(name, True)
-            if int(container.get("restart_count") or 0) > 0
+            if restart_count > 0
             else asyncio.sleep(0, result=("", ""))
         )
         (current, current_error), (previous, previous_error) = await asyncio.gather(
@@ -7610,6 +7702,12 @@ async def _collect_rancher_pod_logs(
             "current_error": current_error,
             "previous": previous,
             "previous_error": previous_error,
+            "container_state": {
+                "state": state,
+                "reason": reason,
+                "message": _clip_text(_redact_text(message), 1000),
+                "restart_count": restart_count,
+            },
         }
 
     containers = [
@@ -7634,6 +7732,15 @@ def _ops_log_errors(logs: dict) -> dict:
     }
 
 
+def _ops_logs_have_content(logs: dict) -> bool:
+    return any(
+        str((content or {}).get(stream) or "").strip()
+        for content in (logs or {}).values()
+        if isinstance(content, dict)
+        for stream in ("current", "previous")
+    )
+
+
 async def _collect_plan_priority_evidence(plan: dict) -> dict:
     """Persist Pod YAML and logs before any optional deep-evidence probe.
 
@@ -7647,6 +7754,7 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
     requested_pod = _target_pod_from_plan(plan)
     originally_requested_pod = requested_pod
     matching_pods: list[dict] = []
+    log_fallback: dict = {}
 
     if transport == "managed_unavailable":
         raise RuntimeError(
@@ -7817,6 +7925,65 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
             requested_pod,
             pod,
         )
+        # A newly-created Pod can legitimately return HTTP 400 from the log
+        # subresource until its container starts.  For a Workload diagnosis,
+        # keep that Pod state as evidence and also inspect the highest-priority
+        # sibling Pod.  This is especially important during a broken rollout,
+        # where an older CrashLoop pod contains the actionable previous log.
+        if (
+            workload_name
+            and str(workload_type or "").lower() not in {"pod", "pods"}
+            and not _ops_logs_have_content(logs)
+            and bool(_ops_log_errors(logs))
+        ):
+            unavailable_pod = pod
+            unavailable_pod_name = requested_pod
+            unavailable_log_errors = _ops_log_errors(logs)
+            try:
+                replacement = await select_rancher_workload_pod(exclude_pod=requested_pod)
+                replacement_raw = await _rancher_k8s_get(
+                    cluster_id,
+                    f"/api/v1/namespaces/{ns}/pods/{quote(replacement, safe='')}",
+                    timeout=15,
+                )
+                replacement_pod = _normalize_k8s_pod(replacement_raw, replica_owner)
+                if replacement_pod.get("workload_kind") in {"", "ReplicaSet"}:
+                    replacement_pod["workload_kind"] = workload_type
+                    replacement_pod["workload_name"] = workload_name
+                replacement_logs = await _collect_rancher_pod_logs(
+                    cluster_id,
+                    namespace,
+                    replacement,
+                    replacement_pod,
+                )
+                if _ops_logs_have_content(replacement_logs):
+                    requested_pod = replacement
+                    pod = replacement_pod
+                    logs = replacement_logs
+                    matching_pods = [unavailable_pod, *matching_pods]
+                    log_fallback = {
+                        "used": True,
+                        "unavailable_pod_name": unavailable_pod_name,
+                        "unavailable_pod": unavailable_pod,
+                        "unavailable_log_errors": unavailable_log_errors,
+                        "log_source_pod_name": replacement,
+                        "reason": "目标 Pod 容器尚未启动；已读取同一 Workload 中证据优先级最高的异常 Pod 日志。",
+                    }
+                else:
+                    log_fallback = {
+                        "used": False,
+                        "unavailable_pod_name": unavailable_pod_name,
+                        "unavailable_log_errors": unavailable_log_errors,
+                        "sibling_pod_name": replacement,
+                        "sibling_log_errors": _ops_log_errors(replacement_logs),
+                    }
+            except Exception as exc:
+                log_fallback = {
+                    "used": False,
+                    "unavailable_pod_name": unavailable_pod_name,
+                    "unavailable_log_errors": unavailable_log_errors,
+                    "fallback_error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
+                }
         source = "rancher"
     else:
         listed = await _call_mcp_tool("list_pods", {"namespace": namespace})
@@ -7885,6 +8052,7 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
         "source": source,
         "transport": transport,
         "priority_evidence": True,
+        "log_fallback": log_fallback,
         "superseded_pod_name": (
             originally_requested_pod
             if originally_requested_pod and originally_requested_pod != requested_pod
@@ -7895,7 +8063,9 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
             "selected": requested_pod,
             "reselected_after_rollout": bool(
                 originally_requested_pod and originally_requested_pod != requested_pod
+                and not log_fallback.get("used")
             ),
+            "reselected_for_logs": bool(log_fallback.get("used")),
         },
     })
 

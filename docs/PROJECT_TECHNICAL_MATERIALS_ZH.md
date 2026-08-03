@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：5.0.1
+版本：5.0.2
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -285,9 +285,9 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-5.0.1 已完成：
+5.0.2 已完成：
 
-- Python 全量测试：202 passed，另有 9 个 subtests passed。
+- Python 全量测试：209 passed，另有 9 个 subtests passed。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
 - 真实 DeepSeek 路径：11.32 秒完成 `llm_planning → llm_planning_done → skill_router_processing → skill_router_done`，模型来源为 `llm+EvidenceRunbookEngine`。
 - Skill Router 卡死模拟：LLM 返回后 Router 人为阻塞，任务在独立硬超时内产生 `skill_router_timeout` 并安全返回。
@@ -303,6 +303,9 @@ tests/                   单元、状态机和真实 Kubernetes E2E
   - 新 Pod Ready，原错误消失，最终 `completed/recovered=true`。
 - kubeconfig 脱离 Rancher 闭环：通过 `/api/clusters` 加密纳管真实 K3s，完整执行 LLM 诊断、Skill 匹配、两次审批、Deployment Patch、滚动更新和恢复验证。
 - 双入口纳管兼容性：页面可选择 Rancher URL/Token 或 kubeconfig；已有 ConfigMap/Secret Rancher 配置在仅替换镜像时保持默认生效，页面新配置验证成功后才加密覆盖，删除覆盖后自动回退。
+- 状态感知日志证据：容器尚未启动时不再把 Kubernetes log HTTP 400 当作终点，保留 waiting reason/message，并在 Workload 范围内补采证据优先级最高的异常 Pod current/previous 日志。
+- eBPF/Beyla 拓扑：兼容 `namespace/pod/container` 与 `namespace_name/pod_name/container_name` 标签、纯文本与 JSON 包装 flow 日志；CMDB 降级时仍融合真实观测边。
+- 信息架构：核心入口收敛为 SRE 对话、AI 巡检、拓扑影响、Skill 库；运行总览、资源事件和运维成效归入平台能力。
 
 ## 9. 项目过程中使用的工具
 

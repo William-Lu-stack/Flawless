@@ -66,6 +66,31 @@ class ClusterRegistryTests(unittest.TestCase):
         self.assertEqual(logs["sidecar"]["current"], "sidecar:current")
         self.assertEqual(logs["sidecar"]["previous"], "")
 
+    def test_priority_log_bundle_does_not_request_logs_before_container_starts(self):
+        core = MagicMock()
+        logs = ClusterRegistry._pod_log_bundle(
+            core,
+            {
+                "spec": {"containers": [{"name": "grafana"}]},
+                "status": {
+                    "containerStatuses": [{
+                        "name": "grafana",
+                        "restartCount": 0,
+                        "state": {"waiting": {
+                            "reason": "ContainerCreating",
+                            "message": "containers with unready status",
+                        }},
+                    }],
+                },
+            },
+            namespace="monitoring",
+            pod_name="grafana-new",
+            tail_lines=180,
+        )
+        core.read_namespaced_pod_log.assert_not_called()
+        self.assertIn("容器尚未启动", logs["grafana"]["current_error"])
+        self.assertEqual(logs["grafana"]["container_state"]["reason"], "ContainerCreating")
+
     def test_workload_patch_uses_strategic_merge_for_named_container_lists(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = ClusterRegistry(Path(directory) / "clusters.db")

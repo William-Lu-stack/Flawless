@@ -675,8 +675,21 @@ def get_pod_events(namespace: str, pod_name: str) -> dict:
         data = _k8s_get(
             f"/api/v1/namespaces/{namespace}/events?fieldSelector={field_selector}"
         )
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        if body:
+            try:
+                payload = json.loads(body)
+                if isinstance(payload, dict):
+                    body = str(payload.get("message") or payload.get("reason") or body)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return {"error": f"HTTP {exc.code}: {body or exc.reason}"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"{type(e).__name__}: {e}"}
 
     return {
         "namespace": namespace,
@@ -722,8 +735,21 @@ def get_pod_logs(
             "previous": previous,
             "logs": logs,
         }
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        if body:
+            try:
+                payload = json.loads(body)
+                if isinstance(payload, dict):
+                    body = str(payload.get("message") or payload.get("reason") or body)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return {"error": f"HTTP {exc.code}: {body or exc.reason}"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def _workload_api_path(workload_type: str, namespace: str, workload_name: str) -> str:

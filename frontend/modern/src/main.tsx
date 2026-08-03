@@ -69,7 +69,7 @@ import {
 } from "./UnifiedPages";
 import "./styles.css";
 
-type PageKey = "chat" | "inspection" | "topology" | "dashboard" | "opsHub" | "skills" | "reliability" | "effectiveness" | "platform";
+type PageKey = "chat" | "inspection" | "topology" | "skills" | "platform";
 type Theme = "light" | "dark";
 
 type ChatMessage = {
@@ -107,11 +107,7 @@ const navItems = [
   { key: "chat", label: "SRE 对话", group: "核心", icon: MessageSquareText },
   { key: "inspection", label: "AI 巡检", group: "核心", icon: Search },
   { key: "topology", label: "拓扑影响", group: "核心", icon: Network },
-  { key: "dashboard", label: "运行总览", group: "运维闭环", icon: LayoutDashboard },
-  { key: "opsHub", label: "资源事件", group: "运维闭环", icon: PackageSearch },
-  { key: "skills", label: "Skill 库", group: "运维闭环", icon: BrainCircuit },
-  { key: "reliability", label: "发布治理", group: "运维", icon: ShieldCheck },
-  { key: "effectiveness", label: "运维成效", group: "运维", icon: LineChart },
+  { key: "skills", label: "Skill 库", group: "核心", icon: BrainCircuit },
   { key: "platform", label: "平台能力", group: "平台", icon: Settings2 }
 ] as const;
 
@@ -311,13 +307,9 @@ function App() {
         </header>
         <div className="page-stack">
           {visited.has("chat") && <div className={cx("page-layer", page === "chat" && "active")}><ChatPage activeModelId={activeModelId} /></div>}
-          {visited.has("dashboard") && <div className={cx("page-layer", page === "dashboard" && "active")}><DashboardPage /></div>}
           {visited.has("inspection") && <div className={cx("page-layer", page === "inspection" && "active")}><InspectionPage activeModelId={activeModelId} /></div>}
           {visited.has("topology") && <div className={cx("page-layer", page === "topology" && "active")}><TopologyPage /></div>}
-          {visited.has("opsHub") && <div className={cx("page-layer", page === "opsHub" && "active")}><OpsHubPage /></div>}
           {visited.has("skills") && <div className={cx("page-layer", page === "skills" && "active")}><OpsSkillsPage /></div>}
-          {visited.has("reliability") && <div className={cx("page-layer", page === "reliability" && "active")}><ReliabilityPage /></div>}
-          {visited.has("effectiveness") && <div className={cx("page-layer", page === "effectiveness" && "active")}><EffectivenessPage /></div>}
           {visited.has("platform") && <div className={cx("page-layer", page === "platform" && "active")}><PlatformPage activeModelId={activeModelId} onActivate={activateModel} refreshRegistry={refreshRegistry} registry={registry} /></div>}
         </div>
       </main>
@@ -335,15 +327,18 @@ function App() {
   );
 }
 
-function OpsHubPage() {
-  const [tab, setTab] = useState<"resources" | "operations">("resources");
+function RuntimeOverviewPage() {
+  const [tab, setTab] = useState<"status" | "resources" | "events">("status");
   return (
     <section className="hub-page">
       <div className="hub-tabs">
+        <button className={tab === "status" ? "active" : ""} onClick={() => setTab("status")}><LayoutDashboard size={15} />运行状态</button>
         <button className={tab === "resources" ? "active" : ""} onClick={() => setTab("resources")}><PackageSearch size={15} />资源浏览</button>
-        <button className={tab === "operations" ? "active" : ""} onClick={() => setTab("operations")}><Wrench size={15} />事件与工具</button>
+        <button className={tab === "events" ? "active" : ""} onClick={() => setTab("events")}><Wrench size={15} />资源事件</button>
       </div>
-      {tab === "resources" ? <ResourcesPage /> : <OperationsPage />}
+      {tab === "status" && <DashboardPage />}
+      {tab === "resources" && <ResourcesPage />}
+      {tab === "events" && <OperationsPage />}
     </section>
   );
 }
@@ -359,10 +354,13 @@ function PlatformPage({
   refreshRegistry: () => void;
   registry: ApiState<any>;
 }) {
-  const [tab, setTab] = useState<"models" | "knowledge" | "observability" | "algorithms" | "infrastructure" | "integrations">("models");
+  const [tab, setTab] = useState<"overview" | "effectiveness" | "reliability" | "models" | "knowledge" | "observability" | "algorithms" | "infrastructure" | "integrations">("overview");
   return (
     <section className="hub-page">
       <div className="hub-tabs platform-tabs">
+        <button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}><LayoutDashboard size={15} />运行总览</button>
+        <button className={tab === "effectiveness" ? "active" : ""} onClick={() => setTab("effectiveness")}><LineChart size={15} />运维成效</button>
+        <button className={tab === "reliability" ? "active" : ""} onClick={() => setTab("reliability")}><ShieldCheck size={15} />发布治理</button>
         <button className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}><Beaker size={15} />模型实验室</button>
         <button className={tab === "knowledge" ? "active" : ""} onClick={() => setTab("knowledge")}><BookOpen size={15} />知识库</button>
         <button className={tab === "observability" ? "active" : ""} onClick={() => setTab("observability")}><Activity size={15} />可观测</button>
@@ -370,6 +368,9 @@ function PlatformPage({
         <button className={tab === "infrastructure" ? "active" : ""} onClick={() => setTab("infrastructure")}><Database size={15} />全栈资源</button>
         <button className={tab === "integrations" ? "active" : ""} onClick={() => setTab("integrations")}><Cable size={15} />集成</button>
       </div>
+      {tab === "overview" && <RuntimeOverviewPage />}
+      {tab === "effectiveness" && <EffectivenessPage />}
+      {tab === "reliability" && <ReliabilityPage />}
       {tab === "models" && <ModelLabPage activeModelId={activeModelId} onActivate={onActivate} refreshRegistry={refreshRegistry} registry={registry} />}
       {tab === "knowledge" && <KnowledgePage activeModelId={activeModelId} />}
       {tab === "observability" && <SignalsPage />}

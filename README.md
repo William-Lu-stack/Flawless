@@ -16,12 +16,22 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.1**.
+Current release: **5.0.2**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
+
+Release 5.0.2 makes Pod-log evidence state-aware: containers that have not
+started are diagnosed from Pod status and Events instead of surfacing a bare
+Kubernetes log HTTP 400, while Workload-level diagnosis can continue with an
+evidence-rich sibling Pod and retain the full lineage. Beyla topology fusion
+now accepts standard and Alloy label names, plain or JSON-wrapped network-flow
+logs, and remains active when the configured CMDB is degraded. The console
+keeps SRE chat, AI inspection, topology impact, and the Skill library as its
+four core entries; runtime overview, resource events, effectiveness, and other
+administrative capabilities are nested under Platform Capabilities.
 
 Release 5.0.1 adds two explicit cluster-onboarding paths in the console:
 encrypted kubeconfig and Rancher URL/token. Existing `RANCHER_URL`,
