@@ -95,6 +95,110 @@ class ClusterRegistry:
                     last_checked_at TEXT NOT NULL DEFAULT ''
                 )
             """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS rancher_connection (
+                    id TEXT PRIMARY KEY,
+                    encrypted_payload BLOB NOT NULL,
+                    status TEXT NOT NULL,
+                    cluster_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL DEFAULT ''
+                )
+            """)
+
+    def save_rancher_connection(
+        self,
+        *,
+        base_url: str,
+        bearer_token: str,
+        verify_ssl: bool,
+        status: str = "connected",
+        cluster_count: int = 0,
+        last_error: str = "",
+        last_checked_at: str = "",
+    ) -> dict[str, Any]:
+        """Encrypt and atomically replace the singleton runtime Rancher profile."""
+        payload = {
+            "base_url": str(base_url or "").strip(),
+            "bearer_token": str(bearer_token or "").strip(),
+            "verify_ssl": bool(verify_ssl),
+        }
+        if not payload["base_url"] or not payload["bearer_token"]:
+            raise ValueError("Rancher URL 和 Bearer Token 不能为空")
+        encrypted = self._fernet.encrypt(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        now = _now()
+        checked_at = last_checked_at or now
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                """
+                INSERT INTO rancher_connection
+                    (id,encrypted_payload,status,cluster_count,last_error,created_at,updated_at,last_checked_at)
+                VALUES ('primary',?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    encrypted_payload=excluded.encrypted_payload,
+                    status=excluded.status,
+                    cluster_count=excluded.cluster_count,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at,
+                    last_checked_at=excluded.last_checked_at
+                """,
+                (
+                    encrypted,
+                    str(status or "connected"),
+                    max(0, int(cluster_count or 0)),
+                    str(last_error or "")[:2000],
+                    now,
+                    now,
+                    checked_at,
+                ),
+            )
+        return self.rancher_connection_public() or {}
+
+    def rancher_connection(self) -> dict[str, Any] | None:
+        """Return decrypted runtime credentials for internal requests only."""
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT * FROM rancher_connection WHERE id='primary'"
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(
+                self._fernet.decrypt(row["encrypted_payload"]).decode("utf-8")
+            )
+        except (InvalidToken, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Rancher 凭据无法解密；请检查持久化加密密钥") from exc
+        return {
+            "base_url": str(payload.get("base_url") or ""),
+            "bearer_token": str(payload.get("bearer_token") or ""),
+            "verify_ssl": bool(payload.get("verify_ssl", True)),
+            "status": str(row["status"] or ""),
+            "cluster_count": int(row["cluster_count"] or 0),
+            "last_error": str(row["last_error"] or ""),
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+            "last_checked_at": str(row["last_checked_at"] or ""),
+        }
+
+    def rancher_connection_public(self) -> dict[str, Any] | None:
+        connection = self.rancher_connection()
+        if connection is None:
+            return None
+        return {
+            key: value
+            for key, value in connection.items()
+            if key != "bearer_token"
+        } | {"token_configured": bool(connection.get("bearer_token"))}
+
+    def delete_rancher_connection(self) -> bool:
+        """Delete only the runtime override; environment configuration is untouched."""
+        with self._lock, closing(self._connect()) as db, db:
+            cursor = db.execute("DELETE FROM rancher_connection WHERE id='primary'")
+        return bool(cursor.rowcount)
 
     @staticmethod
     def parse(

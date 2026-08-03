@@ -18,6 +18,12 @@ class ManagedClusterTokenRefreshRequest(BaseModel):
     bearer_token: SecretStr = Field(min_length=1, max_length=200_000)
 
 
+class RancherConnectionUpsertRequest(BaseModel):
+    rancher_url: str = Field(min_length=8, max_length=2048)
+    bearer_token: SecretStr = Field(min_length=1, max_length=200_000)
+    verify_ssl: bool = True
+
+
 class MCPToolRequest(BaseModel):
     tool: str
     arguments: dict = Field(default_factory=dict)

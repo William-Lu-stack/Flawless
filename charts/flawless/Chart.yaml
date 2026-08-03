@@ -2,8 +2,8 @@ apiVersion: v2
 name: flawless
 description: Flawless SRE AgenticOps control plane and Kubernetes agent suite
 type: application
-version: 5.0.0
-appVersion: "5.0.0"
+version: 5.0.1
+appVersion: "5.0.1"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/your-org/Flawless
 maintainers:

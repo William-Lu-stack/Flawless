@@ -115,6 +115,7 @@ from backend.app.schemas.operations import (
     OpsSkillDefinition,
     OpsSkillMatchRequest,
     ReleaseGateRequest,
+    RancherConnectionUpsertRequest,
     TopologyImpactRequest,
     KubeconfigContextsRequest,
     ManagedClusterTokenRefreshRequest,
@@ -195,8 +196,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.0")
-APP_CODE_SIGNATURE = "rollout-pod-evidence-lineage-v24"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.1")
+APP_CODE_SIGNATURE = "dual-cluster-onboarding-v25"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -204,15 +205,17 @@ KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", s
 SECURITY_HEADERS_ENABLED = _env_bool("SECURITY_HEADERS_ENABLED", "true")
 OUTBOUND_VERIFY_SSL = _env_bool("OUTBOUND_VERIFY_SSL", "true")
 RANCHER_HTTP_CLIENT: httpx.AsyncClient | None = None
+RANCHER_HTTP_CLIENT_VERIFY_SSL: bool | None = None
 OUTBOUND_HTTP_CLIENTS: dict[int, httpx.AsyncClient] = {}
 
 
 @app.on_event("startup")
 async def startup_build_banner():
-    global RANCHER_HTTP_CLIENT
+    global RANCHER_HTTP_CLIENT, RANCHER_HTTP_CLIENT_VERIFY_SSL
+    RANCHER_HTTP_CLIENT_VERIFY_SSL = _rancher_verify_ssl()
     RANCHER_HTTP_CLIENT = httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, connect=5.0, pool=3.0),
-        verify=_rancher_verify_ssl(),
+        verify=RANCHER_HTTP_CLIENT_VERIFY_SSL,
         limits=HTTP_LIMITS,
         headers={"Accept": "application/json"},
     )
@@ -232,7 +235,7 @@ async def startup_build_banner():
 
 @app.on_event("shutdown")
 async def shutdown_http_clients():
-    global RANCHER_HTTP_CLIENT
+    global RANCHER_HTTP_CLIENT, RANCHER_HTTP_CLIENT_VERIFY_SSL
     persist_task = OPS_JOB_PERSIST_TASK
     if persist_task is not None and not persist_task.done():
         try:
@@ -242,6 +245,7 @@ async def shutdown_http_clients():
     if RANCHER_HTTP_CLIENT is not None:
         await RANCHER_HTTP_CLIENT.aclose()
         RANCHER_HTTP_CLIENT = None
+        RANCHER_HTTP_CLIENT_VERIFY_SSL = None
     await asyncio.gather(*(client.aclose() for client in OUTBOUND_HTTP_CLIENTS.values()), return_exceptions=True)
     OUTBOUND_HTTP_CLIENTS.clear()
 
@@ -3802,16 +3806,85 @@ def _normalize_cmdb_topology(raw) -> dict:
     return {"nodes": norm_nodes, "edges": norm_edges}
 
 
-def _rancher_base() -> str:
-    raw = os.getenv("RANCHER_URL", "").strip().rstrip("/")
+def _normalize_rancher_base_url(raw: str) -> str:
+    raw = str(raw or "").strip().rstrip("/")
     for marker in ("/dashboard", "/v3", "/v1", "/k8s/clusters"):
         if marker in raw:
             raw = raw.split(marker, 1)[0]
-    return raw.rstrip("/")
+    normalized = raw.rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("RANCHER_URL 必须是有效的 http/https 地址")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("RANCHER_URL 不能包含账号、密码、查询参数或 fragment")
+    return normalized
+
+
+def _runtime_rancher_connection() -> tuple[dict | None, str]:
+    try:
+        connection = CLUSTER_REGISTRY.rancher_connection()
+        return connection, ""
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {_redact_text(str(exc))}"
+
+
+def _environment_rancher_connection() -> dict:
+    raw_url = os.getenv("RANCHER_URL", "").strip()
+    try:
+        base_url = _normalize_rancher_base_url(raw_url) if raw_url else ""
+    except ValueError:
+        base_url = ""
+    return {
+        "base_url": base_url,
+        "bearer_token": os.getenv("RANCHER_TOKEN", "").strip(),
+        "verify_ssl": os.getenv("RANCHER_VERIFY_SSL", "true").lower() in {"1", "true", "yes", "on"},
+        "source": "environment",
+    }
+
+
+def _active_rancher_connection() -> dict:
+    runtime, _runtime_error = _runtime_rancher_connection()
+    if runtime and runtime.get("base_url") and runtime.get("bearer_token"):
+        return {**runtime, "source": "runtime_encrypted"}
+    return _environment_rancher_connection()
+
+
+def _rancher_connection_metadata() -> dict:
+    runtime, runtime_error = _runtime_rancher_connection()
+    environment = _environment_rancher_connection()
+    environment_configured = bool(environment.get("base_url") and environment.get("bearer_token"))
+    if runtime and runtime.get("base_url") and runtime.get("bearer_token"):
+        return {
+            **{
+                key: value
+                for key, value in runtime.items()
+                if key != "bearer_token"
+            },
+            "configured": True,
+            "source": "runtime_encrypted",
+            "editable": True,
+            "token_configured": True,
+            "fallback_environment_configured": environment_configured,
+            "runtime_error": "",
+        }
+    return {
+        "base_url": environment.get("base_url") or "",
+        "verify_ssl": bool(environment.get("verify_ssl", True)),
+        "configured": environment_configured,
+        "source": "environment" if environment_configured else "none",
+        "editable": False,
+        "token_configured": bool(environment.get("bearer_token")),
+        "fallback_environment_configured": environment_configured,
+        "runtime_error": runtime_error,
+    }
+
+
+def _rancher_base() -> str:
+    return str(_active_rancher_connection().get("base_url") or "")
 
 
 def _rancher_token() -> str:
-    return os.getenv("RANCHER_TOKEN", "").strip()
+    return str(_active_rancher_connection().get("bearer_token") or "")
 
 
 def _rancher_enabled() -> bool:
@@ -3859,7 +3932,16 @@ def _ops_uses_rancher(plan: dict) -> bool:
 
 
 def _rancher_verify_ssl() -> bool:
-    return _env_bool("RANCHER_VERIFY_SSL", "true")
+    return bool(_active_rancher_connection().get("verify_ssl", True))
+
+
+def _rancher_shared_http_client() -> httpx.AsyncClient | None:
+    if (
+        RANCHER_HTTP_CLIENT is not None
+        and RANCHER_HTTP_CLIENT_VERIFY_SSL == _rancher_verify_ssl()
+    ):
+        return RANCHER_HTTP_CLIENT
+    return None
 
 
 def _wanted_rancher_clusters() -> set[str] | None:
@@ -3877,7 +3959,7 @@ async def _rancher_get(path: str, timeout: int = 20):
     url = path if str(path).startswith(("http://", "https://")) else f"{_rancher_base()}/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {_rancher_token()}", "Accept": "application/json"}
     async with OUTBOUND_BULKHEAD.slot():
-        client = RANCHER_HTTP_CLIENT
+        client = _rancher_shared_http_client()
         if client is None:
             async with httpx.AsyncClient(timeout=timeout, verify=_rancher_verify_ssl(), limits=HTTP_LIMITS) as fallback:
                 resp = await fallback.get(url, headers=headers)
@@ -3944,7 +4026,7 @@ async def _rancher_k8s_patch(
         "Accept": "application/json",
     }
     async with OUTBOUND_BULKHEAD.slot():
-        client = RANCHER_HTTP_CLIENT
+        client = _rancher_shared_http_client()
         if client is None:
             async with httpx.AsyncClient(timeout=timeout, verify=_rancher_verify_ssl(), limits=HTTP_LIMITS) as fallback:
                 resp = await fallback.patch(url, headers=headers, json=patch)
@@ -3960,7 +4042,7 @@ async def _rancher_k8s_delete(cluster_id: str, path: str, body: dict | None = No
     url = f"{_rancher_base()}/k8s/clusters/{quote(cluster_id, safe='')}{path}"
     headers = {"Authorization": f"Bearer {_rancher_token()}", "Accept": "application/json"}
     async with OUTBOUND_BULKHEAD.slot():
-        client = RANCHER_HTTP_CLIENT
+        client = _rancher_shared_http_client()
         if client is None:
             async with httpx.AsyncClient(timeout=timeout, verify=_rancher_verify_ssl(), limits=HTTP_LIMITS) as fallback:
                 resp = await fallback.request("DELETE", url, headers=headers, json=body)
@@ -3976,7 +4058,7 @@ async def _rancher_k8s_post(cluster_id: str, path: str, body: dict, timeout: int
     url = f"{_rancher_base()}/k8s/clusters/{quote(cluster_id, safe='')}{path}"
     headers = {"Authorization": f"Bearer {_rancher_token()}", "Accept": "application/json", "Content-Type": "application/json"}
     async with OUTBOUND_BULKHEAD.slot():
-        client = RANCHER_HTTP_CLIENT
+        client = _rancher_shared_http_client()
         if client is None:
             async with httpx.AsyncClient(timeout=timeout, verify=_rancher_verify_ssl(), limits=HTTP_LIMITS) as fallback:
                 resp = await fallback.post(url, headers=headers, json=body)
@@ -3997,7 +4079,7 @@ async def _rancher_execution_configuration(cluster_id: str):
         "Content-Type": "application/json",
     }
     async with OUTBOUND_BULKHEAD.slot():
-        client = RANCHER_HTTP_CLIENT
+        client = _rancher_shared_http_client()
         if client is None:
             async with httpx.AsyncClient(timeout=30, verify=_rancher_verify_ssl(), limits=HTTP_LIMITS) as fallback:
                 response = await fallback.post(url, headers=headers, json={})
@@ -4359,10 +4441,142 @@ def _managed_cluster_metadata() -> list[dict]:
     return [{"id": item["id"], "name": item["name"], "state": item["status"], "provider": item.get("version") or "Kubernetes", "source": "kubeconfig", "raw_id": item["id"]} for item in CLUSTER_REGISTRY.list()]
 
 
+async def _probe_rancher_connection(
+    base_url: str,
+    bearer_token: str,
+    verify_ssl: bool,
+) -> dict:
+    """Validate candidate credentials without changing the active connection."""
+    headers = {"Authorization": f"Bearer {bearer_token}", "Accept": "application/json"}
+    endpoints: list[str] = []
+    errors: list[str] = []
+    timeout = httpx.Timeout(25.0, connect=5.0, pool=3.0)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        verify=verify_ssl,
+        limits=HTTP_LIMITS,
+        headers={"Accept": "application/json"},
+    ) as client:
+        try:
+            root_response = await client.get(f"{base_url}/v3", headers=headers)
+            root_response.raise_for_status()
+            root_payload = root_response.json()
+            cluster_link = (
+                ((root_payload.get("links") or {}).get("clusters"))
+                if isinstance(root_payload, dict)
+                else ""
+            ) or ""
+            if cluster_link:
+                endpoints.append(str(cluster_link))
+        except Exception as exc:
+            errors.append(f"v3 root: {type(exc).__name__}: {_redact_text(str(exc))}")
+        endpoints.extend([
+            f"{base_url}/v3/clusters?limit=1000",
+            f"{base_url}/v1/management.cattle.io.clusters?limit=-1",
+            f"{base_url}/v1/provisioning.cattle.io.clusters?limit=-1",
+        ])
+        seen: set[str] = set()
+        for endpoint in endpoints:
+            if endpoint in seen:
+                continue
+            seen.add(endpoint)
+            try:
+                response = await client.get(endpoint, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+                rows = []
+                if isinstance(payload, dict):
+                    candidate_rows = payload.get("data") or payload.get("items") or []
+                    if isinstance(candidate_rows, list):
+                        rows = [item for item in candidate_rows if isinstance(item, dict)]
+                ids = {
+                    str(
+                        item.get("id")
+                        or (item.get("metadata") or {}).get("name")
+                        or item.get("name")
+                        or ""
+                    )
+                    for item in rows
+                }
+                ids.discard("")
+                return {
+                    "status": "connected",
+                    "cluster_count": len(ids),
+                    "last_error": "",
+                    "last_checked_at": datetime.now(timezone.utc).isoformat(),
+                }
+            except Exception as exc:
+                label = urlparse(endpoint).path or "Rancher API"
+                errors.append(f"{label}: {type(exc).__name__}: {_redact_text(str(exc))}")
+    summary = " | ".join(errors[-4:])
+    raise RuntimeError(f"Rancher 连接验证失败：{_clip_text(summary, 1600)}")
+
+
+async def rancher_connection_status():
+    """Return source metadata only; bearer tokens are never returned."""
+    return _rancher_connection_metadata()
+
+
+async def upsert_rancher_connection(req: RancherConnectionUpsertRequest):
+    try:
+        base_url = _normalize_rancher_base_url(req.rancher_url)
+        bearer_token = req.bearer_token.get_secret_value().strip()
+        verified = await _probe_rancher_connection(
+            base_url,
+            bearer_token,
+            req.verify_ssl,
+        )
+    except (ValueError, RuntimeError, httpx.HTTPError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Rancher 连接验证失败，当前 ConfigMap/加密配置保持不变",
+                "error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
+            },
+        ) from exc
+    saved = await asyncio.to_thread(
+        CLUSTER_REGISTRY.save_rancher_connection,
+        base_url=base_url,
+        bearer_token=bearer_token,
+        verify_ssl=req.verify_ssl,
+        status=verified["status"],
+        cluster_count=verified["cluster_count"],
+        last_error=verified["last_error"],
+        last_checked_at=verified["last_checked_at"],
+    )
+    await RANCHER_CACHE.invalidate()
+    await RANCHER_INVENTORY_CACHE.invalidate()
+    return {
+        **saved,
+        "configured": True,
+        "source": "runtime_encrypted",
+        "editable": True,
+        "fallback_environment_configured": bool(
+            _environment_rancher_connection().get("base_url")
+            and _environment_rancher_connection().get("bearer_token")
+        ),
+    }
+
+
+async def delete_rancher_connection_override():
+    deleted = await asyncio.to_thread(CLUSTER_REGISTRY.delete_rancher_connection)
+    await RANCHER_CACHE.invalidate()
+    await RANCHER_INVENTORY_CACHE.invalidate()
+    return {
+        "status": "deleted" if deleted else "unchanged",
+        "active_connection": _rancher_connection_metadata(),
+        "message": (
+            "页面 Rancher 覆盖配置已删除，已回退到 ConfigMap/Secret。"
+            if deleted
+            else "没有页面 Rancher 覆盖配置；ConfigMap/Secret 未被修改。"
+        ),
+    }
+
+
 async def rancher_status():
     managed = _managed_cluster_metadata()
     if not _rancher_enabled():
-        return {"enabled": bool(managed), "status": "ok" if managed else "disabled", "clusters": managed, "cluster_count": len(managed), "cluster_sources": ["kubeconfig"] if managed else [], "message": f"已通过 kubeconfig 纳管 {len(managed)} 个集群。" if managed else "Rancher 尚未配置，可在 Web 页面上传 kubeconfig 纳管集群。"}
+        return {"enabled": bool(managed), "status": "ok" if managed else "disabled", "clusters": managed, "cluster_count": len(managed), "cluster_sources": ["kubeconfig"] if managed else [], "connection": _rancher_connection_metadata(), "message": f"已通过 kubeconfig 纳管 {len(managed)} 个集群。" if managed else "Rancher 尚未配置，可在 Web 页面选择 Rancher 或 kubeconfig 纳管集群。"}
     try:
         clusters = [*(await _rancher_clusters()), *managed]
         return {
@@ -4373,6 +4587,7 @@ async def rancher_status():
             "cluster_count": len(clusters),
             "cluster_sources": sorted({c.get("source", "") for c in clusters if c.get("source")}),
             "cluster_ids": [c.get("id") for c in clusters],
+            "connection": _rancher_connection_metadata(),
             "message": f"Rancher 已返回 {len(clusters)} 个集群。",
         }
     except Exception as exc:
@@ -4384,6 +4599,7 @@ async def rancher_status():
             "clusters": managed,
             "cluster_count": len(managed),
             "cluster_sources": ["kubeconfig"] if managed else [],
+            "connection": _rancher_connection_metadata(),
             "message": f"Rancher 暂不可用；{len(managed)} 个 kubeconfig 集群仍可正常纳管。" if managed else "Rancher 连接失败。",
         }
 

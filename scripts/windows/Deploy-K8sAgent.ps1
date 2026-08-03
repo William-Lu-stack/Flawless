@@ -95,7 +95,7 @@ if ($LASTEXITCODE -ne 0) {
 
 if ($ImageMode -eq "public-cn") {
     $appRepository = "ghcr.dockerproxy.net/your-org/flawless"
-    $appTag = "5.0.0"
+    $appTag = "5.0.1"
     $nodeExecutorImage = "ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36"
 } else {
     $registry = $PrivateRegistry.Trim().TrimEnd('/')
@@ -103,7 +103,7 @@ if ($ImageMode -eq "public-cn") {
         Fail "PrivateRegistry must be host[:port] without a URL scheme"
     }
     $appRepository = "$registry/k8s-agent"
-    $appTag = "5.0.0"
+    $appTag = "5.0.1"
     $nodeExecutorImage = "$registry/k8s-agent-node-exec:1.36"
 
     if ($RegistryUsername) {

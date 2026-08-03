@@ -153,6 +153,31 @@ class ClusterRegistryTests(unittest.TestCase):
                 self.assertTrue(registry.delete(saved["id"]))
                 self.assertEqual(registry.list(), [])
 
+    def test_rancher_connection_is_encrypted_and_runtime_override_can_be_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clusters.db"
+            registry = ClusterRegistry(path)
+            rancher_url = "https://" + "rancher.runtime.example"
+            bearer_token = "-".join(("fixture", "rancher", "credential"))
+            saved = registry.save_rancher_connection(
+                base_url=rancher_url,
+                bearer_token=bearer_token,
+                verify_ssl=False,
+                cluster_count=3,
+                last_checked_at="now",
+            )
+            self.assertEqual(saved["base_url"], rancher_url)
+            self.assertFalse(saved["verify_ssl"])
+            self.assertTrue(saved["token_configured"])
+            self.assertNotIn("bearer_token", saved)
+            stored = path.read_bytes()
+            self.assertNotIn(rancher_url.encode("utf-8"), stored)
+            self.assertNotIn(bearer_token.encode("utf-8"), stored)
+            internal = registry.rancher_connection()
+            self.assertEqual(internal["bearer_token"], bearer_token)
+            self.assertTrue(registry.delete_rancher_connection())
+            self.assertIsNone(registry.rancher_connection())
+
     def test_contexts_marks_current_context(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = ClusterRegistry(Path(directory) / "clusters.db")

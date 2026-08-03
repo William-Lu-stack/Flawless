@@ -6,6 +6,9 @@ from ._registry import build_feature_router
 def build_router(runtime):
     return build_feature_router(runtime, [
         ("GET", "/api/rancher/status", "rancher_status"),
+        ("GET", "/api/rancher/connection", "rancher_connection_status"),
+        ("POST", "/api/rancher/connection", "upsert_rancher_connection"),
+        ("DELETE", "/api/rancher/connection", "delete_rancher_connection_override"),
         ("GET", "/api/rancher/inventory", "rancher_inventory"),
         ("GET", "/api/clusters", "managed_clusters"),
         ("POST", "/api/clusters/contexts", "managed_cluster_contexts"),

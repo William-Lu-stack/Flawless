@@ -2115,5 +2115,12 @@ body[data-theme="dark"] .flow-module {
 .managed-cluster-list { display: grid; gap: 10px; align-content: start; }
 .managed-cluster-list > div { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto auto; gap: 10px; align-items: center; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
 .managed-cluster-list p, .managed-cluster-list small { display: block; margin: 3px 0 0; color: var(--muted); }
+.rancher-connection-card { display: grid; gap: 14px; align-content: start; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.rancher-connection-card > div:first-child { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: center; }
+.rancher-connection-card p { margin: 4px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.rancher-connection-card dl { display: grid; gap: 8px; margin: 0; }
+.rancher-connection-card dl > div { display: flex; justify-content: space-between; gap: 18px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.rancher-connection-card dt { color: var(--muted); }
+.rancher-connection-card dd { margin: 0; text-align: right; }
 .channel-test.danger { color: #ff8ca2; }
 @media (max-width: 980px) { .cluster-connect-grid { grid-template-columns: 1fr; } }

@@ -797,6 +797,8 @@ export function IntegrationsPage() {
   const [testing, setTesting] = useState("");
   const [feedback, setFeedback] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
   const [clusters, refreshClusters] = useAsync<any>(() => apiGet("/api/clusters"), []);
+  const [rancherConnection, refreshRancherConnection] = useAsync<any>(() => apiGet("/api/rancher/connection"), []);
+  const [connectionMode, setConnectionMode] = useState<"kubeconfig" | "rancher">("kubeconfig");
   const [kubeconfig, setKubeconfig] = useState("");
   const [dynamicToken, setDynamicToken] = useState("");
   const [clusterName, setClusterName] = useState("");
@@ -804,6 +806,16 @@ export function IntegrationsPage() {
   const [context, setContext] = useState("");
   const [editingClusterId, setEditingClusterId] = useState("");
   const [savingCluster, setSavingCluster] = useState(false);
+  const [rancherUrl, setRancherUrl] = useState("");
+  const [rancherToken, setRancherToken] = useState("");
+  const [rancherVerifySsl, setRancherVerifySsl] = useState(true);
+  const [savingRancher, setSavingRancher] = useState(false);
+  useEffect(() => {
+    const active = rancherConnection.data;
+    if (!active) return;
+    setRancherUrl((current) => current || active.base_url || "");
+    setRancherVerifySsl(active.verify_ssl !== false);
+  }, [rancherConnection.data]);
   const groups = [
     ["infrastructure", "基础设施", Network],
     ["observability", "可观测", Activity],
@@ -846,11 +858,65 @@ export function IntegrationsPage() {
     try { await apiDelete(`/api/clusters/${encodeURIComponent(id)}`); refreshClusters(); setFeedback({ tone: "ok", text: `${name} 已删除` }); }
     catch (error: any) { setFeedback({ tone: "warn", text: error.message }); }
   }
+  async function connectRancher() {
+    setSavingRancher(true); setFeedback(null);
+    try {
+      const result = await apiPost<any>("/api/rancher/connection", {
+        rancher_url: rancherUrl,
+        bearer_token: rancherToken,
+        verify_ssl: rancherVerifySsl,
+      });
+      setRancherToken("");
+      refreshRancherConnection(); refresh();
+      setFeedback({ tone: "ok", text: `Rancher 已验证并纳管 ${result.cluster_count || 0} 个集群` });
+    } catch (error: any) { setFeedback({ tone: "warn", text: error.message }); }
+    finally { setSavingRancher(false); }
+  }
+  async function restoreEnvironmentRancher() {
+    if (!window.confirm("删除页面保存的 Rancher 覆盖配置，并恢复使用当前 ConfigMap/Secret？")) return;
+    try {
+      const result = await apiDelete<any>("/api/rancher/connection");
+      const active = result.active_connection || {};
+      setRancherUrl(active.base_url || ""); setRancherToken("");
+      setRancherVerifySsl(active.verify_ssl !== false);
+      refreshRancherConnection(); refresh();
+      setFeedback({ tone: "ok", text: result.message || "已恢复 ConfigMap/Secret 配置" });
+    } catch (error: any) { setFeedback({ tone: "warn", text: error.message }); }
+  }
   const cloudAdapters = list(cloud.data?.available || cloud.data?.adapters);
   return <div className="unified-page"><div className="page-commandbar"><div className="quiet-note"><ShieldCheck size={15} />凭据在服务端加密存储，前端不回传敏感内容</div>{feedback && <span className={`channel-feedback ${feedback.tone}`}>{feedback.text}</span>}<button className="ghost" onClick={refresh}><RefreshCcw size={15} />检测</button></div>
-    <section className="surface"><SectionHead icon={ServerCog} title="Kubernetes 集群纳管" meta="Rancher 或加密 kubeconfig" />
-      <div className="cluster-connect-grid"><div className="cluster-connect-form">{editingClusterId && <div className="quiet-note"><RefreshCcw size={14} />可只填写新 Token 进行原子刷新，或上传完整 kubeconfig；验证成功后才替换原密文。<button className="ghost tiny" onClick={() => { setEditingClusterId(""); setClusterName(""); setDynamicToken(""); }}>取消</button></div>}<label>集群名称<input value={clusterName} onChange={(event) => setClusterName(event.target.value)} placeholder="例如：生产华东集群" /></label><label>上传 kubeconfig<input type="file" accept=".yaml,.yml,.conf,.config" onChange={async (event) => { const file = event.target.files?.[0]; if (!file) return; const text = await file.text(); setKubeconfig(text); await inspectKubeconfig(text); }} /></label><label>或粘贴 kubeconfig<textarea value={kubeconfig} onChange={(event) => setKubeconfig(event.target.value)} rows={8} placeholder="apiVersion: v1…" /></label><label>动态 Bearer Token（可选）<input type="password" autoComplete="off" value={dynamicToken} onChange={(event) => setDynamicToken(event.target.value)} placeholder="含 exec/auth-provider 的 kubeconfig 必须单独填写当前 Token" /><small>Token 仅在服务端加密保存；平台不会执行 kubeconfig 中的外部认证命令。</small></label><div className="querybar"><button className="ghost" onClick={() => inspectKubeconfig()} disabled={!kubeconfig.trim()}>读取 Context</button>{contexts.length > 0 && <select value={context} onChange={(event) => setContext(event.target.value)}>{contexts.map((item: any) => <option key={item.name} value={item.name}>{item.name}{item.current ? "（当前）" : ""}</option>)}</select>}<button className="primary" onClick={importCluster} disabled={savingCluster || (editingClusterId ? (!dynamicToken.trim() && (!kubeconfig.trim() || !context)) : (!kubeconfig.trim() || !context))}>{savingCluster ? <Loader2 className="spin" size={15} /> : <Upload size={15} />}{editingClusterId && !kubeconfig.trim() ? "验证并刷新 Token" : editingClusterId ? "验证并更新" : "验证并纳管"}</button></div></div>
-      <div className="managed-cluster-list">{list(clusters.data?.items).length ? list(clusters.data.items).map((item: any) => <div key={item.id}><span className="resource-icon"><ServerCog size={16} /></span><div><strong>{item.name}</strong><p>{item.context_name} · Kubernetes {item.version || "待验证"}</p><small>{item.node_count || 0} nodes · 最近验证 {timeText(item.last_checked_at)}</small>{item.last_error && <small className="inline-error">{item.last_error}</small>}</div><StatusPill status={item.status} /><button className="channel-test" onClick={() => { setEditingClusterId(item.id); setClusterName(item.name); setKubeconfig(""); setDynamicToken(""); setContexts([]); setContext(""); }} title="更新 kubeconfig 或动态 Token"><Upload size={13} /></button><button className="channel-test" onClick={async () => { await apiPost(`/api/clusters/${encodeURIComponent(item.id)}/verify`, {}); refreshClusters(); }} title="重新验证"><RefreshCcw size={13} /></button><button className="channel-test danger" onClick={() => removeCluster(item.id, item.name)} title="删除集群"><Trash2 size={13} /></button></div>) : <Empty text="尚未通过 kubeconfig 纳管集群；Rancher 接入仍可并行使用" />}</div></div>
+    <section className="surface">
+      <SectionHead
+        icon={ServerCog}
+        title="Kubernetes 集群纳管"
+        meta="选择 Rancher 或加密 kubeconfig"
+        action={<div className="segmented"><button className={connectionMode === "kubeconfig" ? "active" : ""} onClick={() => setConnectionMode("kubeconfig")}><Upload size={13} />添加 kubeconfig</button><button className={connectionMode === "rancher" ? "active" : ""} onClick={() => setConnectionMode("rancher")}><Network size={13} />连接 Rancher</button></div>}
+      />
+      {connectionMode === "kubeconfig" ? <div className="cluster-connect-grid">
+        <div className="cluster-connect-form">
+          {editingClusterId && <div className="quiet-note"><RefreshCcw size={14} />可只填写新 Token 进行原子刷新，或上传完整 kubeconfig；验证成功后才替换原密文。<button className="ghost tiny" onClick={() => { setEditingClusterId(""); setClusterName(""); setDynamicToken(""); }}>取消</button></div>}
+          <label>集群名称<input value={clusterName} onChange={(event) => setClusterName(event.target.value)} placeholder="例如：生产集群" /></label>
+          <label>上传 kubeconfig<input type="file" accept=".yaml,.yml,.conf,.config" onChange={async (event) => { const file = event.target.files?.[0]; if (!file) return; const text = await file.text(); setKubeconfig(text); await inspectKubeconfig(text); }} /></label>
+          <label>或粘贴 kubeconfig<textarea value={kubeconfig} onChange={(event) => setKubeconfig(event.target.value)} rows={8} placeholder="apiVersion: v1…" /></label>
+          <label>动态 Bearer Token（可选）<input type="password" autoComplete="off" value={dynamicToken} onChange={(event) => setDynamicToken(event.target.value)} placeholder="含 exec/auth-provider 的 kubeconfig 必须单独填写当前 Token" /><small>Token 仅在服务端加密保存；平台不会执行 kubeconfig 中的外部认证命令。</small></label>
+          <div className="querybar"><button className="ghost" onClick={() => inspectKubeconfig()} disabled={!kubeconfig.trim()}>读取 Context</button>{contexts.length > 0 && <select value={context} onChange={(event) => setContext(event.target.value)}>{contexts.map((item: any) => <option key={item.name} value={item.name}>{item.name}{item.current ? "（当前）" : ""}</option>)}</select>}<button className="primary" onClick={importCluster} disabled={savingCluster || (editingClusterId ? (!dynamicToken.trim() && (!kubeconfig.trim() || !context)) : (!kubeconfig.trim() || !context))}>{savingCluster ? <Loader2 className="spin" size={15} /> : <Upload size={15} />}{editingClusterId && !kubeconfig.trim() ? "验证并刷新 Token" : editingClusterId ? "验证并更新" : "验证并纳管"}</button></div>
+        </div>
+        <div className="managed-cluster-list">{list(clusters.data?.items).length ? list(clusters.data.items).map((item: any) => <div key={item.id}><span className="resource-icon"><ServerCog size={16} /></span><div><strong>{item.name}</strong><p>{item.context_name} · Kubernetes {item.version || "待验证"}</p><small>{item.node_count || 0} nodes · 最近验证 {timeText(item.last_checked_at)}</small>{item.last_error && <small className="inline-error">{item.last_error}</small>}</div><StatusPill status={item.status} /><button className="channel-test" onClick={() => { setEditingClusterId(item.id); setClusterName(item.name); setKubeconfig(""); setDynamicToken(""); setContexts([]); setContext(""); }} title="更新 kubeconfig 或动态 Token"><Upload size={13} /></button><button className="channel-test" onClick={async () => { await apiPost(`/api/clusters/${encodeURIComponent(item.id)}/verify`, {}); refreshClusters(); }} title="重新验证"><RefreshCcw size={13} /></button><button className="channel-test danger" onClick={() => removeCluster(item.id, item.name)} title="删除集群"><Trash2 size={13} /></button></div>) : <Empty text="尚未通过 kubeconfig 纳管集群；Rancher 接入仍可并行使用" />}</div>
+      </div> : <div className="cluster-connect-grid">
+        <div className="cluster-connect-form">
+          <div className="quiet-note"><ShieldCheck size={14} />先验证新连接，再原子替换运行时配置；验证失败不会影响当前 ConfigMap/Secret。</div>
+          <label>Rancher URL<input value={rancherUrl} onChange={(event) => setRancherUrl(event.target.value)} placeholder="https://rancher.example.com" /></label>
+          <label>Rancher Bearer Token<input type="password" autoComplete="new-password" value={rancherToken} onChange={(event) => setRancherToken(event.target.value)} placeholder="输入新的 Bearer Token，服务端不会回显" /></label>
+          <label>TLS 校验<select value={rancherVerifySsl ? "true" : "false"} onChange={(event) => setRancherVerifySsl(event.target.value === "true")}><option value="true">验证 Rancher 证书</option><option value="false">不验证证书（仅限企业自签名环境）</option></select></label>
+          <div className="querybar"><button className="primary" onClick={connectRancher} disabled={savingRancher || !rancherUrl.trim() || !rancherToken.trim()}>{savingRancher ? <Loader2 className="spin" size={15} /> : <Network size={15} />}{rancherConnection.data?.configured ? "验证并更新 Rancher" : "验证并纳管 Rancher"}</button></div>
+        </div>
+        <div className="rancher-connection-card">
+          <div><span className="resource-icon"><Network size={17} /></span><div><strong>当前 Rancher 连接</strong><p>{rancherConnection.data?.base_url || "尚未配置"}</p></div><StatusPill status={rancherConnection.data?.configured ? "connected" : "not_configured"} /></div>
+          {rancherConnection.data?.configured && <><dl><div><dt>配置来源</dt><dd>{rancherConnection.data.source === "environment" ? "ConfigMap / Secret" : "页面加密配置"}</dd></div><div><dt>TLS 校验</dt><dd>{rancherConnection.data.verify_ssl === false ? "关闭" : "开启"}</dd></div><div><dt>已发现集群</dt><dd>{rancherConnection.data.cluster_count ?? "连接后读取"}</dd></div><div><dt>最近验证</dt><dd>{timeText(rancherConnection.data.last_checked_at)}</dd></div></dl>{rancherConnection.data.source === "environment" ? <div className="quiet-note"><ShieldCheck size={14} />当前配置来自 Deployment 注入的 ConfigMap/Secret。直接更换镜像不会覆盖 URL 或 Token。</div> : <div className="quiet-note"><ShieldCheck size={14} />URL、Token 与 TLS 策略已使用 Fernet 加密并保存在持久化运行目录。</div>}{rancherConnection.data.editable && <button className="ghost danger" onClick={restoreEnvironmentRancher}><Trash2 size={13} />删除页面覆盖并恢复 ConfigMap</button>}</>}
+          {!rancherConnection.data?.configured && <Empty text="填写 Rancher URL 和 Token，验证通过后开始发现集群" />}
+          {rancherConnection.data?.runtime_error && <div className="inline-error">{rancherConnection.data.runtime_error}</div>}
+        </div>
+      </div>}
     </section>
     <div className="integration-groups">{groups.map(([id, title, Icon]) => <section className="surface" key={id}><SectionHead icon={Icon} title={title} /><div className="integration-cards">{list(state.data?.items).filter((item: any) => item.category === id).map((item: any) => <div key={item.id}><span className="resource-icon"><CloudCog size={16} /></span><div><strong>{item.name}</strong><p>{item.capability}</p><small>{item.configuration_hint}</small></div><div className="integration-actions"><StatusPill status={item.status} />{id === "collaboration" && item.status === "configured" && <button className="channel-test" onClick={() => testChannel(item.id)} disabled={testing === item.id} title={`发送 ${item.name} 测试通知`}>{testing === item.id ? <Loader2 className="spin" size={13} /> : <Send size={13} />}</button>}</div></div>)}</div></section>)}</div>
     <section className="surface"><SectionHead icon={GitBranch} title="云资源适配器" meta="Rancher · Generic CSI Storage · Virtualization Platform · Public Cloud" /><div className="capability-grid">{cloudAdapters.length ? cloudAdapters.map((item: any) => <div className="capability-card" key={item.id || item.provider}><span>{item.enabled ? "enabled" : "available"}</span><strong>{item.display_name || item.name || item.provider}</strong><p>{list(item.capabilities).join(" · ") || item.description}</p><small>{item.auth_mode} · {item.inventory_scope}</small></div>) : <Empty text="通过 CLOUD_ADAPTERS_JSON 接入阿里云、通用 CSI 存储、虚拟化平台或其他云适配器" />}</div></section>

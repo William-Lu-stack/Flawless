@@ -16,12 +16,20 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.0**.
+Current release: **5.0.1**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
+
+Release 5.0.1 adds two explicit cluster-onboarding paths in the console:
+encrypted kubeconfig and Rancher URL/token. Existing `RANCHER_URL`,
+`RANCHER_TOKEN`, and TLS settings injected by ConfigMap/Secret remain the
+default after an image-only upgrade. A Web-provided Rancher profile is probed
+before it atomically becomes an encrypted runtime override; deleting that
+override restores the environment configuration without changing Kubernetes
+objects or credentials. Neither API ever returns a bearer token.
 
 Release 5.0.0 replaces the display-only Deployment canary with real Argo
 Rollouts progressive delivery.  The existing blast-radius algorithm now
