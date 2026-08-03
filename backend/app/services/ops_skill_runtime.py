@@ -31,7 +31,7 @@ BUILTIN_SKILL_HANDLERS: dict[str, BuiltinSkillHandler] = {
     VOLUME_PERMISSION_SKILL_ID: BuiltinSkillHandler(
         skill_id=VOLUME_PERMISSION_SKILL_ID,
         handler_id="volume-write-permission-recovery",
-        version="2.0.0",
+        version="2.1.0",
         continuation_capable=True,
     ),
     PVC_PV_SKILL_ID: BuiltinSkillHandler(

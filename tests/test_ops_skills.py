@@ -1,4 +1,5 @@
 import base64
+import copy
 import io
 import json
 import os
@@ -352,6 +353,136 @@ class OpsSkillCatalogTests(unittest.TestCase):
         self.assertEqual(container["runAsUser"], 0)
         self.assertEqual(container["runAsGroup"], 0)
         self.assertIs(container["runAsNonRoot"], False)
+
+    def test_live_workload_nonroot_contract_overrides_stale_rollout_pod(self):
+        """A retained old CrashLoop Pod must not make the same patch look new."""
+        workload_security = {
+            "runAsUser": 10001,
+            "runAsGroup": 10001,
+            "runAsNonRoot": True,
+            "fsGroup": 10001,
+            "supplementalGroups": [10001],
+            "fsGroupChangePolicy": "OnRootMismatch",
+        }
+        evidence = {
+            "logs": {"grafana": {"current": (
+                "GF_PATHS_DATA='/var/lib/grafana' is not writable.\n"
+                "Error: unable to open database file (14)"
+            )}},
+            # During a broken rollout the originally selected Pod can still
+            # carry the old, incomplete security context.
+            "pod": {
+                "name": "grafana-old",
+                "security_context": {"fsGroup": 10001},
+                "containers": [{
+                    "name": "grafana",
+                    "security_context": {
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "runAsNonRoot": True,
+                    },
+                    "volume_mounts": [{
+                        "name": "data",
+                        "mount_path": "/var/lib/grafana",
+                    }],
+                }],
+            },
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "grafana", "generation": 8},
+                "spec": {"template": {"spec": {
+                    "securityContext": workload_security,
+                    "containers": [{
+                        "name": "grafana",
+                        "securityContext": {
+                            "runAsUser": 10001,
+                            "runAsGroup": 10001,
+                            "runAsNonRoot": True,
+                            "allowPrivilegeEscalation": False,
+                        },
+                        "volumeMounts": [{
+                            "name": "data",
+                            "mountPath": "/var/lib/grafana",
+                        }],
+                    }],
+                }}},
+            },
+        }
+        plan = {
+            "namespace": "k8s-agent",
+            "target": "Deployment/k8s-agent-grafana",
+            "summary": "Grafana CrashLoopBackOff",
+            "evidence": evidence,
+            "_runtime_evidence": evidence,
+            "changes": [],
+        }
+
+        attached = server._attach_operator_skills_to_plan(
+            plan,
+            {
+                "question": plan["summary"],
+                "diagnosis": {"root_cause": "mounted Grafana path is not writable"},
+                "evidence": evidence,
+                "plan": plan,
+            },
+            preferred_skill_ids=["skill-volume-permission-recovery"],
+        )
+
+        self.assertEqual(attached["permission_recovery_stage"], "root")
+        self.assertIn(
+            "nonroot_group",
+            attached["_attempted_permission_recovery_stages"],
+        )
+        patch_spec = attached["changes"][0]["patch"]["spec"]["template"]["spec"]
+        self.assertEqual(patch_spec["securityContext"]["runAsUser"], 0)
+        self.assertEqual(patch_spec["securityContext"]["runAsGroup"], 0)
+        self.assertEqual(patch_spec["securityContext"]["fsGroup"], 0)
+        self.assertIs(patch_spec["securityContext"]["runAsNonRoot"], False)
+
+    def test_live_root_contract_is_not_repeated_when_storage_still_fails(self):
+        root_pod_security = copy.deepcopy(server.ROOT_POD_SECURITY_CONTEXT)
+        root_container_security = copy.deepcopy(server.ROOT_CONTAINER_SECURITY_CONTEXT)
+        evidence = {
+            "logs": {"grafana": {"current": (
+                "GF_PATHS_DATA='/var/lib/grafana' is not writable.\n"
+                "Error: unable to open database file (14)"
+            )}},
+            "pod": {
+                "name": "grafana-root",
+                "security_context": root_pod_security,
+                "containers": [{
+                    "name": "grafana",
+                    "security_context": root_container_security,
+                    "volume_mounts": [{"name": "data", "mount_path": "/var/lib/grafana"}],
+                }],
+            },
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "grafana"},
+                "spec": {"template": {"spec": {
+                    "securityContext": root_pod_security,
+                    "containers": [{
+                        "name": "grafana",
+                        "securityContext": root_container_security,
+                        "volumeMounts": [{"name": "data", "mountPath": "/var/lib/grafana"}],
+                    }],
+                }}},
+            },
+        }
+        plan = {
+            "namespace": "k8s-agent",
+            "target": "Deployment/k8s-agent-grafana",
+            "summary": "Grafana data path is not writable",
+            "_runtime_evidence": evidence,
+            "evidence": evidence,
+        }
+
+        followup = server._permission_recovery_followup(plan)
+
+        self.assertEqual(followup["source"], "storage_admin_required")
+        self.assertEqual(followup["changes"], [])
+        self.assertIn("root", plan["_attempted_permission_recovery_stages"])
+        self.assertTrue(plan["permission_strategy_decision"]["live_root_patch_is_noop"])
 
     def test_capacity_evidence_prevents_direct_root_strategy(self):
         plan = {

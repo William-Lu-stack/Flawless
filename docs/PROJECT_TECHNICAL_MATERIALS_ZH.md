@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：5.0.3
+版本：5.0.4
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -229,6 +229,18 @@ root_cause_diagnosing
 
 这套设计体现了 SRE 的错误预算门禁、渐进式交付、最小爆炸半径、自动回退、人工高风险审批和可验证恢复，而不只是 Kubernetes RollingUpdate。
 
+### 5.4 权限故障的恢复与合规分层
+
+`runAsUser/runAsGroup/fsGroup=0` 是业务恢复手段，不是长期安全基线。权限 Skill 按以下边界执行：
+
+1. 先证明错误路径、volumeMount、运行 UID/GID 与 ERROR/WARNING 日志属于同一故障链；数据库打开失败等应用包装错误本身不能直接授权 root。
+2. 优先使用镜像声明的业务 UID/GID、`fsGroup`、`supplementalGroups` 或存储侧属主/ACL，使容器继续以非 root 运行。
+3. 完整非 root 方案已实际发布且新 Pod 仍报告同一错误时，才展示完整 root 补丁；该步骤必须重新人工审批，不能复用上一阶段审批。
+4. root 方案同时保持 `allowPrivilegeEscalation=false`，保存变更前快照并限制在单个 Workload；成功后记录残余风险，另行提出可回滚的非 root 加固计划。
+5. 若 root 后仍失败，禁止重复同值 Patch；系统转向 `readOnly`、NFS `root_squash`、CSI 权限、容量、I/O、数据库损坏或后端目录 ACL，并明确要求对应存储管理员处理。
+
+扩展到全量集群风险时，不使用“统一改 root”的自动化规则。OOM、探针、镜像、ConfigMap/Secret、PVC/PV、网络、节点压力和发布失败分别由证据最匹配的 Skill 负责；每个 Skill 都受目标范围、爆炸半径、动作白名单、逐项审批、回滚和恢复判据约束。扫描发现风险只会创建待处置事故，不会自动获得写权限。
+
 ## 6. 数据与持久化
 
 | 数据 | 默认生产路径 | 用途 |
@@ -257,7 +269,7 @@ root_cause_diagnosing
 | 数据 | SQLite、JSON 原子文件、Fernet 加密 |
 | 可观测 | Prometheus、Loki、Tempo、Grafana、Langfuse、eBPF/Beyla |
 | 交付 | Docker 多阶段构建、Docker Compose、Helm、Kubernetes YAML |
-| 测试 | pytest/unittest、真实 K3s、httpx、kubectl、TypeScript Compiler、Vite |
+| 测试 | pytest/unittest、真实 Kind/K3s、httpx、kubectl、TypeScript Compiler、Vite |
 
 ### 7.2 代码结构
 
@@ -285,22 +297,24 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-5.0.3 已完成：
+5.0.4 已完成：
 
-- Python 全量测试：211 passed，另有 9 个 subtests passed。
+- Python 全量测试：214 passed，另有 9 个 subtests passed。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
 - 真实 DeepSeek 路径：11.32 秒完成 `llm_planning → llm_planning_done → skill_router_processing → skill_router_done`，模型来源为 `llm+EvidenceRunbookEngine`。
 - Skill Router 卡死模拟：LLM 返回后 Router 人为阻塞，任务在独立硬超时内产生 `skill_router_timeout` 并安全返回。
 - 孤儿任务模拟：运行状态存在但执行协程丢失时，查询触发从新证据恢复并废除旧审批。
-- 真实 K3s 权限故障闭环：
+- 真实 Kind Kubernetes 权限故障闭环（SQLite 文件打开失败、mkdir 权限拒绝、GID 不匹配三种场景）：
   - 创建非 root securityContext 导致文件和 SQLite 数据库创建失败的 CrashLoop Pod；
   - 产品通过公开 API 采集真实 Kubernetes 证据；
   - 动态匹配权限恢复 Skill；
   - 两次独立人工审批；
-  - 第一次非 root 方案验证失败后自动升级 root 方案；
+  - 第一次非 root 方案验证失败后自动升级为单独审批的完整 root 方案；
+  - 同一阶段已被 API 接受后立即记录，不再因同进程重规划而重复提交同值 Patch；
   - 实际 Patch Deployment 并滚动生成新 Pod；
   - 旧 Pod 被 ReplicaSet 删除后，自动按 Workload owner 重定位新 Pod，记录 Pod lineage 并续采日志；
-  - 新 Pod Ready，原错误消失，最终 `completed/recovered=true`。
+  - 新 Pod Ready，原错误消失，最终 `completed/recovered=true`；
+  - root 仍失败时不重复 Patch，转为只读卷、NFS `root_squash`、CSI、容量或存储后端的显式管理员边界。
 - kubeconfig 脱离 Rancher 闭环：通过 `/api/clusters` 加密纳管真实 K3s，完整执行 LLM 诊断、Skill 匹配、两次审批、Deployment Patch、滚动更新和恢复验证。
 - 双入口纳管兼容性：页面可选择 Rancher URL/Token 或 kubeconfig；已有 ConfigMap/Secret Rancher 配置在仅替换镜像时保持默认生效，页面新配置验证成功后才加密覆盖，删除覆盖后自动回退。
 - 状态感知日志证据：容器尚未启动时不再把 Kubernetes log HTTP 400 当作终点，保留 waiting reason/message，并在 Workload 范围内补采证据优先级最高的异常 Pod current/previous 日志。

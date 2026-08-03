@@ -397,6 +397,71 @@ class ErrorBudgetTests(unittest.TestCase):
         self.assertEqual(root_sc["fsGroup"], 0)
         self.assertIs(root_sc["runAsNonRoot"], False)
 
+    def test_accepted_nonroot_stage_is_visible_to_same_process_replan(self):
+        plan = {
+            "namespace": "k8s-agent",
+            "target": "Deployment/k8s-agent-grafana",
+            "summary": "GF_PATHS_DATA=/var/lib/grafana is not writable",
+            "_runtime_evidence": {
+                "logs": {"grafana": {"current": (
+                    "GF_PATHS_DATA=/var/lib/grafana is not writable\n"
+                    "Error: unable to open database file (14)"
+                )}},
+                "pod": {
+                    "name": "grafana-bad",
+                    "security_context": {"runAsUser": 10001, "runAsGroup": 10001},
+                    "containers": [{
+                        "name": "grafana",
+                        "security_context": {"runAsUser": 10001, "runAsGroup": 10001},
+                        "volume_mounts": [{"name": "data", "mount_path": "/var/lib/grafana"}],
+                    }],
+                },
+            },
+        }
+        accepted_change = {
+            "type": "patch_workload_runtime_security",
+            "namespace": "k8s-agent",
+            "workload_type": "Deployment",
+            "workload_name": "k8s-agent-grafana",
+            "container_name": "grafana",
+            "permission_recovery_stage": "nonroot_group",
+            "patch": {"spec": {"template": {"spec": {
+                "securityContext": {
+                    "runAsUser": 10001,
+                    "runAsGroup": 10001,
+                    "runAsNonRoot": True,
+                    "fsGroup": 10001,
+                    "supplementalGroups": [10001],
+                },
+                "containers": [{
+                    "name": "grafana",
+                    "securityContext": {
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "runAsNonRoot": True,
+                    },
+                }],
+            }}}},
+        }
+
+        server._record_permission_stage_attempt(
+            plan,
+            accepted_change,
+            outcome="patched",
+        )
+        next_plan = server._permission_recovery_followup(plan)
+
+        self.assertEqual(next_plan["permission_recovery_stage"], "root")
+        self.assertEqual(
+            plan["_permission_stage_receipts"][0]["stage"],
+            "nonroot_group",
+        )
+        root_sc = next_plan["changes"][0]["patch"]["spec"]["template"]["spec"]
+        self.assertEqual(root_sc["securityContext"]["runAsUser"], 0)
+        self.assertEqual(root_sc["securityContext"]["runAsGroup"], 0)
+        self.assertEqual(root_sc["securityContext"]["fsGroup"], 0)
+        self.assertIs(root_sc["securityContext"]["runAsNonRoot"], False)
+
     def test_declared_workload_patch_must_match_live_yaml_before_recovery(self):
         plan = {
             "namespace": "monitoring",

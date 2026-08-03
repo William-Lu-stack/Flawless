@@ -310,6 +310,30 @@ async def run() -> None:
         assert result["status"] == "completed", result
         assert not (result.get("results") or [{}])[0].get("permission_guidance"), result
         assert (result.get("verification") or {}).get("recovered") is True, result
+        assert stages == ["nonroot_group", "root"], {
+            "error": "permission stages must advance once without repeating the same patch",
+            "stages": stages,
+            "result": result,
+        }
+        live_workload = registry.read_resource(
+            cluster_id,
+            api_version="apps/v1",
+            kind="Deployment",
+            name=WORKLOAD,
+            namespace=NAMESPACE,
+        )
+        live_pod_spec = (((live_workload.get("spec") or {}).get("template") or {}).get("spec") or {})
+        live_pod_security = live_pod_spec.get("securityContext") or {}
+        live_container_security = ((live_pod_spec.get("containers") or [{}])[0].get("securityContext") or {})
+        assert int((live_workload.get("metadata") or {}).get("generation") or 0) >= 3, live_workload
+        assert live_pod_security.get("runAsUser") == 0, live_pod_security
+        assert live_pod_security.get("runAsGroup") == 0, live_pod_security
+        assert live_pod_security.get("runAsNonRoot") is False, live_pod_security
+        assert live_pod_security.get("fsGroup") == 0, live_pod_security
+        assert live_pod_security.get("supplementalGroups") == [0], live_pod_security
+        assert live_container_security.get("runAsUser") == 0, live_container_security
+        assert live_container_security.get("runAsGroup") == 0, live_container_security
+        assert live_container_security.get("runAsNonRoot") is False, live_container_security
         candidate = result.get("candidate_skill") or {}
         assert candidate.get("lifecycle") == "candidate" and candidate.get("enabled") is False, candidate
         print({

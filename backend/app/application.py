@@ -196,7 +196,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.3")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.4")
 APP_CODE_SIGNATURE = "evidence-satisfied-diagnosis-v27"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -400,7 +400,7 @@ def _change_result_audit_receipt(result: Any) -> dict:
         "api_version", "kind", "name", "namespace",
     ):
         value = result.get(key)
-        if value not in {None, ""}:
+        if value is not None and value != "":
             receipt[key] = value
     resource_payload = (
         result.get("resource")
@@ -412,7 +412,7 @@ def _change_result_audit_receipt(result: Any) -> dict:
         resource_identity = {
             key: metadata.get(key)
             for key in ("name", "namespace", "uid", "resourceVersion", "generation")
-            if metadata.get(key) not in {None, ""}
+            if metadata.get(key) is not None and metadata.get(key) != ""
         }
         if resource_identity:
             receipt["resource"] = resource_identity
@@ -428,7 +428,7 @@ def _change_result_audit_receipt(result: Any) -> dict:
                 "phase", "observedGeneration", "replicas", "readyReplicas",
                 "availableReplicas", "updatedReplicas", "unavailableReplicas",
             )
-            if status.get(key) not in {None, ""}
+            if status.get(key) is not None and status.get(key) != ""
         }
     return _redact_sensitive(receipt or {"completed": True})
 
@@ -8727,13 +8727,35 @@ async def _collect_ops_step(step: dict, plan: dict) -> dict:
                     for e in events
                 ])
         else:
-            evidence = plan.get("evidence") or {}
-            state_text = evidence.get("state_text") if isinstance(evidence, dict) else ""
-            if state_text:
-                artifacts["state_text"] = _redact_text(_clip_text(state_text, 1200))
-                logs.append(f"[state] {_redact_text(_clip_text(state_text, 500))}")
+            # Model-authored step titles such as “确认实时证据” do not always
+            # carry a probe id. Attach the already collected Kubernetes
+            # artifacts instead of emitting the misleading
+            # “no direct pod artifact attached” placeholder.
+            if deep and (deep.get("pod") or deep.get("workload") or deep.get("logs")):
+                artifacts["pod"] = deep.get("pod") or {}
+                artifacts["workload"] = deep.get("workload") or {}
+                artifacts["events"] = (deep.get("events") or [])[-20:]
+                artifacts["storage"] = deep.get("storage") or []
+                artifacts["log_triage"] = deep.get("log_triage") or {}
+                logs.append(
+                    "[evidence] attached live Pod, Workload, Events, storage and prioritized logs"
+                )
+                priority = (deep.get("log_triage") or {}).get("priority") or []
+                for item in priority[:4]:
+                    if not isinstance(item, dict):
+                        continue
+                    logs.append(
+                        f"[priority-log] container={item.get('container') or '-'} "
+                        f"stream={item.get('stream') or '-'} errors={item.get('error_count') or 0}"
+                    )
             else:
-                logs.append("[analysis] no direct pod artifact attached; using planned change context")
+                evidence = plan.get("evidence") or {}
+                state_text = evidence.get("state_text") if isinstance(evidence, dict) else ""
+                if state_text:
+                    artifacts["state_text"] = _redact_text(_clip_text(state_text, 1200))
+                    logs.append(f"[state] {_redact_text(_clip_text(state_text, 500))}")
+                else:
+                    logs.append("[analysis] no direct pod artifact attached; using planned change context")
     except Exception as e:
         status = "warning"
         logs.append(f"[warn] step probe failed: {type(e).__name__}: {_redact_text(str(e))}")
@@ -11265,6 +11287,107 @@ def _permission_attempted_stages(plan: dict) -> set[str]:
     return attempted
 
 
+def _record_permission_stage_attempt(plan: dict, change: dict, *, outcome: str) -> None:
+    """Persist a permission stage as soon as Kubernetes accepted the action.
+
+    The next Skill replan runs inside the same ``_execute_ops_plan_once`` call,
+    before the outer OpsJob has written its history/continuation record.  If we
+    only infer the stage from that later history, the in-process replan can
+    forget that ``nonroot_group`` was just attempted and submit the identical
+    patch again.  Recording the accepted stage on the live plan closes that
+    race while still leaving API/RBAC failures retryable.
+    """
+    stage = _permission_recovery_stage(plan, change)
+    if not stage or str(change.get("type") or "") not in {
+        "patch_workload_runtime_security",
+        "replace_immutable_workload",
+        "rollback_permission_hardening",
+    }:
+        return
+    stages = plan.setdefault("_attempted_permission_recovery_stages", [])
+    if stage not in stages:
+        stages.append(stage)
+    receipts = plan.setdefault("_permission_stage_receipts", [])
+    receipt = {
+        "stage": stage,
+        "outcome": str(outcome or "accepted"),
+        "change_fingerprint": _change_item_fingerprint(change),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not any(
+        isinstance(item, dict)
+        and item.get("stage") == stage
+        and item.get("change_fingerprint") == receipt["change_fingerprint"]
+        for item in receipts
+    ):
+        receipts.append(receipt)
+        del receipts[:-12]
+
+
+def _workload_runtime_security_context(
+    workload: dict,
+    container_name: str,
+) -> tuple[dict, dict]:
+    """Return the desired Pod/container security contexts from live YAML."""
+    spec = workload.get("spec") or {} if isinstance(workload, dict) else {}
+    kind = str(workload.get("kind") or "") if isinstance(workload, dict) else ""
+    if kind.lower() == "cronjob":
+        pod_spec = (
+            ((((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec"))
+            or {}
+        )
+    elif kind.lower() == "pod":
+        pod_spec = spec
+    else:
+        pod_spec = ((spec.get("template") or {}).get("spec") or {})
+    container = next(
+        (
+            item for item in (pod_spec.get("containers") or [])
+            if isinstance(item, dict)
+            and str(item.get("name") or "") == str(container_name or "")
+        ),
+        {},
+    )
+    return (
+        pod_spec.get("securityContext") or {},
+        container.get("securityContext") or {},
+    )
+
+
+def _complete_nonroot_security_contract(pod_sc: dict, container_sc: dict) -> tuple[bool, int | None, int | None]:
+    """Recognize the complete least-privilege contract displayed to operators."""
+    try:
+        uid = int(container_sc.get("runAsUser", pod_sc.get("runAsUser")))
+        gid = int(container_sc.get("runAsGroup", pod_sc.get("runAsGroup", pod_sc.get("fsGroup"))))
+    except (TypeError, ValueError):
+        return False, None, None
+    supplemental = {
+        int(value)
+        for value in (pod_sc.get("supplementalGroups") or [])
+        if value is not None and not isinstance(value, bool) and str(value).lstrip("-").isdigit()
+    }
+    complete = bool(
+        uid > 0
+        and gid > 0
+        and pod_sc.get("runAsUser") == uid
+        and pod_sc.get("runAsGroup") == gid
+        and pod_sc.get("runAsNonRoot") is True
+        and pod_sc.get("fsGroup") == gid
+        and gid in supplemental
+        and container_sc.get("runAsUser") == uid
+        and container_sc.get("runAsGroup") == gid
+        and container_sc.get("runAsNonRoot") is True
+    )
+    return complete, uid, gid
+
+
+def _complete_root_security_contract(pod_sc: dict, container_sc: dict) -> bool:
+    return bool(
+        all(pod_sc.get(key) == value for key, value in ROOT_POD_SECURITY_CONTEXT.items())
+        and all(container_sc.get(key) == value for key, value in ROOT_CONTAINER_SECURITY_CONTEXT.items())
+    )
+
+
 def _permission_recovery_followup(
     plan: dict,
     *,
@@ -11277,10 +11400,16 @@ def _permission_recovery_followup(
     workload = deep.get("workload") or {}
     container, container_name, failing_path = _permission_failure_container(plan)
     attempted = _permission_attempted_stages(plan)
-    pod_sc = pod.get("security_context") or (
-        ((((workload.get("spec") or {}).get("template") or {}).get("spec") or {}).get("securityContext") or {})
+    workload_pod_sc, workload_container_sc = _workload_runtime_security_context(
+        workload,
+        container_name,
     )
-    container_sc = container.get("security_context") or container.get("securityContext") or {}
+    pod_sc = pod.get("security_context") or pod.get("securityContext") or workload_pod_sc
+    container_sc = (
+        container.get("security_context")
+        or container.get("securityContext")
+        or workload_container_sc
+    )
 
     def observed_int(*values) -> int | None:
         for value in values:
@@ -11294,8 +11423,18 @@ def _permission_recovery_followup(
                 return parsed
         return None
 
-    uid = observed_int(container_sc.get("runAsUser"), pod_sc.get("runAsUser"))
+    # The Workload template is the desired state that will create the next
+    # ReplicaSet. Prefer it over a stale CrashLoop Pod retained during rollout.
+    uid = observed_int(
+        workload_container_sc.get("runAsUser"),
+        workload_pod_sc.get("runAsUser"),
+        container_sc.get("runAsUser"),
+        pod_sc.get("runAsUser"),
+    )
     gid = observed_int(
+        workload_container_sc.get("runAsGroup"),
+        workload_pod_sc.get("runAsGroup"),
+        workload_pod_sc.get("fsGroup"),
         container_sc.get("runAsGroup"),
         pod_sc.get("runAsGroup"),
         pod_sc.get("fsGroup"),
@@ -11321,26 +11460,22 @@ def _permission_recovery_followup(
     # cannot change the outcome. Treat the live, still-failing configuration as
     # an attempted non-root stage so evidence scoring can advance to a bounded
     # ownership repair or the separately approved complete root fallback.
-    supplemental_groups = {
-        parsed
-        for value in (pod_sc.get("supplementalGroups") or [])
-        if (parsed := observed_int(value)) is not None
-    }
+    workload_nonroot_complete, workload_uid, workload_gid = _complete_nonroot_security_contract(
+        workload_pod_sc,
+        workload_container_sc,
+    )
+    pod_nonroot_complete, pod_uid, pod_gid = _complete_nonroot_security_contract(
+        pod_sc,
+        container_sc,
+    )
+    permission_failure_is_live = _storage_permission_detected(plan)
     current_nonroot_group_active = bool(
-        uid is not None
-        and gid is not None
-        and uid > 0
-        and observed_int(container_sc.get("runAsUser")) == uid
-        and observed_int(container_sc.get("runAsGroup")) == gid
-        and container_sc.get("runAsNonRoot") is True
-        and observed_int(pod_sc.get("fsGroup")) == gid
-        and observed_int(pod_sc.get("runAsUser")) == uid
-        and observed_int(pod_sc.get("runAsGroup")) == gid
-        and pod_sc.get("runAsNonRoot") is True
-        and gid in supplemental_groups
-        and _storage_permission_detected(plan)
+        permission_failure_is_live
+        and (workload_nonroot_complete or pod_nonroot_complete)
     )
     if current_nonroot_group_active:
+        uid = workload_uid or pod_uid or uid
+        gid = workload_gid or pod_gid or gid
         attempted.add("nonroot_group")
         runtime_stages = plan.setdefault("_attempted_permission_recovery_stages", [])
         if "nonroot_group" not in runtime_stages:
@@ -11352,6 +11487,21 @@ def _permission_recovery_followup(
             "noop_guard": (
                 "实时 Workload 已包含完整同值非 root securityContext，且当前日志仍报写路径失败；"
                 "禁止重复提交同值 Patch。"
+            ),
+        })
+    if permission_failure_is_live and _complete_root_security_contract(
+        workload_pod_sc or pod_sc,
+        workload_container_sc or container_sc,
+    ):
+        attempted.add("root")
+        runtime_stages = plan.setdefault("_attempted_permission_recovery_stages", [])
+        if "root" not in runtime_stages:
+            runtime_stages.append("root")
+        plan.setdefault("permission_strategy_decision", {}).update({
+            "live_root_patch_is_noop": True,
+            "noop_guard": (
+                "实时 Workload 已完整采用 root securityContext，但写路径错误仍存在；"
+                "禁止重复 root Patch，必须转向 readOnly、root_squash、容量、路径或存储后端边界。"
             ),
         })
     pod_name = str(deep.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan) or "")
@@ -11367,6 +11517,7 @@ def _permission_recovery_followup(
 
     if (
         not force_root
+        and "root" not in attempted
         and (uid is None or gid is None or uid == 0)
         and "identity_probe" not in attempted
         and pod_name
@@ -11549,6 +11700,10 @@ def _permission_recovery_followup(
             "changes": [],
             "operator_steps": steps,
             "source": "storage_admin_required",
+            "_attempted_permission_recovery_stages": sorted(attempted),
+            "permission_strategy_decision": copy.deepcopy(
+                plan.get("permission_strategy_decision") or {}
+            ),
             "verification_plan": _next_attempt_verification_plan(target),
         }
     change["permission_recovery_stage"] = stage
@@ -11582,6 +11737,7 @@ def _permission_recovery_followup(
         "permission_strategy_decision": copy.deepcopy(
             plan.get("permission_strategy_decision") or {}
         ),
+        "_attempted_permission_recovery_stages": sorted(attempted),
         "requires_confirmation": True,
         "requires_high_risk_confirmation": True,
         "source": "progressive_permission_recovery",
@@ -13929,6 +14085,20 @@ async def _execute_ops_plan_once(
             )
         results.append(change_result)
         change_status = change_result.get("status") or "completed"
+        if change_status == "completed":
+            # Make the accepted stage visible to the failure replan that runs
+            # later in this same function.  Without this receipt, the router
+            # can regenerate the just-executed non-root patch before OpsJob
+            # history has had a chance to persist it.
+            _record_permission_stage_attempt(
+                plan,
+                change,
+                outcome=str(
+                    ((change_result.get("result") or {}).get("operation"))
+                    if isinstance(change_result.get("result"), dict)
+                    else "accepted"
+                ) or "accepted",
+            )
         raw_result = change_result.get("result")
         await emit(
             "change_done",
@@ -14304,7 +14474,8 @@ async def _execute_ops_plan_once(
             level="warning",
         )
         post_failure_timeout = max(10, int(os.getenv("OPS_POST_FAILURE_EVIDENCE_TIMEOUT_SECONDS", "45")))
-        plan["_previous_runtime_evidence"] = plan.get("_runtime_evidence") or {}
+        previous_runtime_evidence = copy.deepcopy(plan.get("_runtime_evidence") or {})
+        plan["_previous_runtime_evidence"] = previous_runtime_evidence
         post_priority: dict = {}
         try:
             post_priority = await run_with_heartbeat(
@@ -14391,6 +14562,32 @@ async def _execute_ops_plan_once(
         except Exception as exc:
             post_deep = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
         plan["_runtime_evidence"] = _merge_ops_evidence(post_priority, post_deep)
+        # A just-created rollout Pod can be Pending or have no readable log
+        # stream yet.  Preserve the direct ERROR/WARNING from the previous Pod
+        # as incident-lineage evidence until the replacement produces its own
+        # log body; otherwise a transient empty log response can reroute a
+        # proven volume-permission incident to an unrelated configuration
+        # Skill between the non-root and root stages.
+        if (
+            not _ops_logs_have_content((plan.get("_runtime_evidence") or {}).get("logs") or {})
+            and _ops_logs_have_content(previous_runtime_evidence.get("logs") or {})
+        ):
+            plan["_runtime_evidence"]["logs"] = copy.deepcopy(
+                previous_runtime_evidence.get("logs") or {}
+            )
+            plan["_runtime_evidence"]["prior_failure_logs"] = copy.deepcopy(
+                previous_runtime_evidence.get("logs") or {}
+            )
+            plan["_runtime_evidence"]["log_lineage"] = {
+                "source_pod": previous_runtime_evidence.get("pod_name")
+                or ((previous_runtime_evidence.get("pod") or {}).get("name")),
+                "current_pod": (plan.get("_runtime_evidence") or {}).get("pod_name")
+                or (((plan.get("_runtime_evidence") or {}).get("pod") or {}).get("name")),
+                "reason": "replacement Pod has no readable logs yet; retained previous direct failure signature",
+            }
+            plan["_runtime_evidence"]["log_errors"] = _ops_log_errors(
+                plan["_runtime_evidence"].get("logs") or {}
+            )
         plan["_runtime_evidence"]["log_triage"] = _redact_sensitive(
             triage_kubernetes_logs((plan.get("_runtime_evidence") or {}).get("logs") or {})
         )
@@ -14489,26 +14686,39 @@ async def _execute_ops_plan_once(
             )
             else None
         )
-        candidate = _attach_operator_skills_to_plan(
-            candidate,
-            _skill_signal_payload(
-                question=str(candidate.get("summary") or candidate.get("reason") or plan.get("summary") or ""),
-                alert={
-                    "cluster": plan.get("cluster"),
-                    "cluster_id": plan.get("cluster_id"),
-                    "namespace": candidate.get("namespace") or plan.get("namespace"),
-                    "target": candidate.get("target") or plan.get("target"),
-                },
-                diagnosis={
-                    "root_cause": candidate.get("summary") or plan.get("summary") or "",
-                    "signals": (plan.get("_runtime_evidence") or {}).get("events") or [],
-                    "previous_failure": plan.get("_last_failure") or {},
-                },
-                evidence=plan.get("_runtime_evidence") or plan.get("evidence") or {},
-                plan=candidate,
-            ),
-            preferred_skill_ids=candidate_continuation_preference,
-        )
+        if not candidate_continuation_preference:
+            candidate = _attach_operator_skills_to_plan(
+                candidate,
+                _skill_signal_payload(
+                    question=str(candidate.get("summary") or candidate.get("reason") or plan.get("summary") or ""),
+                    alert={
+                        "cluster": plan.get("cluster"),
+                        "cluster_id": plan.get("cluster_id"),
+                        "namespace": candidate.get("namespace") or plan.get("namespace"),
+                        "target": candidate.get("target") or plan.get("target"),
+                    },
+                    diagnosis={
+                        "root_cause": candidate.get("summary") or plan.get("summary") or "",
+                        "signals": (plan.get("_runtime_evidence") or {}).get("events") or [],
+                        "previous_failure": plan.get("_last_failure") or {},
+                    },
+                    evidence=plan.get("_runtime_evidence") or plan.get("evidence") or {},
+                    plan=candidate,
+                ),
+            )
+        else:
+            # The executable handler already re-evaluated live evidence,
+            # generated the next stage and bound every action to its Skill.
+            # Running the generic statistical router a second time can steal
+            # ownership while a replacement Pod is temporarily log-less.
+            # Keep this handler-owned continuation; execution still passes the
+            # action allowlist, root contract, RBAC, approval and verification
+            # gates on the next attempt.
+            candidate["skill_continuation_locked"] = {
+                "skill_id": candidate_skill_id,
+                "reason": "executable handler owns the incident continuation until recovery or explicit evidence contradiction",
+                "previous_failure": _redact_sensitive(plan.get("_last_failure") or {}),
+            }
         candidate["stepwise_confirmation"] = bool(candidate.get("changes"))
         candidate["high_risk_confirmed"] = False
         candidate["operator_force_execute"] = False

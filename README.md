@@ -16,12 +16,22 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.3**.
+Current release: **5.0.4**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
+
+Release 5.0.4 keeps live error evidence across replacement Pods, records each
+accepted permission-recovery stage before same-process replanning, and prevents
+the router from repeating an identical non-root patch or replacing an active
+recovery Skill during rollout. Permission recovery now progresses from a
+least-privilege UID/GID/fsGroup repair to a separately approved complete root
+fallback, then stops at an explicit storage-administrator boundary instead of
+repeating root when read-only volumes, NFS root_squash, CSI policy, capacity or
+backend ownership still blocks the write. Each accepted change must complete a
+rollout and fresh Pod/log verification before the incident is marked recovered.
 
 Release 5.0.3 advances directly from actionable Pod logs to root-cause diagnosis
 once the live Pod and owning Workload evidence are available. Broad storage,
