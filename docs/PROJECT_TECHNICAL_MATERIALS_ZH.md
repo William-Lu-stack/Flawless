@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：5.0.2
+版本：5.0.3
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -285,9 +285,9 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-5.0.2 已完成：
+5.0.3 已完成：
 
-- Python 全量测试：209 passed，另有 9 个 subtests passed。
+- Python 全量测试：211 passed，另有 9 个 subtests passed。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
 - 真实 DeepSeek 路径：11.32 秒完成 `llm_planning → llm_planning_done → skill_router_processing → skill_router_done`，模型来源为 `llm+EvidenceRunbookEngine`。
 - Skill Router 卡死模拟：LLM 返回后 Router 人为阻塞，任务在独立硬超时内产生 `skill_router_timeout` 并安全返回。

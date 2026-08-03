@@ -743,6 +743,19 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             {"items": []},
             {"items": [pending, crashloop]},
             crashloop,
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "grafana", "namespace": "monitoring"},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "securityContext": {"runAsUser": 472, "runAsGroup": 472},
+                            "containers": [{"name": "grafana"}],
+                        },
+                    },
+                },
+            },
         ])
         collect_logs = AsyncMock(side_effect=[
             {"grafana": {"current": "", "current_error": "container has not started"}},
@@ -769,6 +782,113 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evidence["log_fallback"]["used"])
         self.assertEqual(evidence["log_fallback"]["unavailable_pod_name"], "grafana-new")
         self.assertTrue(evidence["pod_lineage"]["reselected_for_logs"])
+        self.assertEqual(evidence["workload"]["kind"], "Deployment")
+        self.assertFalse(evidence["workload_error"])
+
+    def test_actionable_direct_evidence_enters_diagnosis_without_global_enrichment(self):
+        evidence = {
+            "pod": {
+                "name": "grafana-old",
+                "security_context": {"runAsUser": 472, "runAsGroup": 472},
+                "containers": [{"name": "grafana", "restart_count": 12}],
+            },
+            "logs": {
+                "grafana": {
+                    "current": "Error: unable to open database file",
+                    "current_error": "",
+                },
+            },
+            "workload": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "grafana"},
+                "spec": {"template": {"spec": {"containers": [{"name": "grafana"}]}}},
+            },
+        }
+        triage = server.triage_kubernetes_logs(evidence["logs"])
+        self.assertTrue(server._priority_evidence_can_start_diagnosis(evidence, triage))
+        self.assertTrue(
+            server._priority_evidence_can_start_diagnosis(
+                {"pod": evidence["pod"], "logs": evidence["logs"], "workload": {}},
+                triage,
+            )
+        )
+
+        pending_pvc = {
+            "pod": evidence["pod"],
+            "logs": {},
+            "workload": evidence["workload"],
+        }
+        self.assertFalse(
+            server._priority_evidence_can_start_diagnosis(
+                pending_pvc,
+                server.triage_kubernetes_logs({}),
+            )
+        )
+
+    async def test_actionable_logs_do_not_wait_for_unrelated_deep_collectors(self):
+        evidence = {
+            "namespace": "monitoring",
+            "pod_name": "grafana-old",
+            "pod": {
+                "name": "grafana-old",
+                "security_context": {"runAsUser": 472, "runAsGroup": 472},
+                "containers": [{"name": "grafana", "restart_count": 12}],
+            },
+            "logs": {
+                "grafana": {
+                    "current": "Error: unable to open database file",
+                    "current_error": "",
+                },
+            },
+            "workload": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "grafana", "namespace": "monitoring"},
+                "spec": {"template": {"spec": {"containers": [{"name": "grafana"}]}}},
+            },
+        }
+        events = []
+
+        async def progress(stage, _message, **_extra):
+            events.append(stage)
+
+        deep_collector = AsyncMock(side_effect=AssertionError("deep collector must be deferred"))
+        plan = {
+            "title": "diagnose grafana",
+            "target": "Deployment/grafana",
+            "namespace": "monitoring",
+            "cluster_id": "cluster-a",
+            "source": "rancher",
+            "summary": "unable to open database file",
+            "steps": [],
+            "changes": [],
+        }
+        with patch.object(server, "_ops_release_gate", return_value={"allowed": True}), patch.object(
+            server, "_collect_plan_priority_evidence", AsyncMock(return_value=evidence),
+        ), patch.object(
+            server, "_collect_plan_deep_evidence", deep_collector,
+        ), patch.object(
+            server, "_attach_operator_skills_to_plan", side_effect=lambda current, *_args, **_kwargs: current,
+        ), patch.object(
+            server,
+            "_probe_plan_recovery",
+            AsyncMock(return_value={"status": "failed", "recovered": False, "message": "still failing"}),
+        ), patch.object(
+            server, "_evidence_based_replan", AsyncMock(return_value=[]),
+        ):
+            result = await server._execute_ops_plan_once(
+                plan,
+                progress=progress,
+                summarize=False,
+            )
+
+        deep_collector.assert_not_awaited()
+        self.assertIn("collecting_evidence_done", events)
+        self.assertIn("diagnosing", events)
+        self.assertIn("root_cause_diagnosing", events)
+        self.assertIn("diagnosis_done", events)
+        self.assertEqual(result["status"], "diagnostic_completed")
 
     async def test_http_deep_diagnosis_reaches_permission_change_approval(self):
         """Exercise the browser's real POST -> background job -> GET polling path.

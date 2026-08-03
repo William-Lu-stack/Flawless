@@ -16,14 +16,20 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.2**.
+Current release: **5.0.3**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
 
-Release 5.0.2 makes Pod-log evidence state-aware: containers that have not
+Release 5.0.3 advances directly from actionable Pod logs to root-cause diagnosis
+once the live Pod and owning Workload evidence are available. Broad storage,
+Service, node and topology probes are now collected only when the selected
+root-cause hypothesis or Skill requires them, so a slow optional Rancher API
+cannot leave an incident stuck in evidence collection.
+
+Release 5.0.2 made Pod-log evidence state-aware: containers that have not
 started are diagnosed from Pod status and Events instead of surfacing a bare
 Kubernetes log HTTP 400, while Workload-level diagnosis can continue with an
 evidence-rich sibling Pod and retain the full lineage. Beyla topology fusion

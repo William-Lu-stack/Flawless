@@ -196,8 +196,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.2")
-APP_CODE_SIGNATURE = "state-aware-logs-ebpf-ia-v26"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.3")
+APP_CODE_SIGNATURE = "evidence-satisfied-diagnosis-v27"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -7741,6 +7741,24 @@ def _ops_logs_have_content(logs: dict) -> bool:
     )
 
 
+def _priority_evidence_can_start_diagnosis(evidence: dict, triage: dict) -> bool:
+    """Return True once direct evidence can distinguish a root-cause family.
+
+    An actionable application error tied to a live Pod is enough to begin
+    diagnosis. The selected Skill still enforces its own mutation evidence
+    contract (for example a live Workload template), but unrelated Service,
+    node and storage discovery must not delay root-cause classification.
+    """
+    if not isinstance(evidence, dict) or not isinstance(triage, dict):
+        return False
+    if not triage.get("actionable"):
+        return False
+    return bool(
+        evidence.get("pod")
+        and _ops_logs_have_content(evidence.get("logs") or {})
+    )
+
+
 async def _collect_plan_priority_evidence(plan: dict) -> dict:
     """Persist Pod YAML and logs before any optional deep-evidence probe.
 
@@ -7755,6 +7773,8 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
     originally_requested_pod = requested_pod
     matching_pods: list[dict] = []
     log_fallback: dict = {}
+    workload: dict = {}
+    workload_error = ""
 
     if transport == "managed_unavailable":
         raise RuntimeError(
@@ -7838,6 +7858,27 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
             pod["workload_kind"] = workload_type
             pod["workload_name"] = workload_name
         logs = payload.get("logs") or {}
+        if workload_name and str(workload_type or "").lower() in {
+            "deployment", "statefulset", "daemonset", "job", "cronjob", "pod",
+        }:
+            api_version = (
+                "v1" if str(workload_type).lower() == "pod"
+                else "batch/v1" if str(workload_type).lower() in {"job", "cronjob"}
+                else "apps/v1"
+            )
+            try:
+                workload = _safe_workload_evidence(
+                    await asyncio.to_thread(
+                        CLUSTER_REGISTRY.read_resource,
+                        cluster_id,
+                        api_version=api_version,
+                        kind=workload_type,
+                        name=workload_name,
+                        namespace=namespace,
+                    )
+                )
+            except Exception as exc:
+                workload_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
         source = "kubeconfig"
     elif transport == "rancher":
         replica_owner: dict[str, tuple[str, str]] = {}
@@ -7984,6 +8025,24 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                     "unavailable_log_errors": unavailable_log_errors,
                     "fallback_error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
                 }
+        if workload_name and str(workload_type or "").lower() in {
+            "deployment", "statefulset", "daemonset", "job", "cronjob", "pod",
+        }:
+            try:
+                workload = _safe_workload_evidence(
+                    raw_pod
+                    if str(workload_type).lower() == "pod"
+                    else await _rancher_k8s_get(
+                        cluster_id,
+                        _workload_api_path(workload_type, namespace, workload_name),
+                        timeout=max(
+                            5,
+                            min(15, int(os.getenv("OPS_PRIORITY_WORKLOAD_TIMEOUT_SECONDS", "10"))),
+                        ),
+                    )
+                )
+            except Exception as exc:
+                workload_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
         source = "rancher"
     else:
         listed = await _call_mcp_tool("list_pods", {"namespace": namespace})
@@ -8043,11 +8102,12 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
         "pod": pod,
         "logs": logs,
         "log_errors": _ops_log_errors(logs),
-        "workload": (
+        "workload": workload or (
             ((plan.get("evidence") or {}).get("workload") or {})
             if isinstance(plan.get("evidence"), dict)
             else {}
         ),
+        "workload_error": workload_error,
         "matching_pods": matching_pods[:8],
         "source": source,
         "transport": transport,
@@ -13088,36 +13148,75 @@ async def _execute_ops_plan_once(
             level="warning",
         )
 
+    direct_evidence_ready = _priority_evidence_can_start_diagnosis(
+        priority_evidence,
+        priority_triage,
+    )
+    priority_evidence_ids = _collected_skill_evidence({"evidence": priority_evidence})
+    direct_skill_contract_complete = bool(
+        {"workload_spec", "pod_security_context"}.issubset(priority_evidence_ids)
+        and {"current_logs", "previous_logs", "events"} & priority_evidence_ids
+    )
     await emit(
         "collecting_evidence",
-        "Pod 日志优先通道已结束；继续补充 Events、Workload、Service、存储与节点证据。",
+        (
+            (
+                "Pod 日志、状态和所属 Workload 已满足直接证据合同；立即结束通用采集并进入根因诊断。"
+                if direct_skill_contract_complete else
+                "Pod ERROR/WARNING 已足以区分候选根因；立即进入诊断，缺少的 Workload/存储证据由匹配 Skill 定向补采。"
+            )
+            if direct_evidence_ready else
+            "直接证据尚不能区分根因；按候选故障补充 Events、Workload、存储、Service 与节点证据。"
+        ),
+        evidence_mode="direct_contract" if direct_evidence_ready else "hypothesis_enrichment",
     )
     evidence_timeout = max(10, int(os.getenv("OPS_EVIDENCE_TIMEOUT_SECONDS", "70")))
     deep_enrichment: dict = {}
-    try:
-        deep_enrichment = await run_with_heartbeat(
-            _collect_plan_deep_evidence(plan),
-            stage="collecting_evidence",
-            timeout_seconds=evidence_timeout,
-            heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
-            cancel_event=cancel_event,
-            on_heartbeat=heartbeat("collecting_evidence", "Rancher/Kubernetes/MCP 证据接口"),
-        )
-    except StageTimeoutError as exc:
+    if direct_evidence_ready:
         deep_enrichment = {
-            "error": str(exc),
-            "timeout": True,
-            "operator_hint": "检查 Rancher API、MCP Server 网络和 RBAC；本轮会使用已有证据继续，不会永久卡住。",
+            "collection_mode": "direct_contract",
+            "optional_enrichment_deferred": [
+                "storage_chain", "service_endpoints", "node_conditions", "dependency_topology",
+            ],
         }
         await emit(
-            "stage_timeout",
-            f"证据采集超过 {evidence_timeout} 秒，已熔断慢调用并继续执行可用步骤。",
-            timed_out_stage="collecting_evidence",
-            timeout_seconds=evidence_timeout,
-            level="warning",
+            "evidence_contract_satisfied",
+            (
+                "ERROR/WARNING、Pod securityContext 与实时 Workload YAML 已闭合；非相关证据不再阻塞诊断。"
+                if direct_skill_contract_complete else
+                "直接错误证据已保留；主 Skill 将只补采自身缺失证据，非相关接口不再阻塞诊断。"
+            ),
+            direct_skill_contract_complete=direct_skill_contract_complete,
+            collected_evidence=sorted(priority_evidence_ids),
+            deferred_optional_evidence=deep_enrichment["optional_enrichment_deferred"],
+            _update_stage=False,
+            level="success",
         )
-    except Exception as exc:
-        deep_enrichment = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
+    else:
+        try:
+            deep_enrichment = await run_with_heartbeat(
+                _collect_plan_deep_evidence(plan),
+                stage="collecting_evidence",
+                timeout_seconds=evidence_timeout,
+                heartbeat_seconds=float(os.getenv("OPS_HEARTBEAT_SECONDS", "5")),
+                cancel_event=cancel_event,
+                on_heartbeat=heartbeat("collecting_evidence", "Rancher/Kubernetes/MCP 证据接口"),
+            )
+        except StageTimeoutError as exc:
+            deep_enrichment = {
+                "error": str(exc),
+                "timeout": True,
+                "operator_hint": "检查 Rancher API、MCP Server 网络和 RBAC；本轮会使用已有证据继续，不会永久卡住。",
+            }
+            await emit(
+                "stage_timeout",
+                f"证据采集超过 {evidence_timeout} 秒，已熔断慢调用并继续执行可用步骤。",
+                timed_out_stage="collecting_evidence",
+                timeout_seconds=evidence_timeout,
+                level="warning",
+            )
+        except Exception as exc:
+            deep_enrichment = {"error": f"{type(exc).__name__}: {_redact_text(str(exc))}"}
     newly_collected_evidence = _merge_ops_evidence(
         priority_evidence,
         deep_enrichment,

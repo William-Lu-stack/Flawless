@@ -61,7 +61,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          image: ghcr.dockerproxy.net/your-org/flawless:5.0.2
+          image: ghcr.dockerproxy.net/your-org/flawless:5.0.3
           imagePullPolicy: Always
           command:
             - python
