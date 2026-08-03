@@ -354,6 +354,112 @@ class OpsSkillCatalogTests(unittest.TestCase):
         self.assertEqual(container["runAsGroup"], 0)
         self.assertIs(container["runAsNonRoot"], False)
 
+    def test_live_nonroot_contract_uses_arbitrary_workload_uid_and_gid(self):
+        """No-op detection must derive identity from YAML, never a platform UID."""
+        for uid, gid in ((10002, 10003), (65532, 3000)):
+            with self.subTest(uid=uid, gid=gid):
+                pod_security = {
+                    "runAsUser": uid,
+                    "runAsGroup": gid,
+                    "runAsNonRoot": True,
+                    "fsGroup": gid,
+                    "supplementalGroups": [gid],
+                    "fsGroupChangePolicy": "OnRootMismatch",
+                }
+                container_security = {
+                    "runAsUser": uid,
+                    "runAsGroup": gid,
+                    "runAsNonRoot": True,
+                }
+                evidence = {
+                    "logs": {"writer": {"current": (
+                        "DATA_PATH='/data/runtime' is not writable\n"
+                        "Error: unable to open database file"
+                    )}},
+                    "pod": {
+                        "name": "writer-bad",
+                        "security_context": copy.deepcopy(pod_security),
+                        "containers": [{
+                            "name": "writer",
+                            "security_context": copy.deepcopy(container_security),
+                            "volume_mounts": [{"name": "data", "mount_path": "/data"}],
+                        }],
+                    },
+                    "workload": {
+                        "kind": "Deployment",
+                        "metadata": {"name": "writer"},
+                        "spec": {"template": {"spec": {
+                            "securityContext": copy.deepcopy(pod_security),
+                            "containers": [{
+                                "name": "writer",
+                                "securityContext": copy.deepcopy(container_security),
+                                "volumeMounts": [{"name": "data", "mountPath": "/data"}],
+                            }],
+                        }}},
+                    },
+                }
+                plan = {
+                    "namespace": "applications",
+                    "target": "Deployment/writer",
+                    "summary": "mounted data path is not writable",
+                    "evidence": evidence,
+                    "_runtime_evidence": evidence,
+                    "changes": [],
+                }
+                attached = server._attach_operator_skills_to_plan(
+                    plan,
+                    {
+                        "question": plan["summary"],
+                        "diagnosis": {"skill_routing": {
+                            "primary_skill_id": "skill-volume-permission-recovery",
+                            "strategy_id": "root_workload_security_context",
+                        }},
+                        "evidence": evidence,
+                        "plan": plan,
+                    },
+                    preferred_skill_ids=["skill-volume-permission-recovery"],
+                )
+                self.assertEqual(attached["permission_recovery_stage"], "root")
+                self.assertEqual(
+                    attached["permission_strategy_decision"]["live_nonroot_identity"],
+                    f"{uid}:{gid}",
+                )
+                self.assertTrue(
+                    attached["permission_strategy_decision"]["live_nonroot_patch_is_noop"]
+                )
+
+                incomplete = copy.deepcopy(evidence)
+                incomplete["pod"]["security_context"] = {"runAsNonRoot": True}
+                incomplete["workload"]["spec"]["template"]["spec"]["securityContext"] = {
+                    "runAsNonRoot": True,
+                }
+                initial_plan = {
+                    "namespace": "applications",
+                    "target": "Deployment/writer",
+                    "summary": "mounted data path is not writable",
+                    "evidence": incomplete,
+                    "_runtime_evidence": incomplete,
+                    "changes": [],
+                }
+                initial = server._attach_operator_skills_to_plan(
+                    initial_plan,
+                    {
+                        "question": initial_plan["summary"],
+                        "diagnosis": {"skill_routing": {
+                            "primary_skill_id": "skill-volume-permission-recovery",
+                        }},
+                        "evidence": incomplete,
+                        "plan": initial_plan,
+                    },
+                    preferred_skill_ids=["skill-volume-permission-recovery"],
+                )
+                self.assertEqual(initial["permission_recovery_stage"], "nonroot_group")
+                patch_spec = initial["changes"][0]["patch"]["spec"]["template"]["spec"]
+                self.assertEqual(patch_spec["securityContext"]["runAsUser"], uid)
+                self.assertEqual(patch_spec["securityContext"]["runAsGroup"], gid)
+                self.assertEqual(patch_spec["securityContext"]["fsGroup"], gid)
+                self.assertEqual(patch_spec["securityContext"]["supplementalGroups"], [gid])
+
     def test_live_workload_nonroot_contract_overrides_stale_rollout_pod(self):
         """A retained old CrashLoop Pod must not make the same patch look new."""
         workload_security = {
