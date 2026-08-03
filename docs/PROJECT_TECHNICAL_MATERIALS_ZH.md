@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：3.3.1
+版本：5.0.0
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -172,7 +172,7 @@ Skill Router 使用上下文贝叶斯效用排序，综合：
 
 ### 4.4 防卡死状态机
 
-3.3.1 将根因诊断拆成独立可观测阶段：
+5.0.0 将根因诊断拆成独立可观测阶段：
 
 ```text
 root_cause_diagnosing
@@ -217,7 +217,7 @@ root_cause_diagnosing
 
 ### 5.3 灰度发布的 SRE 落地
 
-3.3.1 把原有“展示灰度策略、一次性 patch Deployment”升级为真实 Argo Rollouts canary：
+5.0.0 把原有“展示灰度策略、一次性 patch Deployment”升级为真实 Argo Rollouts canary：
 
 1. 现有 BFS 依赖图算法计算故障域、可达节点、关键依赖和 blast radius。
 2. 发布风险算法根据错误预算、近期异常、依赖影响面和变更通道选择首批比例、增长步长、最大比例和观察窗口。
@@ -285,9 +285,9 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-3.3.1 已完成：
+5.0.0 已完成：
 
-- Python 全量测试：185 passed，另有 9 个 subtests passed。
+- Python 全量测试：198 passed，另有 9 个 subtests passed。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
 - 真实 DeepSeek 路径：11.32 秒完成 `llm_planning → llm_planning_done → skill_router_processing → skill_router_done`，模型来源为 `llm+EvidenceRunbookEngine`。
 - Skill Router 卡死模拟：LLM 返回后 Router 人为阻塞，任务在独立硬超时内产生 `skill_router_timeout` 并安全返回。
@@ -299,7 +299,9 @@ tests/                   单元、状态机和真实 Kubernetes E2E
   - 两次独立人工审批；
   - 第一次非 root 方案验证失败后自动升级 root 方案；
   - 实际 Patch Deployment 并滚动生成新 Pod；
+  - 旧 Pod 被 ReplicaSet 删除后，自动按 Workload owner 重定位新 Pod，记录 Pod lineage 并续采日志；
   - 新 Pod Ready，原错误消失，最终 `completed/recovered=true`。
+- kubeconfig 脱离 Rancher 闭环：通过 `/api/clusters` 加密纳管真实 K3s，完整执行 LLM 诊断、Skill 匹配、两次审批、Deployment Patch、滚动更新和恢复验证。
 
 ## 9. 项目过程中使用的工具
 

@@ -16,14 +16,14 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **3.3.1**.
+Current release: **5.0.0**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
 
-Release 3.3.1 replaces the display-only Deployment canary with real Argo
+Release 5.0.0 replaces the display-only Deployment canary with real Argo
 Rollouts progressive delivery.  The existing blast-radius algorithm now
 produces an enforceable replica-weight envelope; each batch runs a live
 Prometheus/SLO AnalysisRun, the approved ceiling pauses for a second human
@@ -33,6 +33,14 @@ desired state are recovered.  Argo Rollouts v1.9.1 is pinned by digest to a
 verified mainland-accessible mirror.  The application executor was tested
 against a real K3s controller for canary pause, status-subresource promotion,
 automatic abort, capacity recovery, and desired-state restoration.
+
+The same release also closes a post-remediation evidence gap: after a
+Deployment rollout deletes the originally selected Pod, Flawless now resolves
+the replacement Pod through Workload ownership, records the old-to-new Pod
+lineage, and continues collecting current/previous logs for diagnosis and
+recovery verification.  This applies to both Rancher proxy and directly
+uploaded kubeconfig transports; RBAC, timeout, and network failures remain
+visible instead of being mistaken for Pod replacement.
 
 Release 3.2.17 closes the post-LLM diagnosis stall. The LLM response, action
 normalization, and Skill Router are now independently observable stages; the

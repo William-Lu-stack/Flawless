@@ -195,8 +195,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "3.3.1")
-APP_CODE_SIGNATURE = "bounded-llm-skill-router-v23"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.0")
+APP_CODE_SIGNATURE = "rollout-pod-evidence-lineage-v24"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -1177,7 +1177,15 @@ def _select_representative_pod(
     requested_pod = str(requested_pod or "").strip()
     if requested_pod:
         selected = next((pod for pod in pods if requested_pod == str(pod.get("name") or "")), None)
-        return selected, [selected] if selected else []
+        if selected:
+            return selected, [selected]
+        # A Deployment rollout replaces Pod names.  Once the originally
+        # selected Pod has disappeared, continue with another Pod owned by the
+        # same Workload instead of treating the stale name as permanent.
+        # Without a Workload identity it would be unsafe to pick an arbitrary
+        # Pod from the namespace, so keep the old exact-match behaviour.
+        if not str(workload_name or "").strip():
+            return None, []
     matches = [
         pod for pod in pods
         if _pod_matches_workload(pod, workload_name, workload_type)
@@ -1186,6 +1194,22 @@ def _select_representative_pod(
         return None, []
     matches.sort(key=_pod_evidence_priority, reverse=True)
     return matches[0], matches
+
+
+def _is_kubernetes_not_found_error(exc: Exception) -> bool:
+    """Recognize a stale Kubernetes object without swallowing RBAC/network errors."""
+    status_values = [
+        getattr(exc, "status", None),
+        getattr(exc, "status_code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+    ]
+    concrete_statuses = [value for value in status_values if value is not None]
+    if any(str(value) == "404" for value in concrete_statuses):
+        return True
+    if concrete_statuses:
+        return False
+    text = str(exc or "").lower()
+    return "404" in text and any(term in text for term in ("not found", "notfound"))
 
 
 def _select_chat_target_pod(pods: list[dict], req: ChatRequest) -> dict | None:
@@ -7405,6 +7429,7 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
     cluster_id = str(plan.get("cluster_id") or plan.get("rancher_cluster_id") or "local")
     transport = _ops_cluster_transport(plan)
     requested_pod = _target_pod_from_plan(plan)
+    originally_requested_pod = requested_pod
     matching_pods: list[dict] = []
 
     if transport == "managed_unavailable":
@@ -7415,7 +7440,9 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
 
     if transport == "kubeconfig":
         replica_owner: dict[str, tuple[str, str]] = {}
-        if not requested_pod:
+
+        async def select_managed_workload_pod(*, exclude_pod: str = "") -> str:
+            nonlocal replica_owner, matching_pods
             scope = await asyncio.to_thread(
                 CLUSTER_REGISTRY.namespace_pods,
                 cluster_id,
@@ -7433,6 +7460,11 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                 _normalize_k8s_pod(item, replica_owner)
                 for item in (scope.get("pods") or [])
             ]
+            if exclude_pod:
+                candidates = [
+                    item for item in candidates
+                    if str(item.get("name") or "") != exclude_pod
+                ]
             selected, matching_pods = _select_representative_pod(
                 candidates,
                 workload_name=workload_name,
@@ -7442,14 +7474,41 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                 raise RuntimeError(
                     f"no Pod owned by {workload_type}/{workload_name} in namespace {namespace}"
                 )
-            requested_pod = str(selected.get("name") or "")
-        payload = await asyncio.to_thread(
-            CLUSTER_REGISTRY.pod_priority_evidence,
-            cluster_id,
-            namespace=namespace,
-            pod_name=requested_pod,
-            tail_lines=180,
-        )
+            return str(selected.get("name") or "")
+
+        if not requested_pod:
+            requested_pod = await select_managed_workload_pod()
+        try:
+            payload = await asyncio.to_thread(
+                CLUSTER_REGISTRY.pod_priority_evidence,
+                cluster_id,
+                namespace=namespace,
+                pod_name=requested_pod,
+                tail_lines=180,
+            )
+        except Exception as exc:
+            if not requested_pod or not workload_name or not _is_kubernetes_not_found_error(exc):
+                raise
+            requested_pod = await select_managed_workload_pod()
+            payload = await asyncio.to_thread(
+                CLUSTER_REGISTRY.pod_priority_evidence,
+                cluster_id,
+                namespace=namespace,
+                pod_name=requested_pod,
+                tail_lines=180,
+            )
+        raw_pod = payload.get("raw_pod") or {}
+        if (raw_pod.get("metadata") or {}).get("deletionTimestamp") and workload_name:
+            replacement = await select_managed_workload_pod(exclude_pod=requested_pod)
+            if replacement and replacement != requested_pod:
+                requested_pod = replacement
+                payload = await asyncio.to_thread(
+                    CLUSTER_REGISTRY.pod_priority_evidence,
+                    cluster_id,
+                    namespace=namespace,
+                    pod_name=requested_pod,
+                    tail_lines=180,
+                )
         pod = _normalize_k8s_pod(payload.get("raw_pod") or {}, replica_owner)
         if workload_name:
             pod["workload_kind"] = workload_type
@@ -7459,7 +7518,9 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
     elif transport == "rancher":
         replica_owner: dict[str, tuple[str, str]] = {}
         ns = quote(namespace, safe="")
-        if not requested_pod:
+
+        async def select_rancher_workload_pod(*, exclude_pod: str = "") -> str:
+            nonlocal replica_owner, matching_pods
             rs_result, pods_result = await asyncio.gather(
                 _rancher_k8s_get(
                     cluster_id,
@@ -7488,6 +7549,11 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                 _normalize_k8s_pod(item, replica_owner)
                 for item in ((pods_result or {}).get("items") or [])
             ]
+            if exclude_pod:
+                candidates = [
+                    item for item in candidates
+                    if str(item.get("name") or "") != exclude_pod
+                ]
             selected, matching_pods = _select_representative_pod(
                 candidates,
                 workload_name=workload_name,
@@ -7497,12 +7563,34 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                 raise RuntimeError(
                     f"no Pod owned by {workload_type}/{workload_name} in namespace {namespace}"
                 )
-            requested_pod = str(selected.get("name") or "")
-        raw_pod = await _rancher_k8s_get(
-            cluster_id,
-            f"/api/v1/namespaces/{ns}/pods/{quote(requested_pod, safe='')}",
-            timeout=15,
-        )
+            return str(selected.get("name") or "")
+
+        if not requested_pod:
+            requested_pod = await select_rancher_workload_pod()
+        try:
+            raw_pod = await _rancher_k8s_get(
+                cluster_id,
+                f"/api/v1/namespaces/{ns}/pods/{quote(requested_pod, safe='')}",
+                timeout=15,
+            )
+        except Exception as exc:
+            if not requested_pod or not workload_name or not _is_kubernetes_not_found_error(exc):
+                raise
+            requested_pod = await select_rancher_workload_pod()
+            raw_pod = await _rancher_k8s_get(
+                cluster_id,
+                f"/api/v1/namespaces/{ns}/pods/{quote(requested_pod, safe='')}",
+                timeout=15,
+            )
+        if (raw_pod.get("metadata") or {}).get("deletionTimestamp") and workload_name:
+            replacement = await select_rancher_workload_pod(exclude_pod=requested_pod)
+            if replacement and replacement != requested_pod:
+                requested_pod = replacement
+                raw_pod = await _rancher_k8s_get(
+                    cluster_id,
+                    f"/api/v1/namespaces/{ns}/pods/{quote(requested_pod, safe='')}",
+                    timeout=15,
+                )
         pod = _normalize_k8s_pod(raw_pod, replica_owner)
         if workload_name and pod.get("workload_kind") in {"", "ReplicaSet"}:
             pod["workload_kind"] = workload_type
@@ -7581,6 +7669,18 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
         "source": source,
         "transport": transport,
         "priority_evidence": True,
+        "superseded_pod_name": (
+            originally_requested_pod
+            if originally_requested_pod and originally_requested_pod != requested_pod
+            else ""
+        ),
+        "pod_lineage": {
+            "requested": originally_requested_pod,
+            "selected": requested_pod,
+            "reselected_after_rollout": bool(
+                originally_requested_pod and originally_requested_pod != requested_pod
+            ),
+        },
     })
 
 
@@ -12561,6 +12661,18 @@ async def _execute_ops_plan_once(
         if isinstance(content, dict)
         for stream in ("current", "previous")
     )
+    if priority_evidence.get("superseded_pod_name"):
+        await emit(
+            "pod_target_refreshed",
+            (
+                f"滚动更新后原 Pod/{priority_evidence.get('superseded_pod_name')} 已失效；"
+                f"已自动切换到同一 Workload 的 Pod/{priority_evidence.get('pod_name')} 继续取证。"
+            ),
+            previous_pod=priority_evidence.get("superseded_pod_name"),
+            selected_pod=priority_evidence.get("pod_name"),
+            transport=priority_evidence.get("transport"),
+            level="success",
+        )
     if log_content_bytes > 0:
         await emit(
             "pod_logs_collected",
@@ -13722,6 +13834,18 @@ async def _execute_ops_plan_once(
                 triage_kubernetes_logs(post_priority.get("logs") or {})
             )
             post_priority["log_triage"] = post_triage
+            if post_priority.get("superseded_pod_name"):
+                await emit(
+                    "pod_target_refreshed",
+                    (
+                        f"上一轮 Pod/{post_priority.get('superseded_pod_name')} 已被滚动替换；"
+                        f"失败后重规划改为读取 Pod/{post_priority.get('pod_name')}。"
+                    ),
+                    previous_pod=post_priority.get("superseded_pod_name"),
+                    selected_pod=post_priority.get("pod_name"),
+                    transport=post_priority.get("transport"),
+                    level="success",
+                )
             await emit(
                 "pod_logs_collected",
                 (

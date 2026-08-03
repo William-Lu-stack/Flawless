@@ -545,6 +545,133 @@ class ErrorBudgetTests(unittest.TestCase):
 
 
 class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _rollout_pod(name: str, *, replica_set: str = "api-new") -> dict:
+        return {
+            "metadata": {
+                "name": name,
+                "namespace": "apps",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": replica_set}],
+            },
+            "spec": {"containers": [{"name": "api", "securityContext": {}}]},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": "api",
+                    "ready": True,
+                    "restartCount": 0,
+                    "state": {"running": {}},
+                }],
+            },
+        }
+
+    async def test_managed_kubeconfig_reselects_new_pod_after_rollout(self):
+        class KubernetesNotFound(Exception):
+            status = 404
+
+        new_pod = self._rollout_pod("api-new-abc")
+        plan = {
+            "cluster_id": "managed-1",
+            "source": "kubeconfig",
+            "namespace": "apps",
+            "target": "Deployment/api",
+            "pod_name": "api-old-xyz",
+            "changes": [{
+                "namespace": "apps",
+                "workload_type": "Deployment",
+                "workload_name": "api",
+            }],
+        }
+        registry = MagicMock()
+        registry.pod_priority_evidence.side_effect = [
+            KubernetesNotFound("(404) pods api-old-xyz not found"),
+            {"raw_pod": new_pod, "logs": {"api": {"current": "RECOVERED"}}},
+        ]
+        registry.namespace_pods.return_value = {
+            "replicasets": [{
+                "metadata": {
+                    "name": "api-new",
+                    "ownerReferences": [{"kind": "Deployment", "name": "api"}],
+                },
+            }],
+            "pods": [new_pod],
+        }
+        with patch.object(server, "CLUSTER_REGISTRY", registry), patch.object(
+            server, "_ops_cluster_transport", return_value="kubeconfig"
+        ):
+            evidence = await server._collect_plan_priority_evidence(plan)
+        self.assertEqual(evidence["pod_name"], "api-new-abc")
+        self.assertEqual(evidence["superseded_pod_name"], "api-old-xyz")
+        self.assertTrue(evidence["pod_lineage"]["reselected_after_rollout"])
+        self.assertEqual(evidence["logs"]["api"]["current"], "RECOVERED")
+        self.assertEqual(plan["pod_name"], "api-new-abc")
+
+    async def test_managed_kubeconfig_does_not_hide_forbidden_log_access(self):
+        class KubernetesForbidden(Exception):
+            status = 403
+
+        plan = {
+            "cluster_id": "managed-1",
+            "source": "kubeconfig",
+            "namespace": "apps",
+            "target": "Deployment/api",
+            "pod_name": "api-current-abc",
+            "changes": [{
+                "namespace": "apps",
+                "workload_type": "Deployment",
+                "workload_name": "api",
+            }],
+        }
+        registry = MagicMock()
+        registry.pod_priority_evidence.side_effect = KubernetesForbidden("Forbidden")
+        with patch.object(server, "CLUSTER_REGISTRY", registry), patch.object(
+            server, "_ops_cluster_transport", return_value="kubeconfig"
+        ):
+            with self.assertRaises(KubernetesForbidden):
+                await server._collect_plan_priority_evidence(plan)
+        registry.namespace_pods.assert_not_called()
+
+    async def test_rancher_reselects_new_pod_after_rollout(self):
+        request = httpx.Request("GET", "https://rancher.example/k8s/clusters/c-1/pods/old")
+        response = httpx.Response(404, request=request)
+        not_found = httpx.HTTPStatusError("Pod not found", request=request, response=response)
+        new_pod = self._rollout_pod("api-new-rancher")
+        plan = {
+            "cluster_id": "c-1",
+            "source": "rancher",
+            "namespace": "apps",
+            "target": "Deployment/api",
+            "pod_name": "api-old-rancher",
+            "changes": [{
+                "namespace": "apps",
+                "workload_type": "Deployment",
+                "workload_name": "api",
+            }],
+        }
+        rancher_get = AsyncMock(side_effect=[
+            not_found,
+            {"items": [{
+                "metadata": {
+                    "name": "api-new",
+                    "ownerReferences": [{"kind": "Deployment", "name": "api"}],
+                },
+            }]},
+            {"items": [new_pod]},
+            new_pod,
+        ])
+        with patch.object(server, "_ops_cluster_transport", return_value="rancher"), patch.object(
+            server, "_rancher_k8s_get", rancher_get
+        ), patch.object(
+            server,
+            "_collect_rancher_pod_logs",
+            AsyncMock(return_value={"api": {"current": "RECOVERED"}}),
+        ):
+            evidence = await server._collect_plan_priority_evidence(plan)
+        self.assertEqual(evidence["pod_name"], "api-new-rancher")
+        self.assertEqual(evidence["superseded_pod_name"], "api-old-rancher")
+        self.assertEqual(evidence["transport"], "rancher")
+        self.assertEqual(plan["pod_name"], "api-new-rancher")
+
     async def test_http_deep_diagnosis_reaches_permission_change_approval(self):
         """Exercise the browser's real POST -> background job -> GET polling path.
 
