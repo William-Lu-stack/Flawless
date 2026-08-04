@@ -2100,9 +2100,42 @@ body[data-theme="dark"] .flow-module {
 .ops-followup-difference small { grid-column: 1 / -1; color: var(--muted); line-height: 1.5; }
 
 .effectiveness-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.resolved-effectiveness-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.resolved-problem-list { display: grid; gap: 9px; }
+.resolved-problem {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--good) 26%, var(--line));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--good) 5%, var(--surface-2));
+}
+.resolved-problem-status { display: grid; justify-items: center; gap: 3px; color: var(--good); }
+.resolved-problem-status span { font-size: 8px; font-weight: 800; }
+.resolved-problem-main { min-width: 0; }
+.resolved-problem-main strong,
+.resolved-problem-main p,
+.resolved-problem-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resolved-problem-main strong { font-size: 12px; }
+.resolved-problem-main p { margin: 4px 0 0; color: var(--text); font-size: 10px; }
+.resolved-problem-main small { margin-top: 4px; color: var(--muted); font-size: 8px; }
+.resolved-problem-result { display: grid; gap: 4px; text-align: right; }
+.resolved-problem-result b { color: var(--good); font-size: 10px; }
+.resolved-problem-result span { color: var(--muted); font-size: 8px; }
+.resolved-detail-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.resolved-detail-summary article { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.resolved-detail-summary span { color: var(--muted); font-size: 8px; }
+.resolved-detail-summary p { margin: 5px 0 0; color: var(--text); font-size: 10px; line-height: 1.55; }
 
 @media (max-width: 900px) {
   .effectiveness-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .resolved-effectiveness-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .resolved-problem { grid-template-columns: auto minmax(0, 1fr); }
+  .resolved-problem-result { text-align: left; }
+  .resolved-problem > button { grid-column: 2; justify-self: start; }
+  .resolved-detail-summary { grid-template-columns: 1fr; }
   .ops-lineage-history > div > span { grid-template-columns: 24px 1fr auto; }
   .ops-lineage-history small,
   .ops-lineage-history code { grid-column: 2 / -1; }

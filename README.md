@@ -16,12 +16,19 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.8**.
+Current release: **5.0.9**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
+
+Release 5.0.9 turns Operations Effectiveness into a verified-resolution list.
+The default view shows only incidents whose recovery contract passed, with a
+clear problem title, target, Skill, completion time and recovered Pod count.
+Opening a record reveals the root cause, strategy history, approved changes,
+patch details and recovery proof; diagnosis-only and failed attempts no longer
+obscure what Flawless actually solved.
 
 Release 5.0.8 deliberately uses the 5.0.4 code path as its base and changes only
 post-change recovery verification. Diagnosis, Skill routing and approval keep

@@ -57,6 +57,9 @@ class RemediationOutcome:
     incident_signature: str = ""
     strategy_id: str = ""
     symptoms: list[str] = field(default_factory=list)
+    problem_title: str = ""
+    root_cause: str = ""
+    resolution_summary: str = ""
 
 
 INSPECTION_RUNS: list[InspectionRun] = []
@@ -246,6 +249,55 @@ def _semantic_symptoms(plan: dict[str, Any]) -> list[str]:
     return sorted(name for name, present in features.items() if present)
 
 
+_SYMPTOM_LABELS = {
+    "configured_path_not_writable": "应用数据目录不可写",
+    "database_open_failure": "数据库文件无法打开",
+    "permission_denied": "容器文件权限不足",
+    "pvc_pending": "PVC 未绑定可用 PV",
+    "failed_mount": "存储卷挂载失败",
+    "capacity_exhausted": "存储空间或配额耗尽",
+    "crash_loop": "Pod 反复崩溃",
+}
+
+
+def _root_cause_text(plan: dict[str, Any], symptoms: list[str]) -> str:
+    planning = plan.get("planning") if isinstance(plan.get("planning"), dict) else {}
+    diagnosis = plan.get("diagnosis") if isinstance(plan.get("diagnosis"), dict) else {}
+    direct = str(
+        plan.get("root_cause")
+        or diagnosis.get("root_cause")
+        or planning.get("root_cause")
+        or plan.get("reason")
+        or ""
+    ).strip()
+    if direct:
+        return direct[:1200]
+    return "、".join(_SYMPTOM_LABELS[item] for item in symptoms if item in _SYMPTOM_LABELS)
+
+
+def _problem_title(plan: dict[str, Any], symptoms: list[str]) -> str:
+    symptom_set = set(symptoms)
+    if "database_open_failure" in symptom_set and (
+        "permission_denied" in symptom_set or "configured_path_not_writable" in symptom_set
+    ):
+        return "数据目录权限不足导致数据库无法打开"
+    if "pvc_pending" in symptom_set:
+        return "PVC 未绑定可用 PV，Pod 无法启动"
+    if "failed_mount" in symptom_set:
+        return "存储卷挂载失败"
+    for symptom in (
+        "configured_path_not_writable",
+        "database_open_failure",
+        "permission_denied",
+        "capacity_exhausted",
+        "crash_loop",
+    ):
+        if symptom in symptom_set:
+            return _SYMPTOM_LABELS[symptom]
+    title = str(plan.get("title") or "").strip()
+    return title[:240] if title else f"{plan.get('target') or 'Kubernetes 目标'} 故障"
+
+
 def _strategy_id_from_changes(changes: list[dict[str, Any]], plan: dict[str, Any]) -> str:
     explicit = str(plan.get("permission_recovery_stage") or plan.get("storage_recovery_stage") or "")
     if explicit:
@@ -355,6 +407,13 @@ def _record_remediation_in_memory(plan: dict[str, Any], result: dict[str, Any], 
         incident_signature=_incident_signature(plan, symptoms),
         strategy_id=_strategy_id_from_changes(changes, plan),
         symptoms=symptoms,
+        problem_title=_problem_title(plan, symptoms),
+        root_cause=_root_cause_text(plan, symptoms),
+        resolution_summary=str(
+            verification.get("message")
+            or result.get("message")
+            or "恢复判据已通过"
+        )[:1200],
     )
     REMEDIATION_OUTCOMES.append(outcome)
     del REMEDIATION_OUTCOMES[:-500]
@@ -442,6 +501,10 @@ def _summary_in_memory() -> dict[str, Any]:
     changes_total = sum(x["changes_total"] for x in outcomes)
     changes_succeeded = sum(x["changes_succeeded"] for x in outcomes)
     pods_recovered = sum(x["pods_recovered"] for x in outcomes)
+    resolved = [
+        row for row in outcomes
+        if (row.get("verification") or {}).get("recovered") is True
+    ]
     by_model: dict[str, dict[str, Any]] = {}
     for row in inspections:
         key = row.get("model_id") or "default"
@@ -518,10 +581,14 @@ def _summary_in_memory() -> dict[str, Any]:
             "change_success_rate": round(changes_succeeded / changes_total, 4) if changes_total else 0,
             "pods_recovered": pods_recovered,
             "risk_reduction_rate": round(sum(1 for x in outcomes if x["risk_reduced"]) / len(outcomes), 4) if outcomes else 0,
+            "problems_resolved": len(resolved),
+            "workloads_recovered": len({row.get("target") for row in resolved if row.get("target")}),
+            "skills_used_to_resolve": len({row.get("skill_id") for row in resolved if row.get("skill_id")}),
         },
         "by_model": sorted(models, key=lambda x: (x["pods_recovered"], x["successful_changes"]), reverse=True),
         "recent_inspections": inspections[-20:],
         "recent_remediations": outcomes[-20:],
+        "recent_resolved_remediations": resolved[-50:],
     }
 
 

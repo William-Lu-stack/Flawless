@@ -2627,48 +2627,78 @@ function EffectivenessPage() {
   const [state, refresh] = useAsync<any>(() => apiGet("/api/effectiveness"), []);
   const [selectedRecord, setSelectedRecord] = useState<any>(null);
   const summary = state.data?.summary || {};
-  const storage = state.data?.storage || {};
-  const models = asList(state.data?.by_model);
-  const records = asList(state.data?.recent_remediations);
+  const allRecords = asList(state.data?.recent_remediations);
+  const solvedRecords = asList(state.data?.recent_resolved_remediations).length
+    ? asList(state.data?.recent_resolved_remediations)
+    : allRecords.filter((record: any) => record.verification?.recovered === true);
+  const symptomLabels: Record<string, string> = {
+    configured_path_not_writable: "应用数据目录不可写",
+    database_open_failure: "数据库文件无法打开",
+    permission_denied: "容器文件权限不足",
+    pvc_pending: "PVC 未绑定 PV",
+    failed_mount: "存储卷挂载失败",
+    capacity_exhausted: "存储容量不足",
+    crash_loop: "Pod 反复崩溃",
+  };
+  const issueTitle = (record: any) => record.problem_title
+    || record.root_cause
+    || asList(record.symptoms).map((item: string) => symptomLabels[item] || item).join("、")
+    || `${record.target || "Kubernetes 目标"} 故障`;
+  const completedTime = (value: any) => {
+    const date = new Date(String(value || ""));
+    return Number.isNaN(date.getTime())
+      ? "时间未记录"
+      : date.toLocaleString("zh-CN", { hour12: false });
+  };
   return (
     <section className="workspace-grid">
-      <div className="metric-strip effectiveness-metrics span-all">
-        <Metric title="巡检次数" value={summary.inspection_runs || 0} />
-        <Metric title="变更成功率" value={`${Math.round((summary.change_success_rate || 0) * 100)}%`} />
+      <div className="metric-strip effectiveness-metrics resolved-effectiveness-metrics span-all">
+        <Metric title="已解决问题" value={summary.problems_resolved ?? solvedRecords.length} tone="good" />
+        <Metric title="恢复 Workload" value={summary.workloads_recovered ?? new Set(solvedRecords.map((record: any) => record.target).filter(Boolean)).size} tone="good" />
         <Metric title="恢复 Pod" value={summary.pods_recovered || 0} tone="good" />
-        <Metric title="风险降低率" value={`${Math.round((summary.risk_reduction_rate || 0) * 100)}%`} />
-        <Metric title="记录存储" value={storage.durable ? "PVC" : storage.path ? "临时" : "加载中"} tone={storage.durable ? "good" : undefined} />
       </div>
-      <Panel>
-        <PanelTitle icon={Gauge} title="模型效果对比" action={<button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button>} />
-        {state.loading && <div className="quiet-empty">正在读取模型效果和运维审计...</div>}
+      <Panel className="span-all">
+        <PanelTitle icon={CheckCircle2} title="Flawless 已解决的问题" subtitle="这里只展示恢复验证已通过的运维结果" action={<button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button>} />
+        {state.loading && <div className="quiet-empty">正在读取已验证的恢复记录...</div>}
         {state.error && <div className="error-box">{state.error}</div>}
-        <div className="model-list">
-          {models.length ? models.map((m: any) => <div className="model-row" key={m.model_id}><strong>{m.model_id}</strong><span>变更 {m.successful_changes || 0}/{m.changes_total || 0}</span><span>恢复 {m.pods_recovered || 0} Pod</span><button className="ghost tiny" onClick={() => setSelectedRecord((m.records || [])[0] || m)}>查看记录</button></div>) : <EmptyState text="暂无模型效果记录；执行一次 AI 巡检或 SRE 运维后会自动生成。" />}
-        </div>
-      </Panel>
-      <Panel>
-        <PanelTitle icon={TerminalSquare} title="最近 AI 改动记录" />
-        <div className="record-list">
-          {records.length ? records.slice().reverse().map((r: any) => <div className="record" key={r.id}><strong>{r.target || "诊断任务"}</strong><p>{r.cluster}/{r.namespace} · {r.status} · 故障链第 {r.lineage_attempt || 1} 轮 · 变更 {r.changes_succeeded}/{r.changes_total} · 恢复 {r.pods_recovered || 0} Pod</p><button className="ghost tiny" onClick={() => setSelectedRecord(r)}>查看详情</button></div>) : <EmptyState text="暂无变更审计记录；只读诊断、门禁阻断和执行失败也会从现在开始进入这里。" />}
+        <div className="resolved-problem-list">
+          {solvedRecords.length ? solvedRecords.slice().reverse().map((record: any) => <article className="resolved-problem" key={record.id}>
+            <div className="resolved-problem-status"><CheckCircle2 size={18} /><span>已恢复</span></div>
+            <div className="resolved-problem-main">
+              <strong>{issueTitle(record)}</strong>
+              <p>{record.target || "Kubernetes 目标"}</p>
+              <small>{record.cluster || "-"} / {record.namespace || "-"} · {completedTime(record.timestamp)}{record.skill_id ? ` · ${record.skill_id}` : ""}</small>
+            </div>
+            <div className="resolved-problem-result">
+              <b>恢复 {record.pods_recovered || asList(record.recovered_pods).length || 0} Pod</b>
+              <span>第 {record.lineage_attempt || 1} 轮闭环</span>
+            </div>
+            <button className="ghost" onClick={() => setSelectedRecord(record)}>查看解决细节</button>
+          </article>) : <EmptyState text="暂无已闭环的问题。只有新 Pod、rollout 和恢复判据全部通过后，记录才会显示在这里。" />}
         </div>
       </Panel>
       {selectedRecord && <Panel className="span-all">
-        <PanelTitle icon={FileUp} title="运维记录详情" subtitle={selectedRecord.id || selectedRecord.model_id || "record"} action={<button className="ghost tiny" onClick={() => setSelectedRecord(null)}>关闭</button>} />
+        <PanelTitle icon={FileUp} title={issueTitle(selectedRecord)} subtitle="Flawless 解决细节" action={<button className="ghost tiny" onClick={() => setSelectedRecord(null)}>关闭</button>} />
         <div className="effectiveness-detail">
           <div><span>目标</span><strong>{selectedRecord.target || selectedRecord.model_id || "-"}</strong></div>
           <div><span>范围</span><strong>{selectedRecord.cluster || "-"} / {selectedRecord.namespace || "-"}</strong></div>
-          <div><span>状态</span><strong>{selectedRecord.status || "recorded"}</strong></div>
-          <div><span>变更</span><strong>{selectedRecord.changes_succeeded ?? selectedRecord.successful_changes ?? 0}/{selectedRecord.changes_total ?? 0}</strong></div>
-          <div><span>故障链</span><strong>{selectedRecord.lineage_id || "单轮任务"}</strong></div>
-          <div><span>策略轮次</span><strong>第 {selectedRecord.lineage_attempt || 1} 轮</strong></div>
+          <div><span>匹配 Skill</span><strong>{selectedRecord.skill_id || "未记录"}</strong></div>
+          <div><span>最终策略</span><strong>{selectedRecord.strategy_id || "已审批修复"}</strong></div>
+          <div><span>完成时间</span><strong>{completedTime(selectedRecord.timestamp)}</strong></div>
+          <div><span>变更步骤</span><strong>{selectedRecord.changes_succeeded ?? 0}/{selectedRecord.changes_total ?? 0} 成功</strong></div>
+          <div><span>恢复对象</span><strong>{asList(selectedRecord.recovered_pods).join("、") || `${selectedRecord.pods_recovered || 0} Pod`}</strong></div>
+          <div><span>故障链轮次</span><strong>第 {selectedRecord.lineage_attempt || 1} 轮</strong></div>
+        </div>
+        <div className="resolved-detail-summary">
+          <article><span>根因</span><p>{selectedRecord.root_cause || asList(selectedRecord.symptoms).map((item: string) => symptomLabels[item] || item).join("、") || "由实时证据和 Skill 共同定位"}</p></article>
+          <article><span>解决结果</span><p>{selectedRecord.resolution_summary || selectedRecord.verification?.message || selectedRecord.summary || "恢复验证已通过"}</p></article>
         </div>
         {asList(selectedRecord.attempted_strategies).length > 0 && <details className="ops-lineage-history" open>
-          <summary>差异化策略历史</summary>
+          <summary>尝试过的方案与换路过程</summary>
           <div>{asList(selectedRecord.attempted_strategies).map((attempt: any, index: number) => <span key={`${attempt.fingerprint || attempt.strategy}-${index}`}><i>{attempt.attempt || index + 1}</i><b>{attempt.strategy || `策略 ${index + 1}`}</b><em>{attempt.recovered === true ? "已恢复" : attempt.status || "未恢复"}</em><small>{attempt.outcome || "本轮未取得恢复证据。"}</small>{asList(attempt.actions).length > 0 && <code>{asList(attempt.actions).join(" · ")}</code>}</span>)}</div>
         </details>}
-        {asList(selectedRecord.changes).length > 0 && <div className="record-evidence-list">{asList(selectedRecord.changes).map((change: any, index: number) => <article key={`${change.type}-${index}`}><b>{change.type} · {change.target}</b><span>{change.status} · {change.risk}</span><pre>{JSON.stringify(change.patch || change.payload || {}, null, 2)}</pre></article>)}</div>}
-        {selectedRecord.verification && <div className="analysis-card"><strong>恢复验证</strong><p>{selectedRecord.verification.message || selectedRecord.verification.proof || JSON.stringify(selectedRecord.verification)}</p></div>}
+        {asList(selectedRecord.changes).length > 0 && <div className="record-evidence-list">{asList(selectedRecord.changes).map((change: any, index: number) => <article key={`${change.type}-${index}`}><b>{index + 1}. {change.type} · {change.target}</b><span>{change.status} · 风险 {change.risk}{change.reason ? ` · ${change.reason}` : ""}</span><pre>{JSON.stringify(change.patch || change.payload || {}, null, 2)}</pre></article>)}</div>}
+        {selectedRecord.verification && <div className="analysis-card"><strong>恢复验证证据</strong><p>{selectedRecord.verification.message || selectedRecord.verification.proof || "恢复判据已通过"}</p>{asList(selectedRecord.verification?.criteria?.evaluations).map((criterion: any) => <small key={criterion.criterion}>✓ {criterion.criterion} · {criterion.proof}</small>)}</div>}
       </Panel>}
     </section>
   );

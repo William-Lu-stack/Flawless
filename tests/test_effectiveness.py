@@ -34,6 +34,9 @@ class EffectivenessPersistenceTests(unittest.TestCase):
                     test_credential = "-".join(("redaction", "fixture", "value"))
                     effectiveness.record_remediation({
                         "id": "plan-2", "cluster": "prod", "namespace": "orders", "target": "Deployment/orders-api",
+                        "title": "修复订单服务数据目录权限",
+                        "root_cause": "运行 UID/GID 无法写入挂载的数据目录",
+                        "selected_skill_id": "skill-volume-permission-recovery",
                         "changes": [{"type": "patch_workload", "workload_name": "orders-api", "api_key": test_credential}],
                     }, {
                         "status": "completed",
@@ -43,6 +46,15 @@ class EffectivenessPersistenceTests(unittest.TestCase):
                             "lineage_id": "ops-root", "parent_job_id": "ops-parent", "attempt_count": 2,
                             "attempts": [{"attempt": 1, "strategy": "fsGroup", "status": "unresolved"}, {"attempt": 2, "strategy": "initContainer", "status": "completed"}],
                         },
+                    }, model_id="deepseek-ops")
+                    effectiveness.record_remediation({
+                        "id": "plan-3", "cluster": "prod", "namespace": "orders", "target": "Deployment/orders-worker",
+                        "title": "尚未解决的 worker 故障",
+                        "changes": [{"type": "restart", "workload_name": "orders-worker"}],
+                    }, {
+                        "status": "failed",
+                        "results": [{"status": "failed", "change": {"type": "restart", "workload_name": "orders-worker"}}],
+                        "verification": {"recovered": False, "message": "Pod 仍未 Ready"},
                     }, model_id="deepseek-ops")
 
                     self.assertTrue(store.exists())
@@ -55,10 +67,15 @@ class EffectivenessPersistenceTests(unittest.TestCase):
                     restored = effectiveness.summary()
                     self.assertEqual(restored["summary"]["inspection_runs"], 1)
                     self.assertEqual(restored["summary"]["pods_recovered"], 1)
-                    record = restored["recent_remediations"][0]
+                    self.assertEqual(restored["summary"]["problems_resolved"], 1)
+                    self.assertEqual(len(restored["recent_resolved_remediations"]), 1)
+                    record = restored["recent_resolved_remediations"][0]
                     self.assertEqual(record["lineage_id"], "ops-root")
                     self.assertEqual(record["lineage_attempt"], 2)
                     self.assertEqual(len(record["attempted_strategies"]), 2)
+                    self.assertEqual(record["skill_id"], "skill-volume-permission-recovery")
+                    self.assertIn("数据目录", record["root_cause"])
+                    self.assertTrue(record["problem_title"])
             finally:
                 with effectiveness._STORE_LOCK:
                     effectiveness.INSPECTION_RUNS[:] = saved_inspections
