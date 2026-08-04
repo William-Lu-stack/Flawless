@@ -196,7 +196,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.6")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.7")
 APP_CODE_SIGNATURE = "evidence-satisfied-diagnosis-v27"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -1196,8 +1196,14 @@ def _select_representative_pod(
     ]
     if not matches:
         return None, []
+    # A rollout can expose an old healthy Pod and a newer broken Pod at the
+    # same time. Diagnosis must follow the newest controller revision first;
+    # otherwise clean logs from the superseded Pod hide the active incident.
+    current_cohort, _superseded = _current_rollout_pod_cohort(matches)
+    selection_pool = current_cohort or matches
+    selection_pool.sort(key=_pod_evidence_priority, reverse=True)
     matches.sort(key=_pod_evidence_priority, reverse=True)
-    return matches[0], matches
+    return selection_pool[0], matches
 
 
 def _is_kubernetes_not_found_error(exc: Exception) -> bool:
@@ -7862,7 +7868,16 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                 )
             return str(selected.get("name") or "")
 
-        if not requested_pod:
+        # A Workload-scoped plan may carry a Pod name captured before a
+        # rollout. Always resolve the current revision first; the old Pod is
+        # only a fallback when the current Pod has no readable logs.
+        if workload_name:
+            try:
+                requested_pod = await select_managed_workload_pod()
+            except Exception:
+                if not requested_pod:
+                    raise
+        elif not requested_pod:
             requested_pod = await select_managed_workload_pod()
         try:
             payload = await asyncio.to_thread(
@@ -7973,7 +7988,16 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                 )
             return str(selected.get("name") or "")
 
-        if not requested_pod:
+        # Do not trust a stale finding/chat Pod name for a Workload operation.
+        # List the Workload cohort and select its newest revision before
+        # reading logs. A superseded Pod is consulted only by the log fallback.
+        if workload_name:
+            try:
+                requested_pod = await select_rancher_workload_pod()
+            except Exception:
+                if not requested_pod:
+                    raise
+        elif not requested_pod:
             requested_pod = await select_rancher_workload_pod()
         try:
             raw_pod = await _rancher_k8s_get(
@@ -8110,7 +8134,7 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
             candidates,
             workload_name=workload_name,
             workload_type=workload_type,
-            requested_pod=requested_pod,
+            requested_pod=requested_pod if not workload_name else "",
         )
         if not selected:
             raise RuntimeError(

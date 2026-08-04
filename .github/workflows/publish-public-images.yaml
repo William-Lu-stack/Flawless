@@ -6,7 +6,7 @@ on:
       version:
         description: Immutable release tag to publish (for example 3.2.16)
         required: true
-        default: "5.0.6"
+        default: "5.0.7"
   push:
     tags:
       - "v*"

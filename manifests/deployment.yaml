@@ -4,7 +4,7 @@ metadata:
   name: k8s-agent-config
   namespace: k8s-agent
 data:
-  APP_BUILD_VERSION: '5.0.6'
+  APP_BUILD_VERSION: '5.0.7'
   OAUTH_TOKEN_URL: ''
   LLM_GATEWAY_BASE: ''
   LLM_API_BASE: http://ollama.default.svc.cluster.local:11434/v1
@@ -289,7 +289,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: mcp-server
-        image: ghcr.dockerproxy.net/your-org/flawless:5.0.6
+        image: ghcr.dockerproxy.net/your-org/flawless:5.0.7
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -327,7 +327,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: observability-agent
-        image: ghcr.dockerproxy.net/your-org/flawless:5.0.6
+        image: ghcr.dockerproxy.net/your-org/flawless:5.0.7
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -384,7 +384,7 @@ spec:
             cpu: 1
             memory: 1Gi
       - name: healing-agent
-        image: ghcr.dockerproxy.net/your-org/flawless:5.0.6
+        image: ghcr.dockerproxy.net/your-org/flawless:5.0.7
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -422,7 +422,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: incident-agent
-        image: ghcr.dockerproxy.net/your-org/flawless:5.0.6
+        image: ghcr.dockerproxy.net/your-org/flawless:5.0.7
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -460,7 +460,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: postmortem-agent
-        image: ghcr.dockerproxy.net/your-org/flawless:5.0.6
+        image: ghcr.dockerproxy.net/your-org/flawless:5.0.7
         imagePullPolicy: Always
         command:
         - sh
@@ -512,7 +512,7 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 3
       - name: openwebui-adapter
-        image: ghcr.dockerproxy.net/your-org/flawless:5.0.6
+        image: ghcr.dockerproxy.net/your-org/flawless:5.0.7
         imagePullPolicy: Always
         command:
         - uvicorn

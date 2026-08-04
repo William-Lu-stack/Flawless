@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：5.0.6
+版本：5.0.7
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -297,9 +297,11 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-5.0.6 已完成：
+5.0.7 已完成：
 
-- Python 全量测试：218 passed，另有 11 个 subtests passed。
+- Python 全量测试：220 passed，另有 11 个 subtests passed。
+- 当前 Pod 优先：Workload 任务按最新 controller revision 选择 Pod，先读当前 Pod 状态与 current/previous 容器日志；仅当当前 Pod 无可用日志时才回退旧 Pod。
+- 新旧 Pod 逆向验证：旧 Pod Ready、新 revision CrashLoop 时必须锁定新 Pod 且不能误报恢复；旧 Pod CrashLoop、新 revision Ready 时忽略旧 Pod并继续验证 rollout 收敛。
 - Rancher 首次取证回归：Events 已从 Pod/log 快速路径拆离，日志与实时 Workload 并行读取；慢 Events 不会丢弃已经采集的错误日志或重新进入通用取证。
 - 恢复期 Events 隔离：只在恢复验证读取，拥有独立短超时；超时后继续使用新 Pod、日志与 Workload 判定，不阻塞终态。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
