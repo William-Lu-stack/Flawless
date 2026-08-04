@@ -11,7 +11,7 @@ namespaceOverride: k8s-agent
 
 image:
   repository: ghcr.dockerproxy.net/your-org/flawless
-  tag: 5.0.6
+  tag: 5.0.5
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -85,7 +85,6 @@ config:
   SKILL_EXECUTION_REQUIRED: "true"
   OPS_RECOVERY_STABILITY_SECONDS: "15"
   OPS_RECOVERY_EVIDENCE_TIMEOUT_SECONDS: "20"
-  OPS_RECOVERY_EVENTS_TIMEOUT_SECONDS: "4"
   OPS_RECORD_RETENTION_DAYS: "365"
   OPS_JOB_STORE_LIMIT: "5000"
 

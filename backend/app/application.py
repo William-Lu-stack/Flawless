@@ -196,7 +196,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.6")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.5")
 APP_CODE_SIGNATURE = "evidence-satisfied-diagnosis-v27"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -7722,43 +7722,6 @@ async def _collect_rancher_pod_logs(
     return {name: content for name, content in rows if name}
 
 
-async def _collect_rancher_pod_events(
-    cluster_id: str,
-    namespace: str,
-    pod_name: str,
-    *,
-    timeout_seconds: int | None = None,
-) -> list[dict]:
-    """Read fresh Pod Events without extending the initial log fast path.
-
-    Rancher installations frequently proxy the Events endpoint more slowly
-    than Pod/log and Workload endpoints. Events are useful negative evidence
-    during post-change verification, but they must not make the first
-    Pod/log collection miss its hard deadline and discard already-read logs.
-    """
-    ns = quote(namespace, safe="")
-    selector = quote(f"involvedObject.name={pod_name}", safe="=,")
-    timeout = max(
-        2,
-        min(
-            8,
-            int(
-                timeout_seconds
-                if timeout_seconds is not None
-                else os.getenv("OPS_RECOVERY_EVENTS_TIMEOUT_SECONDS", "4")
-            ),
-        ),
-    )
-    payload = await _rancher_k8s_get(
-        cluster_id,
-        f"/api/v1/namespaces/{ns}/events?fieldSelector={selector}",
-        timeout=timeout,
-    )
-    return _normalize_k8s_events(
-        payload.get("items", []) if isinstance(payload, dict) else []
-    )
-
-
 def _ops_log_errors(logs: dict) -> dict:
     return {
         str(name): {
@@ -8003,44 +7966,12 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
         if workload_name and pod.get("workload_kind") in {"", "ReplicaSet"}:
             pod["workload_kind"] = workload_type
             pod["workload_name"] = workload_name
-        async def collect_workload() -> tuple[dict, str]:
-            if not (
-                workload_name
-                and str(workload_type or "").lower() in {
-                    "deployment", "statefulset", "daemonset", "job", "cronjob", "pod",
-                }
-            ):
-                return {}, ""
-            try:
-                live_workload = _safe_workload_evidence(
-                    raw_pod
-                    if str(workload_type).lower() == "pod"
-                    else await _rancher_k8s_get(
-                        cluster_id,
-                        _workload_api_path(workload_type, namespace, workload_name),
-                        timeout=max(
-                            5,
-                            min(15, int(os.getenv("OPS_PRIORITY_WORKLOAD_TIMEOUT_SECONDS", "10"))),
-                        ),
-                    )
-                )
-                return live_workload, ""
-            except Exception as exc:
-                return {}, f"{type(exc).__name__}: {_redact_text(str(exc))}"
-
-        # Pod logs and the owning Workload are independent. Reading them in
-        # parallel keeps the common Rancher path below the stage deadline and
-        # preserves the error log needed by the Skill Router.
-        logs, workload_result = await asyncio.gather(
-            _collect_rancher_pod_logs(
-                cluster_id,
-                namespace,
-                requested_pod,
-                pod,
-            ),
-            collect_workload(),
+        logs = await _collect_rancher_pod_logs(
+            cluster_id,
+            namespace,
+            requested_pod,
+            pod,
         )
-        workload, workload_error = workload_result
         # A newly-created Pod can legitimately return HTTP 400 from the log
         # subresource until its container starts.  For a Workload diagnosis,
         # keep that Pod state as evidence and also inspect the highest-priority
@@ -8100,8 +8031,41 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                     "unavailable_log_errors": unavailable_log_errors,
                     "fallback_error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
                 }
-        # Do not fetch Events in the initial Pod/log fast path. Recovery
-        # verification reads them separately with its own short deadline.
+        try:
+            # Fetch Events after any log fallback so logs, Pod YAML and Events
+            # all describe the same selected Pod.
+            selector = quote(f"involvedObject.name={requested_pod}", safe="=,")
+            event_payload = await _rancher_k8s_get(
+                cluster_id,
+                f"/api/v1/namespaces/{ns}/events?fieldSelector={selector}",
+                timeout=max(
+                    3,
+                    min(10, int(os.getenv("OPS_RECOVERY_EVENTS_TIMEOUT_SECONDS", "8"))),
+                ),
+            )
+            events = _normalize_k8s_events(
+                event_payload.get("items", []) if isinstance(event_payload, dict) else []
+            )
+        except Exception as exc:
+            events_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
+        if workload_name and str(workload_type or "").lower() in {
+            "deployment", "statefulset", "daemonset", "job", "cronjob", "pod",
+        }:
+            try:
+                workload = _safe_workload_evidence(
+                    raw_pod
+                    if str(workload_type).lower() == "pod"
+                    else await _rancher_k8s_get(
+                        cluster_id,
+                        _workload_api_path(workload_type, namespace, workload_name),
+                        timeout=max(
+                            5,
+                            min(15, int(os.getenv("OPS_PRIORITY_WORKLOAD_TIMEOUT_SECONDS", "10"))),
+                        ),
+                    )
+                )
+            except Exception as exc:
+                workload_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
         source = "rancher"
     else:
         listed = await _call_mcp_tool("list_pods", {"namespace": namespace})
@@ -10602,44 +10566,6 @@ async def _verify_plan_recovery(
             )
         except Exception as exc:
             priority_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
-
-        # Events are post-change evidence, not a prerequisite for initial log
-        # triage. Keep this call independently bounded so a slow Rancher Events
-        # proxy cannot erase Pod/log/Workload evidence or restart deep intake.
-        if (
-            isinstance(priority, dict)
-            and priority.get("pod")
-            and _ops_cluster_transport(verification_plan) == "rancher"
-        ):
-            selected_pod = str(
-                priority.get("pod_name")
-                or (priority.get("pod") or {}).get("name")
-                or ""
-            )
-            if selected_pod:
-                event_timeout = max(
-                    2,
-                    min(8, int(os.getenv("OPS_RECOVERY_EVENTS_TIMEOUT_SECONDS", "4"))),
-                )
-                try:
-                    priority["events"] = await asyncio.wait_for(
-                        _collect_rancher_pod_events(
-                            str(
-                                verification_plan.get("cluster_id")
-                                or verification_plan.get("rancher_cluster_id")
-                                or "local"
-                            ),
-                            str(verification_plan.get("namespace") or "default"),
-                            selected_pod,
-                            timeout_seconds=event_timeout,
-                        ),
-                        timeout=event_timeout + 0.5,
-                    )
-                except Exception as exc:
-                    priority["events"] = []
-                    priority["events_error"] = (
-                        f"{type(exc).__name__}: {_redact_text(str(exc))}"
-                    )
 
         fresh = copy.deepcopy(priority) if isinstance(priority, dict) else {}
         if priority_error:

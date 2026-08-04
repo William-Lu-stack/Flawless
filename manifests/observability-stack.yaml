@@ -43,7 +43,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: cmdb
-          image: ghcr.dockerproxy.net/your-org/flawless:5.0.6
+          image: ghcr.dockerproxy.net/your-org/flawless:5.0.5
           imagePullPolicy: IfNotPresent
           command:
             - sh
