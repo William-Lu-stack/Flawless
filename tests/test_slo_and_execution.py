@@ -777,6 +777,60 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             "HTTP 400: container grafana is waiting to start: ContainerCreating",
         )
 
+    async def test_rancher_initial_evidence_does_not_wait_for_events_and_reads_workload_in_parallel(self):
+        pod = self._rollout_pod("grafana-current")
+        pod["metadata"]["ownerReferences"] = [{"kind": "Deployment", "name": "grafana"}]
+        logs_started = asyncio.Event()
+        workload_started = asyncio.Event()
+        requested_paths: list[str] = []
+
+        async def rancher_get(_cluster_id: str, path: str, timeout: int = 25):
+            requested_paths.append(path)
+            if "/events?" in path:
+                raise AssertionError("Events must not run in initial Pod/log collection")
+            if path.endswith("/pods/grafana-current"):
+                return pod
+            if path.endswith("/deployments/grafana"):
+                workload_started.set()
+                await asyncio.wait_for(logs_started.wait(), timeout=0.5)
+                return {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": "grafana", "namespace": "monitoring"},
+                    "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "grafana"}]}}},
+                    "status": {"updatedReplicas": 1, "readyReplicas": 0},
+                }
+            raise AssertionError(f"unexpected Rancher path: {path}")
+
+        async def collect_logs(*_args, **_kwargs):
+            logs_started.set()
+            await asyncio.wait_for(workload_started.wait(), timeout=0.5)
+            return {"grafana": {"current": "Error: unable to open database file"}}
+
+        plan = {
+            "cluster_id": "cluster-a",
+            "source": "rancher",
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "pod_name": "grafana-current",
+            "changes": [{
+                "namespace": "monitoring",
+                "workload_type": "Deployment",
+                "workload_name": "grafana",
+            }],
+        }
+        with patch.object(server, "_ops_cluster_transport", return_value="rancher"), patch.object(
+            server, "_rancher_k8s_get", side_effect=rancher_get,
+        ), patch.object(server, "_collect_rancher_pod_logs", side_effect=collect_logs):
+            evidence = await asyncio.wait_for(
+                server._collect_plan_priority_evidence(plan),
+                timeout=1,
+            )
+        self.assertEqual(evidence["logs"]["grafana"]["current"], "Error: unable to open database file")
+        self.assertEqual(evidence["workload"]["kind"], "Deployment")
+        self.assertEqual(evidence["events"], [])
+        self.assertFalse(any("/events?" in path for path in requested_paths))
+
     async def test_rancher_uses_sibling_crashloop_log_when_selected_pod_has_not_started(self):
         def raw_pod(name: str, phase: str, state: dict, restart_count: int) -> dict:
             return {
@@ -803,13 +857,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         crashloop = raw_pod(
             "grafana-old", "Running", {"waiting": {"reason": "CrashLoopBackOff"}}, 12,
         )
-        rancher_get = AsyncMock(side_effect=[
-            pending,
-            {"items": []},
-            {"items": [pending, crashloop]},
-            crashloop,
-            {"items": []},
-            {
+        workload = {
                 "apiVersion": "apps/v1",
                 "kind": "Deployment",
                 "metadata": {"name": "grafana", "namespace": "monitoring"},
@@ -821,8 +869,20 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                         },
                     },
                 },
-            },
-        ])
+            }
+
+        async def rancher_get(_cluster_id: str, path: str, timeout: int = 25):
+            if path.endswith("/pods/grafana-new"):
+                return pending
+            if path.endswith("/replicasets"):
+                return {"items": []}
+            if path.endswith("/pods"):
+                return {"items": [pending, crashloop]}
+            if path.endswith("/pods/grafana-old"):
+                return crashloop
+            if path.endswith("/deployments/grafana"):
+                return workload
+            raise AssertionError(f"unexpected Rancher path: {path}")
         collect_logs = AsyncMock(side_effect=[
             {"grafana": {"current": "", "current_error": "container has not started"}},
             {"grafana": {"current": "GF_PATHS_DATA is not writable", "current_error": ""}},
@@ -840,7 +900,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             }],
         }
         with patch.object(server, "_ops_cluster_transport", return_value="rancher"), patch.object(
-            server, "_rancher_k8s_get", rancher_get,
+            server, "_rancher_k8s_get", side_effect=rancher_get,
         ), patch.object(server, "_collect_rancher_pod_logs", collect_logs):
             evidence = await server._collect_plan_priority_evidence(plan)
         self.assertEqual(evidence["pod_name"], "grafana-old")
@@ -1733,6 +1793,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         }}}}
         plan = {
             "cluster_id": "managed-test",
+            "source": "rancher",
             "namespace": "monitoring",
             "target": "Deployment/grafana",
             "pod_name": "grafana-new",
@@ -1797,6 +1858,10 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(return_value=fresh),
         ), patch.object(
             server,
+            "_collect_rancher_pod_events",
+            AsyncMock(side_effect=TimeoutError("slow Rancher Events proxy")),
+        ) as events_reader, patch.object(
+            server,
             "_collect_plan_deep_evidence",
             AsyncMock(side_effect=AssertionError("unrelated deep probes must not run")),
         ) as deep, patch.dict(os.environ, {
@@ -1812,6 +1877,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(verification["recovered"], verification)
         self.assertTrue(verification["criteria"]["passed"], verification)
         self.assertIn("verification_evidence", progress_events)
+        events_reader.assert_awaited_once()
         deep.assert_not_awaited()
 
     async def test_configmap_match_does_not_close_incident_while_workload_pod_is_broken(self):

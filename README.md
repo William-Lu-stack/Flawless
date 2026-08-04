@@ -16,12 +16,18 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.5**.
+Current release: **5.0.6**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
+
+Release 5.0.6 fixes a Rancher evidence-intake regression introduced in 5.0.5.
+Initial diagnosis no longer waits for the optional Events endpoint, Pod logs
+and the owning Workload are read concurrently, and recovery-only Events have
+their own short non-blocking deadline. Slow Events can no longer discard logs
+that were already collected or send the job back into global evidence intake.
 
 Release 5.0.5 closes the final recovery-verification stall. The verifier now
 selects the newest controller revision instead of allowing an old CrashLoop
