@@ -196,7 +196,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.5")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.4")
 APP_CODE_SIGNATURE = "evidence-satisfied-diagnosis-v27"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -6534,9 +6534,6 @@ def _normalize_k8s_pod(raw: dict, replica_owner: dict[str, tuple[str, str]] | No
     return {
         "name": meta.get("name", ""),
         "namespace": meta.get("namespace", "default"),
-        "uid": meta.get("uid", ""),
-        "created_at": meta.get("creationTimestamp", ""),
-        "deletion_timestamp": meta.get("deletionTimestamp", ""),
         "labels": meta.get("labels") or {},
         "annotations": meta.get("annotations") or {},
         "node": spec.get("nodeName", ""),
@@ -7778,8 +7775,6 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
     log_fallback: dict = {}
     workload: dict = {}
     workload_error = ""
-    events: list[dict] = []
-    events_error = ""
 
     if transport == "managed_unavailable":
         raise RuntimeError(
@@ -7847,7 +7842,6 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                 tail_lines=180,
             )
         raw_pod = payload.get("raw_pod") or {}
-        events = _normalize_k8s_events(payload.get("events") or [])
         if (raw_pod.get("metadata") or {}).get("deletionTimestamp") and workload_name:
             replacement = await select_managed_workload_pod(exclude_pod=requested_pod)
             if replacement and replacement != requested_pod:
@@ -8031,23 +8025,6 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
                     "unavailable_log_errors": unavailable_log_errors,
                     "fallback_error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
                 }
-        try:
-            # Fetch Events after any log fallback so logs, Pod YAML and Events
-            # all describe the same selected Pod.
-            selector = quote(f"involvedObject.name={requested_pod}", safe="=,")
-            event_payload = await _rancher_k8s_get(
-                cluster_id,
-                f"/api/v1/namespaces/{ns}/events?fieldSelector={selector}",
-                timeout=max(
-                    3,
-                    min(10, int(os.getenv("OPS_RECOVERY_EVENTS_TIMEOUT_SECONDS", "8"))),
-                ),
-            )
-            events = _normalize_k8s_events(
-                event_payload.get("items", []) if isinstance(event_payload, dict) else []
-            )
-        except Exception as exc:
-            events_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
         if workload_name and str(workload_type or "").lower() in {
             "deployment", "statefulset", "daemonset", "job", "cronjob", "pod",
         }:
@@ -8123,8 +8100,6 @@ async def _collect_plan_priority_evidence(plan: dict) -> dict:
         "namespace": namespace,
         "pod_name": requested_pod,
         "pod": pod,
-        "events": events,
-        "events_error": events_error,
         "logs": logs,
         "log_errors": _ops_log_errors(logs),
         "workload": workload or (
@@ -9773,57 +9748,6 @@ async def _restore_progressive_source_template(
     }
 
 
-def _current_rollout_pod_cohort(pods: list[dict]) -> tuple[list[dict], list[str]]:
-    """Select the newest controller revision without trusting a stale Pod name.
-
-    During a Deployment/StatefulSet/DaemonSet rollout, Kubernetes can expose
-    the old CrashLoop Pod and the healthy replacement at the same time.  Health
-    verification must evaluate the newest revision; rollout status is checked
-    separately afterwards to prove the desired replica count converged.
-    """
-    active = [
-        pod for pod in pods
-        if isinstance(pod, dict) and not str(pod.get("deletion_timestamp") or "")
-    ] or [pod for pod in pods if isinstance(pod, dict)]
-    groups: dict[str, list[dict]] = {}
-    unlabeled: list[dict] = []
-    for pod in active:
-        labels = pod.get("labels") or {}
-        revision = str(
-            labels.get("pod-template-hash")
-            or labels.get("controller-revision-hash")
-            or labels.get("rollouts-pod-template-hash")
-            or ""
-        )
-        if revision:
-            groups.setdefault(revision, []).append(pod)
-        else:
-            unlabeled.append(pod)
-    if len(groups) <= 1:
-        return active, []
-
-    def revision_timestamp(items: list[dict]) -> str:
-        return max((str(item.get("created_at") or "") for item in items), default="")
-
-    timestamps = {revision: revision_timestamp(items) for revision, items in groups.items()}
-    if not any(timestamps.values()):
-        # Synthetic/MCP pod payloads may not expose timestamps.  In that case
-        # retaining all pods is safer than guessing revision order from a hash.
-        return active, []
-    newest_revision = max(groups, key=lambda revision: timestamps[revision])
-    selected = groups[newest_revision]
-    superseded = [
-        str(pod.get("name") or "")
-        for revision, items in groups.items()
-        if revision != newest_revision
-        for pod in items
-        if pod.get("name")
-    ]
-    # Unlabelled controller pods cannot be proven to belong to the new
-    # revision. Keep them visible only when no labelled cohort exists.
-    return selected or unlabeled or active, superseded
-
-
 async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     if any(r.get("status") in {"failed", "blocked"} for r in results):
         return {"status": "skipped", "recovered": False, "message": "存在变更 API 失败，跳过恢复验证并进入替代策略。"}
@@ -10164,11 +10088,8 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
         pod for pod in active_matched
         if str(pod.get("phase") or "") not in {"Failed", "Unknown"}
     ]
-    superseded_pods: list[str] = []
     if workload_name and non_terminal_active:
-        matched_for_health, superseded_pods = _current_rollout_pod_cohort(
-            non_terminal_active
-        )
+        matched_for_health = non_terminal_active
     else:
         matched_for_health = active_matched or matched
 
@@ -10208,7 +10129,6 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
         "target": f"{workload_type}/{workload_name}",
         "pods_checked": len(matched_for_health),
         "pods_matched_total": len(matched),
-        "superseded_pods_ignored": superseded_pods,
         "recovered_pods": recovered_pods,
         "unresolved": unresolved[:8],
         "terminal_unresolved": terminal_unresolved[:8],
@@ -10511,7 +10431,6 @@ async def _verify_plan_recovery(
     plan: dict,
     results: list[dict],
     cancel_event: asyncio.Event | None = None,
-    progress=None,
 ) -> dict:
     """Wait for rollout convergence and require evidence that the target recovered."""
     if not plan.get("changes") or any(r.get("status") == "failed" for r in results):
@@ -10534,85 +10453,8 @@ async def _verify_plan_recovery(
     interval_seconds = max(1, int(os.getenv("OPS_VERIFY_INTERVAL_SECONDS", "5")))
     initial_grace_seconds = max(0, int(os.getenv("OPS_VERIFY_INITIAL_GRACE_SECONDS", "15")))
     stability_seconds = max(0, int(os.getenv("OPS_RECOVERY_STABILITY_SECONDS", "0")))
-    recovery_evidence_timeout = max(
-        5,
-        min(45, int(os.getenv("OPS_RECOVERY_EVIDENCE_TIMEOUT_SECONDS", "20"))),
-    )
     deadline = time.monotonic() + timeout_seconds
     attempts = 0
-
-    async def report(stage: str, message: str, **extra) -> None:
-        if not progress:
-            return
-        try:
-            await progress(stage, message, **extra)
-        except Exception:
-            # Persistence/UI telemetry must never block the health decision.
-            return
-
-    async def collect_recovery_evidence(verification_plan: dict) -> dict:
-        """Collect the fresh health contract without running every deep probe.
-
-        Pod, logs, Events and the owning Workload are sufficient for normal
-        workload recovery. Storage/service/node enrichment is only requested
-        when a declared success criterion actually needs that domain.
-        """
-        priority: dict = {}
-        priority_error = ""
-        try:
-            priority = await asyncio.wait_for(
-                _collect_plan_priority_evidence(verification_plan),
-                timeout=recovery_evidence_timeout,
-            )
-        except Exception as exc:
-            priority_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
-
-        fresh = copy.deepcopy(priority) if isinstance(priority, dict) else {}
-        if priority_error:
-            fresh["priority_collection_error"] = priority_error
-
-        # Reuse only slow-changing domains from the incident evidence. Never
-        # carry the old Pod/log/Event body into post-change verification.
-        prior = plan.get("_runtime_evidence") or {}
-        for key in (
-            "storage", "services", "business_probes", "dependency_checks", "sli",
-        ):
-            if not fresh.get(key) and isinstance(prior, dict) and prior.get(key):
-                fresh[key] = copy.deepcopy(prior[key])
-                fresh.setdefault("carried_forward_domains", []).append(key)
-
-        requested = {
-            str(item.get("id") or item.get("name") or "")
-            if isinstance(item, dict) else str(item)
-            for item in (plan.get("success_criteria") or [])
-        }
-        requested = {item.strip().lower().replace(" ", "_") for item in requested if item.strip()}
-        needs_deep = bool(
-            not (fresh.get("pod") and fresh.get("workload"))
-            or ("pvc_bound" in requested and not fresh.get("storage"))
-            or ("endpoint_ready" in requested and not fresh.get("services"))
-            or ("business_probe_ok" in requested and not fresh.get("business_probes"))
-            or ("dependency_reachable" in requested and not fresh.get("dependency_checks"))
-            or ({"error_rate_recovered", "latency_recovered"} & requested and not fresh.get("sli"))
-        )
-        if needs_deep:
-            try:
-                deep = await asyncio.wait_for(
-                    _collect_plan_deep_evidence(verification_plan),
-                    timeout=recovery_evidence_timeout,
-                )
-                fresh = _merge_ops_evidence(fresh, deep)
-            except Exception as exc:
-                fresh["enrichment_error"] = (
-                    f"{type(exc).__name__}: {_redact_text(str(exc))}"
-                )
-        if not (fresh.get("pod") and fresh.get("workload")):
-            raise RuntimeError(
-                fresh.get("priority_collection_error")
-                or fresh.get("enrichment_error")
-                or "fresh Pod/Workload evidence is unavailable"
-            )
-        return fresh
 
     async def assess_all_recovered_pods(probe: dict) -> tuple[dict, list[dict]]:
         recovered_pods = [str(item) for item in (probe.get("recovered_pods") or []) if str(item)]
@@ -10624,14 +10466,9 @@ async def _verify_plan_recovery(
             verification_plan = copy.deepcopy(plan)
             if recovered_pod:
                 verification_plan["pod_name"] = recovered_pod
-            await report(
-                "verification_evidence",
-                f"Pod/{recovered_pod or '-'} 已 Ready，正在读取新 Pod 日志、Events 与 Workload 收敛状态。",
-                pod_name=recovered_pod,
-                evidence_timeout_seconds=recovery_evidence_timeout,
-                level="info",
-            )
-            fresh_evidence = await collect_recovery_evidence(verification_plan)
+            fresh_evidence = await _collect_plan_deep_evidence(verification_plan)
+            if fresh_evidence.get("error"):
+                raise RuntimeError(str(fresh_evidence.get("error")))
             criteria = _assess_recovery_criteria(plan, probe, fresh_evidence)
             evaluations.append({
                 "pod": recovered_pod or (fresh_evidence.get("pod") or {}).get("name"),
@@ -10720,14 +10557,6 @@ async def _verify_plan_recovery(
                     "pods": [item.get("pod") for item in pod_evaluations],
                     "passed": True,
                 }]
-                await report(
-                    "verification_stability",
-                    f"恢复判据已通过；进入 {stability_seconds} 秒稳定观察窗。",
-                    elapsed_seconds=0,
-                    remaining_seconds=stability_seconds,
-                    stability_seconds=stability_seconds,
-                    level="success",
-                )
                 while time.monotonic() < stable_deadline:
                     if cancel_event and cancel_event.is_set():
                         last.update({
@@ -10756,20 +10585,6 @@ async def _verify_plan_recovery(
                         "failed": sample_criteria.get("failed") or [],
                         "not_evaluated": sample_criteria.get("not_evaluated") or [],
                     })
-                    elapsed = round(time.monotonic() - stable_started, 1)
-                    remaining = round(max(0.0, stable_deadline - time.monotonic()), 1)
-                    await report(
-                        "verification_stability",
-                        (
-                            f"新 Pod 持续健康：已观察 {int(elapsed)} 秒，"
-                            f"剩余 {int(remaining)} 秒。"
-                        ),
-                        elapsed_seconds=elapsed,
-                        remaining_seconds=remaining,
-                        stability_seconds=stability_seconds,
-                        criteria=sample_criteria,
-                        level="success" if sample_passed else "warning",
-                    )
                     if not sample_passed:
                         last = {
                             **stability_probe,
@@ -14500,12 +14315,7 @@ async def _execute_ops_plan_once(
         "等待 Workload rollout 并验证 Pod 是否真正恢复",
         initial_grace_seconds=verify_grace,
     )
-    verification = await _verify_plan_recovery(
-        plan,
-        results,
-        cancel_event,
-        progress=emit,
-    )
+    verification = await _verify_plan_recovery(plan, results, cancel_event)
     await emit(
         "verification_done",
         verification.get("message") or verification.get("status") or "恢复验证完成",
@@ -14597,12 +14407,7 @@ async def _execute_ops_plan_once(
             "changes": [rollback_change],
             "permission_recovery_stage": "root_rollback",
         }
-        rollback_verification = await _verify_plan_recovery(
-            rollback_plan,
-            [rollback_result],
-            cancel_event,
-            progress=emit,
-        )
+        rollback_verification = await _verify_plan_recovery(rollback_plan, [rollback_result], cancel_event)
         rollback_verification["hardening_succeeded"] = False
         rollback_verification["hardening_rolled_back"] = rollback_verification.get("recovered") is True
         rollback_verification["residual_risk"] = (

@@ -27,7 +27,7 @@ const ACTIVE_EVENT_STAGES = new Set([
   "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "llm_planning", "skill_router_processing",
   "deterministic_replan_start", "deterministic_replan", "skill_routed", "evidence_plan_ready",
   "skill_evidence_refreshed", "skill_chain_ready", "execution_preflight", "change_start", "change_waiting",
-  "change_approval_received", "verifying", "verification_evidence", "verification_stability", "replanning", "summarizing", "strategy_switch",
+  "change_approval_received", "verifying", "replanning", "summarizing", "strategy_switch",
   "continuation_wait", "resume_pending",
 ]);
 const EXECUTION_PHASES = ["采集证据", "根因诊断", "提交变更", "恢复验证"];
@@ -97,8 +97,6 @@ function stageLabel(stage: unknown) {
     change_approved: "步骤已批准",
     stage_timeout: "阶段超时",
     verifying: "恢复验证",
-    verification_evidence: "读取恢复证据",
-    verification_stability: "稳定观察",
     verification_done: "验证完成",
     replanning: "失败后根因重诊断",
     summarizing: "生成结论",
@@ -154,7 +152,7 @@ function phaseIndex(stage: unknown) {
   if (["queued", "starting", "attempt", "release_gate", "collecting_priority_logs", "pod_logs_collected", "pod_logs_unavailable", "collecting_evidence", "collecting_evidence_done"].includes(value)) return 0;
   if (["log_triage_done", "diagnosing", "diagnosis_waiting", "root_cause_diagnosing", "llm_planning", "llm_planning_done", "llm_planning_failed", "skill_router_processing", "skill_router_done", "skill_router_timeout", "skill_router_failed", "deterministic_replan_start", "deterministic_replan", "deterministic_replan_done", "deterministic_replan_timeout", "deterministic_replan_failed", "root_cause_diagnosed", "diagnosis_done", "skill_routed", "skill_evidence_refreshed", "step_start", "step_waiting", "step_done", "replanning", "strategy_switch", "summarizing", "needs_operator", "continuation_wait", "resume_pending"].includes(value)) return 1;
   if (["execution_preflight", "execution_preflight_done", "execution_permission_blocked", "awaiting_change_approval", "change_approval_received", "change_approved", "change_start", "change_waiting", "change_done"].includes(value)) return 2;
-  if (["verifying", "verification_evidence", "verification_stability", "verification_done", "recovered"].includes(value)) return 3;
+  if (["verifying", "verification_done", "recovered"].includes(value)) return 3;
   return 1;
 }
 

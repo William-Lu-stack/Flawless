@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：5.0.5
+版本：5.0.4
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -297,16 +297,13 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-5.0.5 已完成：
+5.0.4 已完成：
 
-- Python 全量测试：217 passed，另有 11 个 subtests passed。
+- Python 全量测试：214 passed，另有 9 个 subtests passed。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
 - 真实 DeepSeek 路径：11.32 秒完成 `llm_planning → llm_planning_done → skill_router_processing → skill_router_done`，模型来源为 `llm+EvidenceRunbookEngine`。
 - Skill Router 卡死模拟：LLM 返回后 Router 人为阻塞，任务在独立硬超时内产生 `skill_router_timeout` 并安全返回。
 - 孤儿任务模拟：运行状态存在但执行协程丢失时，查询触发从新证据恢复并废除旧审批。
-- 恢复验证终态：旧 ReplicaSet 的 CrashLoop Pod 与新 Ready Pod 并存时，只验证最新 revision，再以 Workload generation/Ready 副本证明 rollout 收敛。
-- 恢复证据限时：新 Pod Ready 后只读取直接相关的 Pod、日志、Events 与 Workload；只有声明判据需要时才补充存储、Service 或业务探针，单次补采最长 20 秒。
-- 稳定观察可见：默认稳定窗由无提示的 180 秒改为 15 秒，前端持续显示已观察和剩余秒数。
 - 真实 Kind Kubernetes 权限故障闭环（SQLite 文件打开失败、mkdir 权限拒绝、GID 不匹配三种场景）：
   - 创建非 root securityContext 导致文件和 SQLite 数据库创建失败的 CrashLoop Pod；
   - 产品通过公开 API 采集真实 Kubernetes 证据；

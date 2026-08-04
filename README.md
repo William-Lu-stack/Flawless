@@ -16,19 +16,12 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.5**.
+Current release: **5.0.4**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
-
-Release 5.0.5 closes the final recovery-verification stall. The verifier now
-selects the newest controller revision instead of allowing an old CrashLoop
-Pod to veto a healthy replacement, reads only the Pod/log/Event/Workload
-evidence required by the declared recovery contract, and bounds any additional
-domain enrichment. The console shows a live stability-window countdown; the
-default blocking window is 15 seconds instead of an invisible 180 seconds.
 
 Release 5.0.4 keeps live error evidence across replacement Pods, records each
 accepted permission-recovery stage before same-process replanning, and prevents
