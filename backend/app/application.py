@@ -11454,13 +11454,12 @@ def _permission_recovery_followup(
         gid = gid if gid is not None else int(identity_match.group(2))
 
     # Do not propose the live securityContext as if it were a new repair.  A
-    # workload can already run with any positive UID/GID pair and matching
-    # fsGroup/supplementalGroups, yet the mounted data directory can remain
-    # unwritable. Re-applying those exact, target-specific values creates a new
-    # ReplicaSet but cannot change the outcome. Treat the live, still-failing
-    # configuration as an attempted non-root stage so evidence scoring can
-    # advance to a bounded ownership repair or the separately approved complete
-    # root fallback.
+    # common production failure already runs as 10001:10001 with matching
+    # fsGroup/supplementalGroups, yet the mounted data directory remains
+    # unwritable. Re-applying those exact values creates a new ReplicaSet but
+    # cannot change the outcome. Treat the live, still-failing configuration as
+    # an attempted non-root stage so evidence scoring can advance to a bounded
+    # ownership repair or the separately approved complete root fallback.
     workload_nonroot_complete, workload_uid, workload_gid = _complete_nonroot_security_contract(
         workload_pod_sc,
         workload_container_sc,
