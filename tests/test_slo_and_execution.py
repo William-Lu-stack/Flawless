@@ -808,6 +808,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             {"items": []},
             {"items": [pending, crashloop]},
             crashloop,
+            {"items": []},
             {
                 "apiVersion": "apps/v1",
                 "kind": "Deployment",
@@ -1101,7 +1102,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "result": {"accepted": True, "operation": "patched"},
             }
 
-        async def verify_simulated_recovery(_plan, _results, _cancel_event):
+        async def verify_simulated_recovery(_plan, _results, _cancel_event, progress=None):
             self.assertEqual(simulated_cluster["workload_security"]["runAsUser"], 0)
             self.assertEqual(simulated_cluster["workload_security"]["runAsGroup"], 0)
             self.assertEqual(simulated_cluster["workload_security"]["fsGroup"], 0)
@@ -1642,6 +1643,176 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 os.environ.pop("OPS_VERIFY_INITIAL_GRACE_SECONDS", None)
             else:
                 os.environ["OPS_VERIFY_INITIAL_GRACE_SECONDS"] = old_grace
+
+    async def test_recovery_probe_ignores_superseded_crashloop_revision(self):
+        def raw_pod(name: str, revision: str, created_at: str, *, ready: bool) -> dict:
+            return {
+                "metadata": {
+                    "name": name,
+                    "namespace": "monitoring",
+                    "creationTimestamp": created_at,
+                    "labels": {"pod-template-hash": revision},
+                    "ownerReferences": [{
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": f"grafana-{revision}",
+                    }],
+                },
+                "spec": {
+                    "containers": [{"name": "grafana", "image": "grafana:test"}],
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{
+                        "name": "grafana",
+                        "image": "grafana:test",
+                        "ready": ready,
+                        "restartCount": 0 if ready else 8,
+                        "state": (
+                            {"running": {}}
+                            if ready else
+                            {"waiting": {"reason": "CrashLoopBackOff"}}
+                        ),
+                    }],
+                },
+            }
+
+        inventory = {
+            "replicasets": [
+                {"metadata": {"name": "grafana-oldhash", "ownerReferences": [{"kind": "Deployment", "name": "grafana"}]}},
+                {"metadata": {"name": "grafana-newhash", "ownerReferences": [{"kind": "Deployment", "name": "grafana"}]}},
+            ],
+            "pods": [
+                raw_pod("grafana-old", "oldhash", "2026-08-04T01:00:00Z", ready=False),
+                raw_pod("grafana-new", "newhash", "2026-08-04T01:01:00Z", ready=True),
+            ],
+        }
+        plan = {
+            "cluster_id": "managed-test",
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "pod_name": "grafana-old",
+            "changes": [{
+                "type": "patch_workload_runtime_security",
+                "namespace": "monitoring",
+                "workload_type": "Deployment",
+                "workload_name": "grafana",
+            }],
+        }
+        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[{"id": "managed-test"}]), patch.object(
+            server.CLUSTER_REGISTRY,
+            "inventory",
+            return_value=inventory,
+        ):
+            verification = await server._probe_plan_recovery(
+                plan,
+                [{"status": "completed"}],
+            )
+        self.assertTrue(verification["recovered"], verification)
+        self.assertEqual(verification["recovered_pods"], ["grafana-new"])
+        self.assertEqual(verification["superseded_pods_ignored"], ["grafana-old"])
+
+    async def test_ready_permission_pod_uses_bounded_priority_verification(self):
+        root_security = {
+            "runAsUser": 0,
+            "runAsGroup": 0,
+            "runAsNonRoot": False,
+            "fsGroup": 0,
+            "supplementalGroups": [0],
+            "fsGroupChangePolicy": "OnRootMismatch",
+        }
+        container_security = {
+            "runAsUser": 0,
+            "runAsGroup": 0,
+            "runAsNonRoot": False,
+            "allowPrivilegeEscalation": False,
+        }
+        patch_body = {"spec": {"template": {"spec": {
+            "securityContext": copy.deepcopy(root_security),
+            "containers": [{"name": "grafana", "securityContext": copy.deepcopy(container_security)}],
+        }}}}
+        plan = {
+            "cluster_id": "managed-test",
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "pod_name": "grafana-new",
+            "permission_recovery_stage": "root",
+            "success_criteria": [
+                "pod_ready", "rollout_complete", "restart_count_stable",
+                "events_no_new_backoff", "write_errors_absent", "pvc_bound",
+            ],
+            "changes": [{
+                "type": "patch_workload_runtime_security",
+                "namespace": "monitoring",
+                "workload_type": "Deployment",
+                "workload_name": "grafana",
+                "container_name": "grafana",
+                "patch": patch_body,
+            }],
+            "_runtime_evidence": {
+                "storage": [{"pvc": "grafana-data", "pvc_phase": "Bound"}],
+            },
+        }
+        fresh = {
+            "pod_name": "grafana-new",
+            "pod": {
+                "name": "grafana-new",
+                "ready": True,
+                "phase": "Running",
+                "restart_count": 0,
+                "containers": [{"name": "grafana", "ready": True}],
+            },
+            "logs": {"grafana": {"current": "Grafana server is running", "previous": ""}},
+            "events": [],
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"name": "grafana", "namespace": "monitoring", "generation": 3},
+                "spec": {
+                    "replicas": 1,
+                    "template": {"spec": {
+                        "securityContext": copy.deepcopy(root_security),
+                        "containers": [{"name": "grafana", "securityContext": copy.deepcopy(container_security)}],
+                    }},
+                },
+                "status": {"observedGeneration": 3, "updatedReplicas": 1, "readyReplicas": 1},
+            },
+        }
+        progress_events: list[str] = []
+
+        async def progress(stage: str, _message: str, **_extra):
+            progress_events.append(stage)
+
+        with patch.object(
+            server,
+            "_probe_plan_recovery",
+            AsyncMock(return_value={
+                "status": "completed",
+                "recovered": True,
+                "recovered_pods": ["grafana-new"],
+                "message": "目标 Pod 已恢复 Ready。",
+            }),
+        ), patch.object(
+            server,
+            "_collect_plan_priority_evidence",
+            AsyncMock(return_value=fresh),
+        ), patch.object(
+            server,
+            "_collect_plan_deep_evidence",
+            AsyncMock(side_effect=AssertionError("unrelated deep probes must not run")),
+        ) as deep, patch.dict(os.environ, {
+            "OPS_VERIFY_INITIAL_GRACE_SECONDS": "0",
+            "OPS_RECOVERY_STABILITY_SECONDS": "0",
+            "OPS_RECOVERY_EVIDENCE_TIMEOUT_SECONDS": "1",
+        }):
+            verification = await server._verify_plan_recovery(
+                plan,
+                [{"status": "completed"}],
+                progress=progress,
+            )
+        self.assertTrue(verification["recovered"], verification)
+        self.assertTrue(verification["criteria"]["passed"], verification)
+        self.assertIn("verification_evidence", progress_events)
+        deep.assert_not_awaited()
 
     async def test_configmap_match_does_not_close_incident_while_workload_pod_is_broken(self):
         plan = {
