@@ -616,8 +616,6 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             "metadata": {
                 "name": name,
                 "namespace": "apps",
-                "creationTimestamp": "2026-08-04T01:01:00Z",
-                "labels": {"pod-template-hash": replica_set},
                 "ownerReferences": [{"kind": "ReplicaSet", "name": replica_set}],
             },
             "spec": {"containers": [{"name": "api", "securityContext": {}}]},
@@ -650,10 +648,10 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             }],
         }
         registry = MagicMock()
-        registry.pod_priority_evidence.return_value = {
-            "raw_pod": new_pod,
-            "logs": {"api": {"current": "RECOVERED"}},
-        }
+        registry.pod_priority_evidence.side_effect = [
+            KubernetesNotFound("(404) pods api-old-xyz not found"),
+            {"raw_pod": new_pod, "logs": {"api": {"current": "RECOVERED"}}},
+        ]
         registry.namespace_pods.return_value = {
             "replicasets": [{
                 "metadata": {
@@ -696,9 +694,12 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(KubernetesForbidden):
                 await server._collect_plan_priority_evidence(plan)
-        registry.namespace_pods.assert_called_once()
+        registry.namespace_pods.assert_not_called()
 
     async def test_rancher_reselects_new_pod_after_rollout(self):
+        request = httpx.Request("GET", "https://rancher.example/k8s/clusters/c-1/pods/old")
+        response = httpx.Response(404, request=request)
+        not_found = httpx.HTTPStatusError("Pod not found", request=request, response=response)
         new_pod = self._rollout_pod("api-new-rancher")
         plan = {
             "cluster_id": "c-1",
@@ -712,31 +713,19 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "workload_name": "api",
             }],
         }
-        workload = {
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {"name": "api", "namespace": "apps", "generation": 2},
-            "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "api"}]}}},
-            "status": {"observedGeneration": 2, "updatedReplicas": 1, "readyReplicas": 1},
-        }
-
-        async def rancher_get(_cluster_id: str, path: str, timeout: int = 25):
-            if path.endswith("/replicasets"):
-                return {"items": [{
-                    "metadata": {
-                        "name": "api-new",
-                        "ownerReferences": [{"kind": "Deployment", "name": "api"}],
-                    },
-                }]}
-            if path.endswith("/pods"):
-                return {"items": [new_pod]}
-            if path.endswith("/pods/api-new-rancher"):
-                return new_pod
-            if path.endswith("/deployments/api"):
-                return workload
-            raise AssertionError(f"unexpected Rancher path: {path}")
+        rancher_get = AsyncMock(side_effect=[
+            not_found,
+            {"items": [{
+                "metadata": {
+                    "name": "api-new",
+                    "ownerReferences": [{"kind": "Deployment", "name": "api"}],
+                },
+            }]},
+            {"items": [new_pod]},
+            new_pod,
+        ])
         with patch.object(server, "_ops_cluster_transport", return_value="rancher"), patch.object(
-            server, "_rancher_k8s_get", side_effect=rancher_get,
+            server, "_rancher_k8s_get", rancher_get
         ), patch.object(
             server,
             "_collect_rancher_pod_logs",
@@ -747,104 +736,6 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["superseded_pod_name"], "api-old-rancher")
         self.assertEqual(evidence["transport"], "rancher")
         self.assertEqual(plan["pod_name"], "api-new-rancher")
-
-    async def test_rancher_reads_new_broken_pod_before_old_healthy_pod(self):
-        def raw_pod(
-            name: str,
-            revision: str,
-            created_at: str,
-            *,
-            ready: bool,
-        ) -> dict:
-            return {
-                "metadata": {
-                    "name": name,
-                    "namespace": "monitoring",
-                    "creationTimestamp": created_at,
-                    "labels": {"pod-template-hash": revision},
-                    "ownerReferences": [{"kind": "Deployment", "name": "grafana"}],
-                },
-                "spec": {"containers": [{"name": "grafana"}]},
-                "status": {
-                    "phase": "Running",
-                    "containerStatuses": [{
-                        "name": "grafana",
-                        "ready": ready,
-                        "restartCount": 0 if ready else 7,
-                        "state": (
-                            {"running": {}}
-                            if ready else
-                            {"waiting": {"reason": "CrashLoopBackOff"}}
-                        ),
-                    }],
-                },
-            }
-
-        old_healthy = raw_pod(
-            "grafana-old", "oldhash", "2026-08-04T01:00:00Z", ready=True,
-        )
-        new_broken = raw_pod(
-            "grafana-new", "newhash", "2026-08-04T01:01:00Z", ready=False,
-        )
-        workload = {
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {"name": "grafana", "namespace": "monitoring", "generation": 4},
-            "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "grafana"}]}}},
-            "status": {
-                "observedGeneration": 4,
-                "updatedReplicas": 1,
-                "readyReplicas": 1,
-                "unavailableReplicas": 0,
-            },
-        }
-        log_pods: list[str] = []
-
-        async def rancher_get(_cluster_id: str, path: str, timeout: int = 25):
-            if path.endswith("/replicasets"):
-                return {"items": []}
-            if path.endswith("/pods"):
-                return {"items": [old_healthy, new_broken]}
-            if path.endswith("/pods/grafana-new"):
-                return new_broken
-            if path.endswith("/deployments/grafana"):
-                return workload
-            raise AssertionError(f"old Pod must not be read first: {path}")
-
-        async def collect_logs(_cluster_id: str, _namespace: str, pod_name: str, _pod: dict):
-            log_pods.append(pod_name)
-            return {
-                "grafana": {
-                    "current": "GF_PATHS_DATA is not writable\nError: unable to open database file",
-                    "current_error": "",
-                    "previous": "",
-                    "previous_error": "",
-                },
-            }
-
-        plan = {
-            "cluster_id": "cluster-a",
-            "source": "rancher",
-            "namespace": "monitoring",
-            "target": "Deployment/grafana",
-            # Stale UI/finding reference deliberately points at the old Pod.
-            "pod_name": "grafana-old",
-            "changes": [{
-                "namespace": "monitoring",
-                "workload_type": "Deployment",
-                "workload_name": "grafana",
-            }],
-        }
-        with patch.object(server, "_ops_cluster_transport", return_value="rancher"), patch.object(
-            server, "_rancher_k8s_get", side_effect=rancher_get,
-        ), patch.object(server, "_collect_rancher_pod_logs", side_effect=collect_logs):
-            evidence = await server._collect_plan_priority_evidence(plan)
-
-        self.assertEqual(evidence["pod_name"], "grafana-new")
-        self.assertEqual(evidence["superseded_pod_name"], "grafana-old")
-        self.assertEqual(log_pods, ["grafana-new"])
-        self.assertIn("unable to open database file", evidence["logs"]["grafana"]["current"])
-        self.assertFalse(evidence["log_fallback"].get("used"))
 
     async def test_rancher_log_collection_uses_pod_state_before_unstarted_container_log(self):
         pod = {
@@ -897,10 +788,6 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             requested_paths.append(path)
             if "/events?" in path:
                 raise AssertionError("Events must not run in initial Pod/log collection")
-            if path.endswith("/replicasets"):
-                return {"items": []}
-            if path.endswith("/pods"):
-                return {"items": [pod]}
             if path.endswith("/pods/grafana-current"):
                 return pod
             if path.endswith("/deployments/grafana"):
@@ -945,21 +832,11 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("/events?" in path for path in requested_paths))
 
     async def test_rancher_uses_sibling_crashloop_log_when_selected_pod_has_not_started(self):
-        def raw_pod(
-            name: str,
-            phase: str,
-            state: dict,
-            restart_count: int,
-            *,
-            revision: str,
-            created_at: str,
-        ) -> dict:
+        def raw_pod(name: str, phase: str, state: dict, restart_count: int) -> dict:
             return {
                 "metadata": {
                     "name": name,
                     "namespace": "monitoring",
-                    "creationTimestamp": created_at,
-                    "labels": {"pod-template-hash": revision},
                     "ownerReferences": [{"kind": "Deployment", "name": "grafana"}],
                 },
                 "spec": {"containers": [{"name": "grafana"}]},
@@ -976,11 +853,9 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         pending = raw_pod(
             "grafana-new", "Pending", {"waiting": {"reason": "ContainerCreating"}}, 0,
-            revision="newhash", created_at="2026-08-04T01:01:00Z",
         )
         crashloop = raw_pod(
             "grafana-old", "Running", {"waiting": {"reason": "CrashLoopBackOff"}}, 12,
-            revision="oldhash", created_at="2026-08-04T01:00:00Z",
         )
         workload = {
                 "apiVersion": "apps/v1",
@@ -1895,63 +1770,6 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(verification["recovered"], verification)
         self.assertEqual(verification["recovered_pods"], ["grafana-new"])
-        self.assertEqual(verification["superseded_pods_ignored"], ["grafana-old"])
-
-    async def test_recovery_probe_never_uses_old_healthy_pod_to_hide_new_broken_revision(self):
-        def raw_pod(name: str, revision: str, created_at: str, *, ready: bool) -> dict:
-            return {
-                "metadata": {
-                    "name": name,
-                    "namespace": "monitoring",
-                    "creationTimestamp": created_at,
-                    "labels": {"pod-template-hash": revision},
-                    "ownerReferences": [{"kind": "Deployment", "name": "grafana"}],
-                },
-                "spec": {"containers": [{"name": "grafana", "image": "grafana:test"}]},
-                "status": {
-                    "phase": "Running",
-                    "containerStatuses": [{
-                        "name": "grafana",
-                        "image": "grafana:test",
-                        "ready": ready,
-                        "restartCount": 0 if ready else 9,
-                        "state": (
-                            {"running": {}}
-                            if ready else
-                            {"waiting": {"reason": "CrashLoopBackOff"}}
-                        ),
-                    }],
-                },
-            }
-
-        plan = {
-            "cluster_id": "managed-test",
-            "namespace": "monitoring",
-            "target": "Deployment/grafana",
-            "pod_name": "grafana-old",
-            "changes": [{
-                "type": "patch_workload_runtime_security",
-                "namespace": "monitoring",
-                "workload_type": "Deployment",
-                "workload_name": "grafana",
-            }],
-        }
-        inventory = {
-            "replicasets": [],
-            "pods": [
-                raw_pod("grafana-old", "oldhash", "2026-08-04T01:00:00Z", ready=True),
-                raw_pod("grafana-new", "newhash", "2026-08-04T01:01:00Z", ready=False),
-            ],
-        }
-        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[{"id": "managed-test"}]), patch.object(
-            server.CLUSTER_REGISTRY,
-            "inventory",
-            return_value=inventory,
-        ):
-            verification = await server._probe_plan_recovery(plan, [{"status": "completed"}])
-
-        self.assertFalse(verification["recovered"], verification)
-        self.assertEqual(verification["unresolved"][0]["name"], "grafana-new")
         self.assertEqual(verification["superseded_pods_ignored"], ["grafana-old"])
 
     async def test_ready_permission_pod_uses_bounded_priority_verification(self):

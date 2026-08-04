@@ -16,20 +16,12 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.7**.
+Current release: **5.0.6**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
-
-Release 5.0.7 restores the proven 5.0.4 diagnostic order while retaining the
-bounded 5.0.6 recovery verifier. Workload operations now resolve the newest
-controller revision before reading logs, inspect that Pod's current and
-previous container logs first, and consult a superseded Pod only when the
-current Pod has no readable log evidence. Recovery uses the same revision
-rule, so an old healthy Pod can neither hide a new failure nor falsely close
-the incident.
 
 Release 5.0.6 fixes a Rancher evidence-intake regression introduced in 5.0.5.
 Initial diagnosis no longer waits for the optional Events endpoint, Pod logs
