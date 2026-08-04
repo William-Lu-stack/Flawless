@@ -16,22 +16,20 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.0.4**.
+Current release: **5.0.8**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
 
-Release 5.0.4 keeps live error evidence across replacement Pods, records each
-accepted permission-recovery stage before same-process replanning, and prevents
-the router from repeating an identical non-root patch or replacing an active
-recovery Skill during rollout. Permission recovery now progresses from a
-least-privilege UID/GID/fsGroup repair to a separately approved complete root
-fallback, then stops at an explicit storage-administrator boundary instead of
-repeating root when read-only volumes, NFS root_squash, CSI policy, capacity or
-backend ownership still blocks the write. Each accepted change must complete a
-rollout and fresh Pod/log verification before the incident is marked recovered.
+Release 5.0.8 deliberately uses the 5.0.4 code path as its base and changes only
+post-change recovery verification. Diagnosis, Skill routing and approval keep
+their 5.0.4 behavior. Verification now follows the newest controller revision,
+ignores a superseded CrashLoop Pod only after a replacement revision exists,
+reads the new Pod's current/previous logs and live Workload, requires rollout
+convergence, and closes after a bounded stability window. A broken newest Pod
+still fails verification and continues to the next approved recovery strategy.
 
 Release 5.0.3 advances directly from actionable Pod logs to root-cause diagnosis
 once the live Pod and owning Workload evidence are available. Broad storage,

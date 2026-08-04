@@ -41,8 +41,8 @@ if ($LASTEXITCODE -ne 0) {
 $images = @(
     @{
         Name = "Kubernetes Agent"
-        Source = "ghcr.dockerproxy.net/your-org/flawless:5.0.4"
-        Target = "k8s-agent:5.0.4"
+        Source = "ghcr.dockerproxy.net/your-org/flawless:5.0.8"
+        Target = "k8s-agent:5.0.8"
     },
     @{
         Name = "Approved Node Executor"

@@ -196,7 +196,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.4")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.8")
 APP_CODE_SIGNATURE = "evidence-satisfied-diagnosis-v27"
 BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -6536,6 +6536,8 @@ def _normalize_k8s_pod(raw: dict, replica_owner: dict[str, tuple[str, str]] | No
         "namespace": meta.get("namespace", "default"),
         "labels": meta.get("labels") or {},
         "annotations": meta.get("annotations") or {},
+        "created_at": meta.get("creationTimestamp", ""),
+        "deletion_timestamp": meta.get("deletionTimestamp", ""),
         "node": spec.get("nodeName", ""),
         "phase": status.get("phase", ""),
         "ready": ready,
@@ -9748,6 +9750,59 @@ async def _restore_progressive_source_template(
     }
 
 
+def _current_rollout_pod_cohort(pods: list[dict]) -> tuple[list[dict], list[str]]:
+    """Return only the newest controller revision for post-change verification.
+
+    A rolling update briefly exposes old and new ReplicaSets together. The old
+    failing Pod is valid diagnosis evidence, but it must not veto a healthy new
+    revision after the owning Workload has converged.
+    """
+    active = [
+        pod for pod in pods
+        if isinstance(pod, dict) and not str(pod.get("deletion_timestamp") or "")
+    ] or [pod for pod in pods if isinstance(pod, dict)]
+    revisions: dict[str, list[dict]] = {}
+    for pod in active:
+        labels = pod.get("labels") or {}
+        revision = str(
+            labels.get("pod-template-hash")
+            or labels.get("controller-revision-hash")
+            or labels.get("rollouts-pod-template-hash")
+            or ""
+        )
+        if not revision:
+            owner = next(
+                (
+                    item for item in (pod.get("owner_references") or [])
+                    if str(item.get("kind") or "") == "ReplicaSet"
+                ),
+                {},
+            )
+            revision = str(owner.get("name") or "")
+        if revision:
+            revisions.setdefault(revision, []).append(pod)
+
+    if len(revisions) <= 1:
+        return active, []
+
+    revision_times = {
+        revision: max((str(pod.get("created_at") or "") for pod in items), default="")
+        for revision, items in revisions.items()
+    }
+    if not any(revision_times.values()):
+        return active, []
+    newest_revision = max(revisions, key=lambda revision: revision_times[revision])
+    selected = revisions[newest_revision]
+    superseded = [
+        str(pod.get("name") or "")
+        for revision, items in revisions.items()
+        if revision != newest_revision
+        for pod in items
+        if pod.get("name")
+    ]
+    return selected, superseded
+
+
 async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     if any(r.get("status") in {"failed", "blocked"} for r in results):
         return {"status": "skipped", "recovered": False, "message": "存在变更 API 失败，跳过恢复验证并进入替代策略。"}
@@ -10088,8 +10143,11 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
         pod for pod in active_matched
         if str(pod.get("phase") or "") not in {"Failed", "Unknown"}
     ]
+    superseded_pods: list[str] = []
     if workload_name and non_terminal_active:
-        matched_for_health = non_terminal_active
+        matched_for_health, superseded_pods = _current_rollout_pod_cohort(
+            non_terminal_active
+        )
     else:
         matched_for_health = active_matched or matched
 
@@ -10129,6 +10187,7 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
         "target": f"{workload_type}/{workload_name}",
         "pods_checked": len(matched_for_health),
         "pods_matched_total": len(matched),
+        "superseded_pods_ignored": superseded_pods,
         "recovered_pods": recovered_pods,
         "unresolved": unresolved[:8],
         "terminal_unresolved": terminal_unresolved[:8],
@@ -10452,9 +10511,58 @@ async def _verify_plan_recovery(
     )
     interval_seconds = max(1, int(os.getenv("OPS_VERIFY_INTERVAL_SECONDS", "5")))
     initial_grace_seconds = max(0, int(os.getenv("OPS_VERIFY_INITIAL_GRACE_SECONDS", "15")))
-    stability_seconds = max(0, int(os.getenv("OPS_RECOVERY_STABILITY_SECONDS", "0")))
+    requested_stability_seconds = max(
+        0,
+        int(os.getenv("OPS_RECOVERY_STABILITY_SECONDS", "0")),
+    )
+    stability_seconds = min(
+        requested_stability_seconds,
+        max(0, int(os.getenv("OPS_RECOVERY_MAX_STABILITY_SECONDS", "15"))),
+    )
+    recovery_evidence_timeout = max(
+        5,
+        min(15, int(os.getenv("OPS_RECOVERY_EVIDENCE_TIMEOUT_SECONDS", "10"))),
+    )
     deadline = time.monotonic() + timeout_seconds
     attempts = 0
+
+    async def collect_recovery_evidence(verification_plan: dict) -> dict:
+        """Read the new Pod, its logs and owning Workload without a full rescan."""
+        requested = {
+            str(item.get("id") or item.get("name") or "")
+            if isinstance(item, dict) else str(item)
+            for item in (plan.get("success_criteria") or [])
+        }
+        requested = {
+            item.strip().lower().replace(" ", "_")
+            for item in requested
+            if item.strip()
+        }
+        needs_deep_domain = bool(
+            requested
+            & {
+                "pvc_bound",
+                "endpoint_ready",
+                "dependency_reachable",
+                "business_probe_ok",
+                "error_rate_recovered",
+                "latency_recovered",
+            }
+        )
+        collector = (
+            _collect_plan_deep_evidence
+            if needs_deep_domain
+            else _collect_plan_priority_evidence
+        )
+        evidence = await asyncio.wait_for(
+            collector(verification_plan),
+            timeout=recovery_evidence_timeout,
+        )
+        if evidence.get("error"):
+            raise RuntimeError(str(evidence.get("error")))
+        if not (evidence.get("pod") and evidence.get("workload")):
+            raise RuntimeError("fresh Pod/Workload evidence is unavailable")
+        return evidence
 
     async def assess_all_recovered_pods(probe: dict) -> tuple[dict, list[dict]]:
         recovered_pods = [str(item) for item in (probe.get("recovered_pods") or []) if str(item)]
@@ -10466,9 +10574,7 @@ async def _verify_plan_recovery(
             verification_plan = copy.deepcopy(plan)
             if recovered_pod:
                 verification_plan["pod_name"] = recovered_pod
-            fresh_evidence = await _collect_plan_deep_evidence(verification_plan)
-            if fresh_evidence.get("error"):
-                raise RuntimeError(str(fresh_evidence.get("error")))
+            fresh_evidence = await collect_recovery_evidence(verification_plan)
             criteria = _assess_recovery_criteria(plan, probe, fresh_evidence)
             evaluations.append({
                 "pod": recovered_pod or (fresh_evidence.get("pod") or {}).get("name"),
@@ -10629,6 +10735,7 @@ async def _verify_plan_recovery(
         "attempts": attempts + 1,
         "initial_grace_seconds": initial_grace_seconds,
         "required_stability_seconds": stability_seconds,
+        "requested_stability_seconds": requested_stability_seconds,
         "waited_seconds": (
             min(timeout_seconds, initial_grace_seconds + attempts * interval_seconds)
             + (stability_seconds if last.get("stability_verified") else 0)
