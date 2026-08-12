@@ -24,6 +24,7 @@ import {
   Moon,
   Network,
   PackageSearch,
+  Pause,
   Play,
   RefreshCcw,
   Copy,
@@ -1650,6 +1651,11 @@ function TopologyPage() {
   const [module, setModule] = useState<"relation" | "flow">("relation");
   const [workloadFilter, setWorkloadFilter] = useState("");
   const [view, setView] = useState<"2d" | "3d">(() => (localStorage.getItem("flawless-topology-view") as "2d" | "3d") || "2d");
+  const [autoRotate, setAutoRotate] = useState(() => {
+    const stored = localStorage.getItem("flawless-topology-auto-rotate");
+    if (stored != null) return stored !== "false";
+    return !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  });
   const [viewNotice, setViewNotice] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [analysis, setAnalysis] = useState<ApiState<any>>({ loading: false });
@@ -1731,6 +1737,10 @@ function TopologyPage() {
   }, [view]);
 
   useEffect(() => {
+    localStorage.setItem("flawless-topology-auto-rotate", String(autoRotate));
+  }, [autoRotate]);
+
+  useEffect(() => {
     if (selected && selected.id !== selectedId) setSelectedId(selected.id);
     if (!visibleGraph.nodes.length) setSelectedId("");
   }, [selected?.id, selectedId, visibleGraph.nodes.length]);
@@ -1790,6 +1800,17 @@ function TopologyPage() {
             <button className="ghost tiny" onClick={() => canvasApiRef.current?.zoom(0.82)}><ZoomIn size={14} />放大</button>
             <button className="ghost tiny" onClick={() => canvasApiRef.current?.zoom(1.18)}><ZoomOut size={14} />缩小</button>
             <button className="ghost tiny" onClick={() => canvasApiRef.current?.reset()}><RefreshCcw size={14} />复位</button>
+            {view === "3d" && (
+              <button
+                className={cx("ghost tiny topology-orbit-toggle", autoRotate && "active")}
+                onClick={() => setAutoRotate((value) => !value)}
+                aria-pressed={autoRotate}
+                title={autoRotate ? "暂停自动环绕" : "开启自动环绕"}
+              >
+                {autoRotate ? <Pause size={14} /> : <CircleDot size={14} />}
+                {autoRotate ? "暂停环绕" : "自动环绕"}
+              </button>
+            )}
           </>}
           <div className="topology-legend-inline"><span className="workload">Workload</span><span className="pod">Pod</span><span className="service">Service</span><span className="data">Data</span><span className="risk">Risk</span></div>
         </div>
@@ -1799,7 +1820,7 @@ function TopologyPage() {
             <div className={cx("topology-stage", view === "2d" && "mode-2d")}>
               {visibleGraph.nodes.length ? (
                 view === "2d" ? <Topology2D nodes={visibleGraph.nodes} edges={visibleGraph.edges} selectedId={selected?.id || ""} onSelect={setSelectedId} apiRef={canvasApiRef} /> :
-                  <TopologyCanvas nodes={visibleGraph.nodes} edges={visibleGraph.edges} selectedId={selected?.id || ""} onSelect={setSelectedId} apiRef={canvasApiRef} onUnavailable={handleTopologyUnavailable} />
+                  <TopologyCanvas nodes={visibleGraph.nodes} edges={visibleGraph.edges} selectedId={selected?.id || ""} onSelect={setSelectedId} apiRef={canvasApiRef} onUnavailable={handleTopologyUnavailable} autoRotate={autoRotate} />
               ) : (
                 <EmptyState text={topology.error || topology.data?.message || "CMDB 当前没有返回拓扑节点；请确认 CMDB 已接入 Rancher/Service/Kafka/ELK 数据。"} />
               )}
@@ -1864,6 +1885,7 @@ function TopologyCanvas({
   onSelect,
   apiRef,
   onUnavailable,
+  autoRotate,
 }: {
   nodes: TopologyNode[];
   edges: TopologyEdge[];
@@ -1871,14 +1893,20 @@ function TopologyCanvas({
   onSelect: (id: string) => void;
   apiRef: React.MutableRefObject<{ reset: () => void; zoom: (factor: number) => void } | null>;
   onUnavailable: (message: string) => void;
+  autoRotate: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const selectedIdRef = useRef(selectedId);
+  const autoRotateRef = useRef(autoRotate);
   const [canvasError, setCanvasError] = useState("");
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
+
+  useEffect(() => {
+    autoRotateRef.current = autoRotate;
+  }, [autoRotate]);
 
   useEffect(() => {
     let disposed = false;
@@ -1904,6 +1932,7 @@ function TopologyCanvas({
       const controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
       controls.dampingFactor = 0.08;
+      controls.autoRotateSpeed = 0.42;
       controls.minDistance = 42;
       controls.maxDistance = 1800;
       controls.target.set(0, 0, 0);
@@ -2213,6 +2242,7 @@ function TopologyCanvas({
       };
 
       const animate = () => {
+        controls.autoRotate = autoRotateRef.current && !dragged;
         controls.update();
         starField.rotation.y += 0.000025;
         worlds.forEach(({ boundary, speed }) => {
@@ -2278,6 +2308,10 @@ function TopologyCanvas({
 
   return <div className="topology-canvas-wrap">
     <canvas className="topology-canvas" ref={canvasRef} />
+    <div className={cx("topology-orbit-status", autoRotate && "active")}>
+      <i />
+      {autoRotate ? "AUTO ORBIT · LIVE" : "ORBIT PAUSED"}
+    </div>
     {canvasError && <div className="topology-canvas-error">{canvasError}</div>}
   </div>;
 }

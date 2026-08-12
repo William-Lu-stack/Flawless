@@ -38,7 +38,7 @@ kubectl get storageclass
 
 | 顺序 | 组件 | 国内公开镜像 | 私库建议目标 |
 |---|---|---|---|
-| 1 | Web、API、MCP、全部 Agent、CMDB | `ghcr.dockerproxy.net/your-org/flawless:5.0.9` | `registry.example.com/k8s-agent:5.0.9` |
+| 1 | Web、API、MCP、全部 Agent、CMDB | `ghcr.dockerproxy.net/your-org/flawless:5.1.0` | `registry.example.com/k8s-agent:5.1.0` |
 | 2 | 审批后的节点命令执行器 | `ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36` | `registry.example.com/k8s-agent-node-exec:1.36` |
 
 两个镜像都是公开、多架构镜像，包含 `linux/amd64` 和 `linux/arm64`。普通 `docker pull` 会自动选择当前机器架构。

@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import copy
 import io
 import json
@@ -832,7 +833,7 @@ class OpsSkillCatalogTests(unittest.TestCase):
             self.assertGreater(top["score_breakdown"]["hypothesis_alignment"], 0.4)
             self.assertTrue(top["matched_hypotheses"])
 
-    def test_model_skill_hint_is_prior_not_override_and_failed_lineage_is_penalized(self):
+    def test_model_skill_hint_is_prior_and_executable_continuations_are_not_penalized(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = OpsSkillRegistry(Path(directory) / "skills")
             evidence = {
@@ -883,8 +884,9 @@ class OpsSkillCatalogTests(unittest.TestCase):
             )
             self.assertEqual(
                 service_match["score_breakdown"]["lineage_failure_penalty"],
-                0.3,
+                0.0,
             )
+            self.assertTrue(service_match["skill"]["continuation_capable"])
 
             continuation_payload = {
                 **payload,
@@ -2124,6 +2126,112 @@ class OpsSkillApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plan["target_binding"], "inspection_finding_id")
         finally:
             server.LAST_INSPECTION_PAYLOAD = previous
+
+    async def test_common_kubernetes_skills_publish_real_runtime_handlers(self):
+        handlers = {
+            item["skill_id"]: item["handler_id"]
+            for item in server.public_runtime_catalog()
+        }
+        self.assertEqual(handlers["skill-memory-oom-recovery"], "evidence-runbook-oom-recovery")
+        self.assertEqual(handlers["skill-probe-slow-start-recovery"], "evidence-runbook-probe-recovery")
+        self.assertEqual(handlers["skill-image-pull-runtime-recovery"], "evidence-runbook-image-recovery")
+        self.assertEqual(handlers["skill-config-reference-recovery"], "evidence-runbook-config-recovery")
+        self.assertEqual(handlers["skill-service-endpoint-flow"], "evidence-runbook-service-recovery")
+        self.assertEqual(handlers["skill-rollout-regression-recovery"], "evidence-runbook-rollout-recovery")
+        self.assertEqual(handlers["skill-node-pressure-containment"], "evidence-runbook-node-pressure")
+        self.assertEqual(handlers["skill-pdb-rollout-deadlock-recovery"], "evidence-runbook-pdb-recovery")
+        self.assertEqual(handlers["skill-cpu-capacity-recovery"], "evidence-runbook-cpu-recovery")
+
+    async def test_oom_skill_materializes_bounded_workload_patch(self):
+        evidence = {
+            "pod": {
+                "name": "api-abc",
+                "namespace": "prod",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "last_terminated_reason": "OOMKilled",
+                "last_exit_code": 137,
+                "containers": [{
+                    "name": "api",
+                    "resources": {
+                        "requests": {"cpu": "100m", "memory": "256Mi"},
+                        "limits": {"cpu": "1", "memory": "512Mi"},
+                    },
+                }],
+            },
+            "events": [{"reason": "OOMKilled", "message": "exit code 137"}],
+        }
+        plan = {
+            "namespace": "prod",
+            "target": "Deployment/api",
+            "summary": "OOMKilled exit code 137",
+            "evidence": evidence,
+        }
+        materialized = server._materialize_executable_skill(
+            plan,
+            {
+                "question": plan["summary"],
+                "diagnosis": {"root_cause": "OOMKilled"},
+                "evidence": evidence,
+            },
+            "skill-memory-oom-recovery",
+        )
+        self.assertEqual(materialized["runbook_id"], "oom")
+        self.assertEqual(materialized["selected_skill_id"], "skill-memory-oom-recovery")
+        self.assertEqual(materialized["changes"][0]["type"], "patch_workload")
+        memory = materialized["changes"][0]["patch"]["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"]
+        self.assertNotEqual(memory, "512Mi")
+
+    async def test_mutation_queue_waits_instead_of_rejecting_and_serializes_targets(self):
+        server.OPS_EXECUTION_ACTIVE_JOBS.clear()
+        server.OPS_EXECUTION_ACTIVE_TARGETS.clear()
+        cancel = asyncio.Event()
+        with patch.dict(os.environ, {"OPS_MAX_CONCURRENT_JOBS": "1"}):
+            self.assertTrue(await server._acquire_ops_execution_lease("job-a", "cluster/prod/deployment/a", cancel))
+            waiter = asyncio.create_task(
+                server._acquire_ops_execution_lease("job-b", "cluster/prod/deployment/b", cancel)
+            )
+            await asyncio.sleep(0.02)
+            self.assertFalse(waiter.done())
+            await server._release_ops_execution_lease("job-a", "cluster/prod/deployment/a")
+            self.assertTrue(await asyncio.wait_for(waiter, timeout=1))
+            await server._release_ops_execution_lease("job-b", "cluster/prod/deployment/b")
+        self.assertEqual(server.OPS_EXECUTION_ACTIVE_JOBS, set())
+        self.assertEqual(server.OPS_EXECUTION_ACTIVE_TARGETS, {})
+
+    async def test_waiting_approval_jobs_do_not_block_new_job_admission(self):
+        existing_ids = set(server.OPS_JOBS)
+        for index in range(8):
+            server.OPS_JOBS[f"approval-wait-{index}"] = {
+                "id": f"approval-wait-{index}",
+                "status": "awaiting_approval",
+            }
+        plan = {
+            "namespace": "prod",
+            "target": "Deployment/api",
+            "summary": "read-only diagnosis",
+            "steps": [{"id": "events", "title": "read events"}],
+            "changes": [],
+            "evidence": {"events": []},
+        }
+        try:
+            with patch.object(server, "_run_ops_job", AsyncMock(return_value=None)):
+                created = await server._enqueue_ops_job(
+                    plan,
+                    "tester",
+                    autonomous=False,
+                    confirmed=False,
+                )
+            self.assertEqual(created["status"], "queued")
+            self.assertTrue(created["id"].startswith("ops-"))
+            task = server.OPS_JOB_TASKS.pop(created["id"], None)
+            if task:
+                await task
+        finally:
+            for job_id in list(server.OPS_JOBS):
+                if job_id not in existing_ids:
+                    server.OPS_JOBS.pop(job_id, None)
+                    server.OPS_JOB_CANCEL_EVENTS.pop(job_id, None)
 
 
 if __name__ == "__main__":

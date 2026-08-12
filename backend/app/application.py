@@ -79,8 +79,18 @@ from backend.app.services.ops_execution import StageTimeoutError, run_with_heart
 from backend.app.services.log_evidence import triage_kubernetes_logs
 from backend.app.services.ops_skill_registry import OpsSkillRegistry, approved_script_catalog, skill_option_catalog
 from backend.app.services.ops_skill_runtime import (
+    CONFIG_SKILL_ID,
+    CPU_SKILL_ID,
+    DNS_CNI_SKILL_ID,
+    IMAGE_SKILL_ID,
+    NODE_PRESSURE_SKILL_ID,
+    OOM_SKILL_ID,
     OPS_SKILL_RUNTIME,
+    PDB_SKILL_ID,
+    PROBE_SKILL_ID,
     PVC_PV_SKILL_ID,
+    ROLLOUT_SKILL_ID,
+    SERVICE_SKILL_ID,
     VOLUME_PERMISSION_SKILL_ID,
     classify_volume_write_failure,
     public_runtime_catalog,
@@ -196,9 +206,9 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.0.9")
-APP_CODE_SIGNATURE = "evidence-satisfied-diagnosis-v27"
-BUILTIN_SKILL_POLICY_REVISION = "2.1.0"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.1.0")
+APP_CODE_SIGNATURE = "kubernetes-skill-closure-v28"
+BUILTIN_SKILL_POLICY_REVISION = "3.0.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 KNOWLEDGE_MAX_EXTRACTED_BYTES = int(os.getenv("KNOWLEDGE_MAX_EXTRACTED_BYTES", str(8 * 1024 * 1024)))
@@ -554,6 +564,9 @@ OPS_JOB_TASKS: dict[str, asyncio.Task] = {}
 OPS_JOB_CANCEL_EVENTS: dict[str, asyncio.Event] = {}
 OPS_JOB_STEP_APPROVAL_EVENTS: dict[str, asyncio.Event] = {}
 OPS_JOBS_LOCK = asyncio.Lock()
+OPS_EXECUTION_CONDITION = asyncio.Condition()
+OPS_EXECUTION_ACTIVE_JOBS: set[str] = set()
+OPS_EXECUTION_ACTIVE_TARGETS: dict[str, str] = {}
 OPS_JOB_STORE_PATH = Path(os.getenv("OPS_JOB_STORE_PATH", "").strip()) if os.getenv("OPS_JOB_STORE_PATH", "").strip() else None
 OPS_JOB_STORE_ERROR = ""
 OPS_JOB_PERSIST_TASK: asyncio.Task | None = None
@@ -12128,6 +12141,117 @@ def _pvc_pv_skill_handler(plan: dict, signal: dict) -> dict | None:
     }
 
 
+def _evidence_runbook_skill_handler(
+    plan: dict,
+    signal: dict,
+    *,
+    accepted_runbooks: set[str],
+    title: str,
+    source: str,
+) -> dict | None:
+    """Materialize a common Kubernetes Skill from live, server-validated evidence.
+
+    The LLM may rank hypotheses, but it never invents the target or patch here.
+    ``EvidenceRunbookEngine`` rebuilds the proposal from the current Pod,
+    Workload, Events and domain evidence, then the normal action catalogue,
+    RBAC preflight, per-step approval and recovery verifier still apply.
+    """
+    evidence = {
+        **(plan.get("evidence") or {}),
+        **((signal.get("evidence") or {}) if isinstance(signal, dict) else {}),
+        **(plan.get("_runtime_evidence") or {}),
+    }
+    namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
+    pod = evidence.get("pod") if isinstance(evidence.get("pod"), dict) else {}
+    diagnosis = (signal or {}).get("diagnosis") if isinstance(signal, dict) else {}
+    diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+    engine_plan = build_remediation_plan(
+        {
+            "alert_name": str(plan.get("strategy_class") or title),
+            "summary": str((signal or {}).get("question") or plan.get("summary") or ""),
+            "namespace": namespace,
+            "workload_type": workload_type,
+            "workload_name": workload_name,
+            "pod": evidence.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan),
+        },
+        {
+            "root_cause": str(diagnosis.get("root_cause") or plan.get("summary") or ""),
+            "signals": diagnosis.get("signals") or evidence.get("events") or [],
+        },
+        {
+            **evidence,
+            "pod": pod,
+            "pods": [pod] if pod else [],
+            "events": {"events": evidence.get("events") or []},
+        },
+    )
+    runbook_id = str(engine_plan.get("runbook_id") or "")
+    if runbook_id not in accepted_runbooks:
+        return None
+    changes = [item for item in (engine_plan.get("changes") or []) if isinstance(item, dict)]
+    return {
+        "id": f"{source}-{uuid.uuid4().hex[:8]}",
+        "title": title,
+        "namespace": namespace,
+        "target": f"{workload_type}/{workload_name}",
+        "pod_name": evidence.get("pod_name") or pod.get("name") or _target_pod_from_plan(plan),
+        "summary": engine_plan.get("reason") or title,
+        "steps": engine_plan.get("steps") or [],
+        "changes": changes,
+        "source": source,
+        "runbook_id": runbook_id,
+        "evidence_gap": engine_plan.get("evidence_gap") or "",
+        "root_cause_hypotheses": engine_plan.get("hypotheses") or [],
+        "success_criteria": engine_plan.get("success_criteria") or ["pod_ready", "restart_count_stable"],
+        "requires_confirmation": bool(changes),
+        "requires_high_risk_confirmation": any(
+            item.get("risk") == "high" or item.get("auto_allowed") is False
+            for item in changes
+        ),
+        "verification_plan": _next_attempt_verification_plan(f"{workload_type}/{workload_name}"),
+    }
+
+
+def _oom_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"oom"}, title="OOM 内存恢复", source="executable_oom_skill")
+
+
+def _probe_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"probe"}, title="探针与慢启动恢复", source="executable_probe_skill")
+
+
+def _image_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"image_auth", "image_architecture"}, title="镜像拉取与运行时恢复", source="executable_image_skill")
+
+
+def _config_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"config_missing"}, title="配置引用恢复", source="executable_config_skill")
+
+
+def _service_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"network_service", "service_selector"}, title="Service 与 Endpoint 恢复", source="executable_service_skill")
+
+
+def _rollout_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"rollout_regression"}, title="发布回归恢复", source="executable_rollout_skill")
+
+
+def _node_pressure_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"node_pressure"}, title="节点压力隔离与恢复", source="executable_node_pressure_skill")
+
+
+def _pdb_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"pdb_deadlock"}, title="PDB 发布死锁恢复", source="executable_pdb_skill")
+
+
+def _cpu_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"cpu_saturation"}, title="CPU 容量恢复", source="executable_cpu_skill")
+
+
+def _dns_cni_skill_handler(plan: dict, signal: dict) -> dict | None:
+    return _evidence_runbook_skill_handler(plan, signal, accepted_runbooks={"dns_cni"}, title="DNS 与 CNI 运行时恢复", source="executable_dns_cni_skill")
+
+
 def _materialize_executable_skill(plan: dict, signal: dict, skill_id: str) -> dict | None:
     runtime_plan = OPS_SKILL_RUNTIME.materialize(
         skill_id,
@@ -12136,6 +12260,16 @@ def _materialize_executable_skill(plan: dict, signal: dict, skill_id: str) -> di
         {
             "volume-write-permission-recovery": _volume_permission_skill_handler,
             "pvc-pv-binding-recovery": _pvc_pv_skill_handler,
+            "evidence-runbook-oom-recovery": _oom_skill_handler,
+            "evidence-runbook-probe-recovery": _probe_skill_handler,
+            "evidence-runbook-image-recovery": _image_skill_handler,
+            "evidence-runbook-config-recovery": _config_skill_handler,
+            "evidence-runbook-service-recovery": _service_skill_handler,
+            "evidence-runbook-rollout-recovery": _rollout_skill_handler,
+            "evidence-runbook-node-pressure": _node_pressure_skill_handler,
+            "evidence-runbook-pdb-recovery": _pdb_skill_handler,
+            "evidence-runbook-cpu-recovery": _cpu_skill_handler,
+            "evidence-runbook-dns-cni-recovery": _dns_cni_skill_handler,
         },
     )
     if not runtime_plan:
@@ -12580,6 +12714,16 @@ async def _evidence_based_replan(
         "oom": {"patch_workload"},
         "probe": {"patch_workload"},
         "node_pressure": {"cordon_node", "evict_pod"},
+        "cpu_saturation": {"scale_out", "patch_hpa"},
+        "rollout_regression": {"rollback_workload", "abort_progressive_rollout"},
+        "service_selector": {"patch_service", "patch_workload"},
+        "network_service": {"patch_service", "patch_workload", "restart"},
+        "dns_cni": {"recreate_pod", "restart", "patch_workload", "patch_resource"},
+        "pdb_deadlock": {"patch_pdb"},
+        "scheduling_capacity": {"patch_workload", "patch_resource"},
+        "scheduling_constraints": {"patch_workload"},
+        "quota_limit": {"patch_workload", "patch_resource"},
+        "certificate_expiry": {"apply_manifest", "patch_resource", "rollback_workload", "restart"},
     }.get(str(engine_plan.get("runbook_id") or "")) if float(primary.get("confidence") or 0.0) >= 0.72 else None
     for raw in candidates:
         if constrained_actions and str((raw or {}).get("type") or "") not in constrained_actions:
@@ -13181,12 +13325,101 @@ def _append_manual_exit_if_needed(plan: dict, result: dict, reason: str, attempt
     return result
 
 
+def _ops_execution_target_key(plan: dict, change: dict) -> str:
+    namespace, workload_type, workload_name = _workload_identity_from_plan(plan)
+    cluster = str(plan.get("cluster_id") or plan.get("cluster") or "local")
+    resource_type = str(
+        change.get("workload_type")
+        or change.get("kind")
+        or change.get("resource_type")
+        or workload_type
+        or "resource"
+    )
+    resource_name = str(
+        change.get("workload_name")
+        or change.get("name")
+        or change.get("service_name")
+        or change.get("pvc_name")
+        or change.get("pdb_name")
+        or change.get("node_name")
+        or workload_name
+        or plan.get("target")
+        or "unknown"
+    )
+    return f"{cluster}/{change.get('namespace') or namespace}/{resource_type}/{resource_name}".lower()
+
+
+async def _acquire_ops_execution_lease(
+    lease_id: str,
+    target_key: str,
+    cancel_event: asyncio.Event | None,
+    progress=None,
+) -> bool:
+    """Queue actual mutations without charging diagnosis or approval wait time.
+
+    A global limit controls simultaneous Kubernetes writes while the target map
+    provides single-flight semantics for one Workload/resource. This replaces
+    the old admission-time 429 counter that permanently counted abandoned
+    ``awaiting_approval`` jobs as active executions.
+    """
+    if not lease_id:
+        return True
+    limit = max(1, min(64, int(os.getenv("OPS_MAX_CONCURRENT_JOBS", "4"))))
+    started = time.monotonic()
+    last_notice = -10.0
+    while True:
+        if cancel_event and cancel_event.is_set():
+            return False
+        acquired = False
+        async with OPS_EXECUTION_CONDITION:
+            owner = OPS_EXECUTION_ACTIVE_TARGETS.get(target_key)
+            if (
+                (owner in {None, lease_id})
+                and (lease_id in OPS_EXECUTION_ACTIVE_JOBS or len(OPS_EXECUTION_ACTIVE_JOBS) < limit)
+            ):
+                OPS_EXECUTION_ACTIVE_JOBS.add(lease_id)
+                OPS_EXECUTION_ACTIVE_TARGETS[target_key] = lease_id
+                acquired = True
+            else:
+                try:
+                    await asyncio.wait_for(OPS_EXECUTION_CONDITION.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+        if acquired:
+            return True
+        elapsed = time.monotonic() - started
+        if progress and elapsed - last_notice >= 5.0:
+            last_notice = elapsed
+            await progress(
+                "execution_queued",
+                "受控变更已进入执行队列；等待全局写入槽或同一目标的前序变更完成。",
+                waiting_on="kubernetes_mutation_lease",
+                queue_seconds=round(elapsed, 1),
+                execution_limit=limit,
+                executing_jobs=len(OPS_EXECUTION_ACTIVE_JOBS),
+                target_key=target_key,
+                level="info",
+            )
+
+
+async def _release_ops_execution_lease(lease_id: str, target_key: str) -> None:
+    if not lease_id:
+        return
+    async with OPS_EXECUTION_CONDITION:
+        if OPS_EXECUTION_ACTIVE_TARGETS.get(target_key) == lease_id:
+            OPS_EXECUTION_ACTIVE_TARGETS.pop(target_key, None)
+        if lease_id not in OPS_EXECUTION_ACTIVE_TARGETS.values():
+            OPS_EXECUTION_ACTIVE_JOBS.discard(lease_id)
+        OPS_EXECUTION_CONDITION.notify_all()
+
+
 async def _execute_ops_plan_once(
     plan: dict,
     cancel_event: asyncio.Event | None = None,
     progress=None,
     summarize: bool = True,
     change_approval=None,
+    execution_lease_id: str = "",
 ) -> dict:
     async def emit(stage: str, message: str, **extra):
         if progress:
@@ -14140,6 +14373,22 @@ async def _execute_ops_plan_once(
             )
         else:
             change_timeout = max(10, int(os.getenv("OPS_CHANGE_TIMEOUT_SECONDS", "45")))
+        target_key = _ops_execution_target_key(plan, change)
+        lease_acquired = await _acquire_ops_execution_lease(
+            execution_lease_id,
+            target_key,
+            cancel_event,
+            progress,
+        )
+        if not lease_acquired:
+            return {
+                "status": "cancelled",
+                "executed": bool(results),
+                "steps": executed_steps,
+                "results": results,
+                "release_gate": release_gate,
+                "message": "任务在等待受控变更执行槽时被操作员中断。",
+            }
         try:
             change_result = await run_with_heartbeat(
                 _execute_change(change, plan),
@@ -14190,6 +14439,8 @@ async def _execute_ops_plan_once(
                 error=safe_error,
                 level="error",
             )
+        finally:
+            await _release_ops_execution_lease(execution_lease_id, target_key)
         results.append(change_result)
         change_status = change_result.get("status") or "completed"
         if change_status == "completed":
@@ -14503,7 +14754,26 @@ async def _execute_ops_plan_once(
             rollback_patch=rollback_change.get("patch") or {},
             level="warning",
         )
-        rollback_result = await _execute_change(rollback_change, plan)
+        rollback_target_key = _ops_execution_target_key(plan, rollback_change)
+        rollback_lease_acquired = await _acquire_ops_execution_lease(
+            execution_lease_id,
+            rollback_target_key,
+            cancel_event,
+            progress,
+        )
+        if not rollback_lease_acquired:
+            return {
+                "status": "cancelled",
+                "executed": True,
+                "steps": executed_steps,
+                "results": results,
+                "release_gate": release_gate,
+                "message": "非 root 加固失败，但任务在等待自动回滚执行槽时被中断；请立即核对目标 Workload。",
+            }
+        try:
+            rollback_result = await _execute_change(rollback_change, plan)
+        finally:
+            await _release_ops_execution_lease(execution_lease_id, rollback_target_key)
         results.append(rollback_result)
         rollback_skill_id = str(rollback_change.get("skill_id") or "")
         if rollback_skill_id:
@@ -16639,6 +16909,14 @@ async def ops_capabilities():
             "namespace_allowlist": _csv_env("ALLOWED_NAMESPACES", "default"),
             "verification_timeout_seconds": int(os.getenv("OPS_VERIFY_TIMEOUT_SECONDS", "45")),
             "continuous_until_recovered": True,
+            "execution_queue": {
+                "mutation_limit": max(1, min(64, int(os.getenv("OPS_MAX_CONCURRENT_JOBS", "4")))),
+                "executing_jobs": len(OPS_EXECUTION_ACTIVE_JOBS),
+                "locked_targets": len(OPS_EXECUTION_ACTIVE_TARGETS),
+                "approval_wait_consumes_slot": False,
+                "same_target_single_flight": True,
+                "overflow_policy": "queue",
+            },
             "strategy_summary_window": max(1, min(20, int(os.getenv("AUTO_OPS_MAX_ATTEMPTS", "3")))),
             "continuation_interval_seconds": max(5, min(900, int(os.getenv("OPS_CONTINUATION_INTERVAL_SECONDS", "30")))),
             "job_store": {
@@ -17008,6 +17286,7 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
                 progress,
                 summarize=False,
                 change_approval=await_change_approval,
+                execution_lease_id=job_id,
             )
             history.append({
                 "attempt": attempt,
@@ -17551,9 +17830,6 @@ async def _enqueue_ops_job(plan_input: dict, actor: str, *, autonomous: bool, co
         })
     if not plan.get("changes") and not plan.get("steps"):
         raise HTTPException(status_code=422, detail="计划中既没有诊断步骤，也没有可执行的 Kubernetes 变更")
-    active = sum(1 for item in OPS_JOBS.values() if item.get("status") in {"queued", "running", "awaiting_approval", "cancelling"})
-    if active >= int(os.getenv("OPS_MAX_CONCURRENT_JOBS", "4")):
-        raise HTTPException(status_code=429, detail="自动运维并发已达到保护阈值")
     job_id = f"ops-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     job = {

@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：5.0.9
+版本：5.1.0
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -297,10 +297,13 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-5.0.9 已完成：
+5.1.0 已完成：
 
-- Python 全量测试：217 passed，另有 9 个 subtests passed。
+- Python 全量测试：221 passed。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
+- 常见 Kubernetes 故障已从“Skill 名称匹配”升级为 12 个版本化服务端执行器：卷/SQLite 写权限、PVC/PV、OOM、探针慢启动、镜像鉴权与架构、ConfigMap 引用、Service/Endpoint、发布回归、节点压力、PDB 死锁、CPU 容量和 DNS/CNI；调度/配额/准入与证书/Webhook 使用独立高风险 Skill，在没有批准目标值、Secret 或 PKI 制品时只诊断不编造变更。
+- 运维并发改为实际 Kubernetes 写入租约：证据采集和人工审批等待不占执行槽，超过全局写入上限的任务进入队列，同一资源保持 single-flight，消除遗留审批任务导致的“自动运维并发达到保护阈值”。
+- 3D 拓扑新增默认自动环绕、暂停/恢复控制、实时状态标识和深色星空层次；本地模拟 6 节点/6 条关系边验证了 Three.js 渲染和持续旋转，浏览器控制台无 warning/error。
 - 运维成效默认仅展示 `verification.recovered=true` 的已解决问题，摘要直接显示问题数、恢复 Workload 和恢复 Pod。
 - 单条记录可展开根因、匹配 Skill、最终策略、审批后变更、差异化换路历史和恢复验证证据；失败或只读诊断不再混入成效清单。
 - 真实 DeepSeek 路径：11.32 秒完成 `llm_planning → llm_planning_done → skill_router_processing → skill_router_done`，模型来源为 `llm+EvidenceRunbookEngine`。

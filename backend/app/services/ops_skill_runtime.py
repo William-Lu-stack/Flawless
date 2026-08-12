@@ -1,6 +1,6 @@
 """Runtime dispatch for built-in executable operations Skills.
 
-Portable/custom Skills describe evidence and allowed actions.  The two built-in
+Portable/custom Skills describe evidence and allowed actions.  The built-in
 recovery Skills below additionally own a versioned server-side handler.  This
 keeps chat, inspection preview and background OpsJobs on the same planner path
 without allowing an imported Skill to claim a privileged built-in handler.
@@ -17,6 +17,16 @@ from typing import Any, Callable
 
 VOLUME_PERMISSION_SKILL_ID = "skill-volume-permission-recovery"
 PVC_PV_SKILL_ID = "skill-storage-pvc-pv"
+OOM_SKILL_ID = "skill-memory-oom-recovery"
+PROBE_SKILL_ID = "skill-probe-slow-start-recovery"
+IMAGE_SKILL_ID = "skill-image-pull-runtime-recovery"
+CONFIG_SKILL_ID = "skill-config-reference-recovery"
+SERVICE_SKILL_ID = "skill-service-endpoint-flow"
+ROLLOUT_SKILL_ID = "skill-rollout-regression-recovery"
+NODE_PRESSURE_SKILL_ID = "skill-node-pressure-containment"
+PDB_SKILL_ID = "skill-pdb-rollout-deadlock-recovery"
+CPU_SKILL_ID = "skill-cpu-capacity-recovery"
+DNS_CNI_SKILL_ID = "skill-dns-cni-recovery"
 
 
 @dataclass(frozen=True)
@@ -38,6 +48,66 @@ BUILTIN_SKILL_HANDLERS: dict[str, BuiltinSkillHandler] = {
         skill_id=PVC_PV_SKILL_ID,
         handler_id="pvc-pv-binding-recovery",
         version="2.0.0",
+        continuation_capable=True,
+    ),
+    OOM_SKILL_ID: BuiltinSkillHandler(
+        skill_id=OOM_SKILL_ID,
+        handler_id="evidence-runbook-oom-recovery",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    PROBE_SKILL_ID: BuiltinSkillHandler(
+        skill_id=PROBE_SKILL_ID,
+        handler_id="evidence-runbook-probe-recovery",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    IMAGE_SKILL_ID: BuiltinSkillHandler(
+        skill_id=IMAGE_SKILL_ID,
+        handler_id="evidence-runbook-image-recovery",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    CONFIG_SKILL_ID: BuiltinSkillHandler(
+        skill_id=CONFIG_SKILL_ID,
+        handler_id="evidence-runbook-config-recovery",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    SERVICE_SKILL_ID: BuiltinSkillHandler(
+        skill_id=SERVICE_SKILL_ID,
+        handler_id="evidence-runbook-service-recovery",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    ROLLOUT_SKILL_ID: BuiltinSkillHandler(
+        skill_id=ROLLOUT_SKILL_ID,
+        handler_id="evidence-runbook-rollout-recovery",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    NODE_PRESSURE_SKILL_ID: BuiltinSkillHandler(
+        skill_id=NODE_PRESSURE_SKILL_ID,
+        handler_id="evidence-runbook-node-pressure",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    PDB_SKILL_ID: BuiltinSkillHandler(
+        skill_id=PDB_SKILL_ID,
+        handler_id="evidence-runbook-pdb-recovery",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    CPU_SKILL_ID: BuiltinSkillHandler(
+        skill_id=CPU_SKILL_ID,
+        handler_id="evidence-runbook-cpu-recovery",
+        version="1.0.0",
+        continuation_capable=True,
+    ),
+    DNS_CNI_SKILL_ID: BuiltinSkillHandler(
+        skill_id=DNS_CNI_SKILL_ID,
+        handler_id="evidence-runbook-dns-cni-recovery",
+        version="1.0.0",
         continuation_capable=True,
     ),
 }
