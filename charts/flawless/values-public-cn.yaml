@@ -2,10 +2,10 @@
 # Keep immutable tags in production; avoid `latest` so mirror caches stay deterministic.
 image:
   repository: ghcr.dockerproxy.net/your-org/flawless
-  tag: 5.2.0
+  tag: 5.3.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
 
 config:
-  NODE_EXEC_IMAGE: ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36
+  NODE_EXEC_IMAGE: ghcr.dockerproxy.net/your-org/cisre-node-exec:1.36

@@ -24,7 +24,7 @@ ACTION_CATALOG: dict[str, dict[str, Any]] = {
     },
     "run_shell": {
         "risk": "high", "auto_allowed": False, "rollback": "use the command-specific rollback steps shown in the approved plan",
-        "description": "Run a displayed shell command inside the Flawless runtime after step approval.",
+        "description": "Run a displayed shell command inside the CISRE runtime after step approval.",
     },
     "exec_pod": {
         "risk": "high", "auto_allowed": False, "rollback": "use the command-specific rollback steps shown in the approved plan",
@@ -188,7 +188,7 @@ ACTION_OPERATOR_GUIDANCE: dict[str, dict[str, str]] = {
     "apply_manifest": {"label": "应用 Kubernetes YAML", "when_to_use": "AI/Skill 已根据真实对象生成完整声明式变更。", "operator_note": "执行前展示完整 YAML 和资源差异，必须人工确认。"},
     "patch_resource": {"label": "修改 Kubernetes 资源", "when_to_use": "需要修改 Workload、ConfigMap、Secret、PV/PVC 或其他 API 资源。", "operator_note": "执行前锁定 apiVersion/kind/namespace/name 并保存原对象。"},
     "delete_resource": {"label": "删除 Kubernetes 资源", "when_to_use": "证据证明目标对象必须删除且影响范围可控。", "operator_note": "高风险，必须显示删除目标和可恢复快照。"},
-    "run_shell": {"label": "执行平台 Shell", "when_to_use": "Skill 需要在 Flawless 执行环境运行诊断或处置命令。", "operator_note": "完整命令、超时、风险和回滚方式必须逐步确认。"},
+    "run_shell": {"label": "执行平台 Shell", "when_to_use": "Skill 需要在 CISRE 执行环境运行诊断或处置命令。", "operator_note": "完整命令、超时、风险和回滚方式必须逐步确认。"},
     "exec_pod": {"label": "执行 Pod 命令", "when_to_use": "需要进入明确的 Pod/container 收集证据或执行处置。", "operator_note": "完整命令和目标必须逐步确认并审计 stdout/stderr。"},
     "exec_node": {"label": "执行节点命令", "when_to_use": "必须在指定 Kubernetes 节点主机完成诊断或处置。", "operator_note": "通过受控节点执行器运行，属于高风险逐步确认动作。"},
     "create_workload": {"label": "创建新 Workload", "when_to_use": "发布治理已校验完整 YAML，需要创建新的 Deployment、StatefulSet 或 DaemonSet。", "operator_note": "高风险；创建前必须检查命名空间、镜像、资源、探针、ServiceAccount 和回滚方式。"},

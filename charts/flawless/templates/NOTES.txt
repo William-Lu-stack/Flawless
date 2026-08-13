@@ -1,4 +1,4 @@
-Flawless SRE 已部署。
+CISRE 已部署。
 
 1. 控制台地址：
 {{- if eq .Values.service.type "NodePort" }}

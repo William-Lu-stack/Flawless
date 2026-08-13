@@ -1,6 +1,6 @@
 """Normalize eBPF/Hubble/Cilium network-flow payloads.
 
-Flawless does not run a privileged packet-capture container by default. In
+CISRE does not run a privileged packet-capture container by default. In
 production, the platform consumes flow events emitted by an approved eBPF
 observer such as Cilium Hubble or an enterprise flow collector, then converts
 them into the same contract used by topology and external data-flow APIs.

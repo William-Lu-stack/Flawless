@@ -1,4 +1,4 @@
-"""flawless 后端兼容入口。
+"""CISRE 后端兼容入口。
 
 生产启动命令继续使用 ``backend.app.main:app``，实际应用装配位于
 ``backend.app.application``。这样部署契约不变，同时避免入口文件再次膨胀。

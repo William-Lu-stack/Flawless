@@ -24,7 +24,6 @@ import {
   Moon,
   Network,
   PackageSearch,
-  Pause,
   Play,
   RefreshCcw,
   Copy,
@@ -72,6 +71,7 @@ import "./styles.css";
 
 type PageKey = "chat" | "inspection" | "topology" | "skills" | "platform";
 type Theme = "light" | "dark";
+type PlatformTab = "overview" | "effectiveness" | "reliability" | "models" | "knowledge" | "observability" | "algorithms" | "infrastructure" | "integrations";
 
 type ChatMessage = {
   id: string;
@@ -108,9 +108,20 @@ const navItems = [
   { key: "chat", label: "SRE 对话", group: "核心", icon: MessageSquareText },
   { key: "inspection", label: "AI 巡检", group: "核心", icon: Search },
   { key: "topology", label: "拓扑影响", group: "核心", icon: Network },
-  { key: "skills", label: "Skill 库", group: "核心", icon: BrainCircuit },
-  { key: "platform", label: "平台能力", group: "平台", icon: Settings2 }
+  { key: "skills", label: "Skill 库", group: "核心", icon: BrainCircuit }
 ] as const;
+
+const platformItems: Array<{ key: PlatformTab; label: string; icon: any }> = [
+  { key: "overview", label: "运行总览", icon: LayoutDashboard },
+  { key: "effectiveness", label: "运维成效", icon: LineChart },
+  { key: "reliability", label: "发布治理", icon: ShieldCheck },
+  { key: "models", label: "模型实验室", icon: Beaker },
+  { key: "knowledge", label: "知识库", icon: BookOpen },
+  { key: "observability", label: "可观测", icon: Activity },
+  { key: "algorithms", label: "算法决策", icon: Workflow },
+  { key: "infrastructure", label: "全栈资源", icon: Database },
+  { key: "integrations", label: "集成中心", icon: Cable },
+];
 
 const quickPrompts = [
   "值班巡检：先看所有 P0/P1 异常",
@@ -155,13 +166,15 @@ function markdownish(text: string) {
 
 function App() {
   const [page, setPage] = useState<PageKey>("chat");
+  const [platformTab, setPlatformTab] = useState<PlatformTab>("overview");
+  const [platformOpen, setPlatformOpen] = useState(true);
   const [visited, setVisited] = useState<Set<PageKey>>(() => new Set<PageKey>(["chat"]));
-  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem("flawless-theme") as Theme) || "light");
+  const [theme, setTheme] = useState<Theme>(() => ((localStorage.getItem("cisre-theme") || localStorage.getItem("flawless-theme")) as Theme) || "light");
   const [health, refreshHealth] = useAsync<any>(() => apiGet("/api/health"), []);
   const [build] = useAsync<any>(() => apiGet("/api/build"), []);
   const [session, refreshSession] = useAsync<any>(() => apiGet(`/api/session?ts=${Date.now()}`), []);
   const [registry, refreshRegistry] = useAsync<any>(() => apiGet("/api/model-registry"), []);
-  const [activeModelId, setActiveModelId] = useState(() => localStorage.getItem("flawless-active-model") || "");
+  const [activeModelId, setActiveModelId] = useState(() => localStorage.getItem("cisre-active-model") || localStorage.getItem("flawless-active-model") || "");
   const [adminDialog, setAdminDialog] = useState(false);
   const [adminUser, setAdminUser] = useState("admin");
   const [adminPassword, setAdminPassword] = useState("");
@@ -170,7 +183,7 @@ function App() {
 
   useEffect(() => {
     document.body.dataset.theme = theme;
-    localStorage.setItem("flawless-theme", theme);
+    localStorage.setItem("cisre-theme", theme);
   }, [theme]);
 
   useEffect(() => {
@@ -192,7 +205,7 @@ function App() {
 
   async function activateModel(profileId: string) {
     setActiveModelId(profileId);
-    localStorage.setItem("flawless-active-model", profileId);
+    localStorage.setItem("cisre-active-model", profileId);
     try {
       await apiPost("/api/model-registry/active", { profile_id: profileId });
       refreshRegistry();
@@ -237,10 +250,17 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">Flawless</div>
+          <div className="brand-mark" aria-label="CISRE logo">
+            <svg viewBox="0 0 48 48" role="img" aria-hidden="true">
+              <path d="M34.7 10.2A17 17 0 1 0 35.9 36" />
+              <path d="M31.8 16.3a9.4 9.4 0 1 0 .8 14.7" />
+              <path d="M35.4 9.6v8.2l7.1 4.1-7.1 4.1v8.3" />
+              <circle cx="24" cy="24" r="2.7" />
+            </svg>
+          </div>
           <div>
-            <strong>SRE Console</strong>
-            <span>{build.data?.version || "production control plane"}</span>
+            <strong>CISRE</strong>
+            <span>{build.data?.version || "Intelligent Reliability Engine"}</span>
           </div>
         </div>
         <nav className="nav">
@@ -261,6 +281,35 @@ function App() {
               </React.Fragment>
             );
           })}
+          <span className="nav-section-label">平台</span>
+          <button
+            className={cx("nav-button nav-parent", page === "platform" && "active", platformOpen && "open")}
+            onClick={() => {
+              setPlatformOpen((value) => !value);
+              React.startTransition(() => setPage("platform"));
+            }}
+            aria-expanded={platformOpen}
+          >
+            <Settings2 size={17} />
+            <strong>平台能力</strong>
+            <ChevronRight className="nav-chevron" size={14} />
+          </button>
+          <div className={cx("nav-submenu", platformOpen && "open")}>
+            {platformItems.map((item) => {
+              const Icon = item.icon;
+              return <button
+                key={item.key}
+                className={cx("nav-subitem", page === "platform" && platformTab === item.key && "active")}
+                onClick={() => {
+                  setPlatformTab(item.key);
+                  React.startTransition(() => setPage("platform"));
+                }}
+              >
+                <Icon size={14} />
+                <span>{item.label}</span>
+              </button>;
+            })}
+          </div>
         </nav>
         <div className="side-card">
           <div className="side-row">
@@ -282,7 +331,10 @@ function App() {
 
       <main className="main">
         <header className="topbar">
-          <h1>{navItems.find((x) => x.key === page)?.label}</h1>
+          <div className="topbar-title">
+            <span>CISRE · CONTROL PLANE</span>
+            <h1>{page === "platform" ? platformItems.find((x) => x.key === platformTab)?.label : navItems.find((x) => x.key === page)?.label}</h1>
+          </div>
           <div className="top-actions">
             <label className="top-model">
               <span>当前模型</span>
@@ -311,10 +363,10 @@ function App() {
           {visited.has("inspection") && <div className={cx("page-layer", page === "inspection" && "active")}><InspectionPage activeModelId={activeModelId} /></div>}
           {visited.has("topology") && <div className={cx("page-layer", page === "topology" && "active")}><TopologyPage /></div>}
           {visited.has("skills") && <div className={cx("page-layer", page === "skills" && "active")}><OpsSkillsPage /></div>}
-          {visited.has("platform") && <div className={cx("page-layer", page === "platform" && "active")}><PlatformPage activeModelId={activeModelId} onActivate={activateModel} refreshRegistry={refreshRegistry} registry={registry} /></div>}
+          {visited.has("platform") && <div className={cx("page-layer", page === "platform" && "active")}><PlatformPage tab={platformTab} activeModelId={activeModelId} onActivate={activateModel} refreshRegistry={refreshRegistry} registry={registry} /></div>}
         </div>
       </main>
-      <AssistantDock page={navItems.find((item) => item.key === page)?.label || page} />
+      <AssistantDock page={page === "platform" ? platformItems.find((item) => item.key === platformTab)?.label || "平台能力" : navItems.find((item) => item.key === page)?.label || page} />
       {adminDialog && <div className="admin-dialog-backdrop" role="presentation" onMouseDown={() => setAdminDialog(false)}>
         <section className="admin-dialog" role="dialog" aria-modal="true" aria-label="管理员配置模式" onMouseDown={(event) => event.stopPropagation()}>
           <header><KeyRound size={18} /><div><strong>管理员配置模式</strong><span>凭据只保存在当前浏览器会话，不写入前端配置或仓库。</span></div></header>
@@ -345,30 +397,20 @@ function RuntimeOverviewPage() {
 }
 
 function PlatformPage({
+  tab,
   activeModelId,
   onActivate,
   refreshRegistry,
   registry,
 }: {
+  tab: PlatformTab;
   activeModelId: string;
   onActivate: (profileId: string) => Promise<void>;
   refreshRegistry: () => void;
   registry: ApiState<any>;
 }) {
-  const [tab, setTab] = useState<"overview" | "effectiveness" | "reliability" | "models" | "knowledge" | "observability" | "algorithms" | "infrastructure" | "integrations">("overview");
   return (
     <section className="hub-page">
-      <div className="hub-tabs platform-tabs">
-        <button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}><LayoutDashboard size={15} />运行总览</button>
-        <button className={tab === "effectiveness" ? "active" : ""} onClick={() => setTab("effectiveness")}><LineChart size={15} />运维成效</button>
-        <button className={tab === "reliability" ? "active" : ""} onClick={() => setTab("reliability")}><ShieldCheck size={15} />发布治理</button>
-        <button className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}><Beaker size={15} />模型实验室</button>
-        <button className={tab === "knowledge" ? "active" : ""} onClick={() => setTab("knowledge")}><BookOpen size={15} />知识库</button>
-        <button className={tab === "observability" ? "active" : ""} onClick={() => setTab("observability")}><Activity size={15} />可观测</button>
-        <button className={tab === "algorithms" ? "active" : ""} onClick={() => setTab("algorithms")}><Workflow size={15} />算法决策</button>
-        <button className={tab === "infrastructure" ? "active" : ""} onClick={() => setTab("infrastructure")}><Database size={15} />全栈资源</button>
-        <button className={tab === "integrations" ? "active" : ""} onClick={() => setTab("integrations")}><Cable size={15} />集成</button>
-      </div>
       {tab === "overview" && <RuntimeOverviewPage />}
       {tab === "effectiveness" && <EffectivenessPage />}
       {tab === "reliability" && <ReliabilityPage />}
@@ -755,7 +797,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
     <article className={cx("message", message.role, message.status === "streaming" && "streaming")}>
       <div className="avatar">{message.role === "assistant" ? <Bot size={16} /> : "我"}</div>
       <div className="bubble">
-        <div className="message-meta">{message.role === "assistant" ? "Flawless SRE" : "你"} {message.status === "streaming" && <span>正在生成</span>}{message.status === "stopped" && <span>已中断</span>}</div>
+        <div className="message-meta">{message.role === "assistant" ? "CISRE" : "你"} {message.status === "streaming" && <span>正在生成</span>}{message.status === "stopped" && <span>已中断</span>}</div>
         {message.target && <div className="message-target"><CircleDot size={11} /><span>{message.target.cluster} / {message.target.namespace}</span><b>{message.target.workload_name ? `${message.target.workload_type}/${message.target.workload_name}` : `Pod/${message.target.pod_name}`}</b></div>}
         {message.role === "assistant" && activities.length > 0 && (
           <details className="agent-activity" open={message.status === "streaming"}>
@@ -1650,12 +1692,9 @@ function TopologyPage() {
   const [namespace, setNamespace] = useState("all");
   const [module, setModule] = useState<"relation" | "flow">("relation");
   const [workloadFilter, setWorkloadFilter] = useState("");
-  const [view, setView] = useState<"2d" | "3d">(() => (localStorage.getItem("flawless-topology-view") as "2d" | "3d") || "2d");
-  const [autoRotate, setAutoRotate] = useState(() => {
-    const stored = localStorage.getItem("flawless-topology-auto-rotate");
-    if (stored != null) return stored !== "false";
-    return !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-  });
+  const [view, setView] = useState<"2d" | "3d">(() => (
+    (localStorage.getItem("cisre-topology-view") || localStorage.getItem("flawless-topology-view")) as "2d" | "3d"
+  ) || "3d");
   const [viewNotice, setViewNotice] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [analysis, setAnalysis] = useState<ApiState<any>>({ loading: false });
@@ -1732,13 +1771,9 @@ function TopologyPage() {
   const selected = visibleGraph.nodes.find((n) => n.id === selectedId) || visibleGraph.nodes[0];
 
   useEffect(() => {
-    localStorage.setItem("flawless-topology-view", view);
+    localStorage.setItem("cisre-topology-view", view);
     requestAnimationFrame(() => canvasApiRef.current?.reset());
   }, [view]);
-
-  useEffect(() => {
-    localStorage.setItem("flawless-topology-auto-rotate", String(autoRotate));
-  }, [autoRotate]);
 
   useEffect(() => {
     if (selected && selected.id !== selectedId) setSelectedId(selected.id);
@@ -1801,17 +1836,6 @@ function TopologyPage() {
             <button className="ghost tiny" onClick={() => canvasApiRef.current?.zoom(0.82)}><ZoomIn size={14} />放大</button>
             <button className="ghost tiny" onClick={() => canvasApiRef.current?.zoom(1.18)}><ZoomOut size={14} />缩小</button>
             <button className="ghost tiny" onClick={() => canvasApiRef.current?.reset()}><RefreshCcw size={14} />复位</button>
-            {view === "3d" && (
-              <button
-                className={cx("ghost tiny topology-orbit-toggle", autoRotate && "active")}
-                onClick={() => setAutoRotate((value) => !value)}
-                aria-pressed={autoRotate}
-                title={autoRotate ? "暂停自动环绕" : "开启自动环绕"}
-              >
-                {autoRotate ? <Pause size={14} /> : <CircleDot size={14} />}
-                {autoRotate ? "暂停环绕" : "自动环绕"}
-              </button>
-            )}
           </>}
           <div className="topology-legend-inline"><span className="workload">Workload</span><span className="pod">Pod</span><span className="service">Service</span><span className="data">Data</span><span className="risk">Risk</span></div>
         </div>
@@ -1821,7 +1845,7 @@ function TopologyPage() {
             <div className={cx("topology-stage", view === "2d" && "mode-2d")}>
               {visibleGraph.nodes.length ? (
                 view === "2d" ? <Topology2D nodes={visibleGraph.nodes} edges={visibleGraph.edges} selectedId={selected?.id || ""} onSelect={setSelectedId} apiRef={canvasApiRef} /> :
-                  <TopologyCanvas nodes={visibleGraph.nodes} edges={visibleGraph.edges} selectedId={selected?.id || ""} onSelect={setSelectedId} apiRef={canvasApiRef} onUnavailable={handleTopologyUnavailable} autoRotate={autoRotate} />
+                  <TopologyCanvas nodes={visibleGraph.nodes} edges={visibleGraph.edges} selectedId={selected?.id || ""} onSelect={setSelectedId} apiRef={canvasApiRef} onUnavailable={handleTopologyUnavailable} />
               ) : (
                 <EmptyState text={topology.error || topology.data?.message || "CMDB 当前没有返回拓扑节点；请确认 CMDB 已接入 Rancher/Service/Kafka/ELK 数据。"} />
               )}
@@ -1892,7 +1916,6 @@ function TopologyCanvas({
   onSelect,
   apiRef,
   onUnavailable,
-  autoRotate,
 }: {
   nodes: TopologyNode[];
   edges: TopologyEdge[];
@@ -1900,20 +1923,14 @@ function TopologyCanvas({
   onSelect: (id: string) => void;
   apiRef: React.MutableRefObject<{ reset: () => void; zoom: (factor: number) => void } | null>;
   onUnavailable: (message: string) => void;
-  autoRotate: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const selectedIdRef = useRef(selectedId);
-  const autoRotateRef = useRef(autoRotate);
   const [canvasError, setCanvasError] = useState("");
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
-
-  useEffect(() => {
-    autoRotateRef.current = autoRotate;
-  }, [autoRotate]);
 
   useEffect(() => {
     let disposed = false;
@@ -1934,8 +1951,16 @@ function TopologyCanvas({
       scene.background = new THREE.Color(0x020611);
       scene.fog = new THREE.FogExp2(0x020611, 0.00036);
       const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 7200);
-      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      const deviceMemory = Number((navigator as any).deviceMemory || 8);
+      const lowPower = nodes.length > 72 || edges.length > 120 || deviceMemory <= 4;
+      const renderer = new THREE.WebGLRenderer({
+        canvas,
+        antialias: !lowPower,
+        alpha: true,
+        powerPreference: "low-power",
+        preserveDrawingBuffer: false,
+      });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, lowPower ? 1 : 1.35));
       const controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
       controls.dampingFactor = 0.08;
@@ -1959,7 +1984,7 @@ function TopologyCanvas({
         starSeed = (starSeed * 16807) % 2147483647;
         return (starSeed - 1) / 2147483646;
       };
-      for (let index = 0; index < 1800; index += 1) {
+      for (let index = 0; index < (lowPower ? 520 : 920); index += 1) {
         starPositions.push((seeded() - 0.5) * 1800, (seeded() - 0.5) * 1100, (seeded() - 0.5) * 1200);
       }
       const starGeometry = new THREE.BufferGeometry();
@@ -2064,13 +2089,13 @@ function TopologyCanvas({
         const galaxy = new THREE.Group();
         galaxy.position.copy(center);
         const boundary = new THREE.Mesh(
-          new THREE.SphereGeometry(galaxyRadius * 1.04, 34, 24),
+          new THREE.SphereGeometry(galaxyRadius * 1.04, lowPower ? 16 : 24, lowPower ? 10 : 16),
           new THREE.MeshBasicMaterial({ color: 0x3d8fbd, wireframe: true, transparent: true, opacity: 0.15 })
         );
         galaxy.add(boundary);
         [0.36, 0.52, 0.70, 0.86, 1.0].forEach((ratio, orbitIndex) => {
           const orbit = new THREE.Mesh(
-            new THREE.TorusGeometry(galaxyRadius * ratio, 0.24, 6, 120),
+            new THREE.TorusGeometry(galaxyRadius * ratio, 0.24, 4, lowPower ? 48 : 72),
             new THREE.MeshBasicMaterial({ color: orbitIndex === 2 ? 0x4d9acb : 0x285071, transparent: true, opacity: orbitIndex === 2 ? 0.26 : 0.14 })
           );
           orbit.rotation.set(orbitIndex * 0.47, orbitIndex * 0.63, orbitIndex * 0.29);
@@ -2078,7 +2103,7 @@ function TopologyCanvas({
         });
         scene.add(galaxy);
         const core = new THREE.Mesh(
-          new THREE.SphereGeometry(Math.max(5.2, galaxyRadius * 0.055), 32, 22),
+          new THREE.SphereGeometry(Math.max(5.2, galaxyRadius * 0.055), lowPower ? 14 : 20, lowPower ? 9 : 14),
           new THREE.MeshStandardMaterial({ color: 0x7bc8ff, emissive: 0x168bff, emissiveIntensity: 1.4, roughness: 0.24, metalness: 0.1 })
         );
         core.position.copy(center);
@@ -2109,13 +2134,13 @@ function TopologyCanvas({
         ));
         const size = node.type.includes("data") || node.name.toLowerCase().includes("kafka") ? 6.1 : node.type.includes("service") ? 4.9 : node.type.includes("pod") ? 3.65 : 4.75;
         const geometry = type.includes("pod")
-          ? new THREE.SphereGeometry(size, 22, 14)
+          ? new THREE.SphereGeometry(size, lowPower ? 10 : 16, lowPower ? 7 : 10)
           : /deployment|statefulset|daemonset|workload/.test(type)
             ? new THREE.BoxGeometry(size * 2, size * 1.35, size * 1.7)
             : type.includes("service") || type.includes("ingress")
               ? new THREE.OctahedronGeometry(size, 0)
               : type.includes("data") || type.includes("kafka")
-                ? new THREE.CylinderGeometry(size, size, size * 1.7, 18)
+                ? new THREE.CylinderGeometry(size, size, size * 1.7, lowPower ? 8 : 12)
                 : new THREE.IcosahedronGeometry(size, 0);
         const mesh = new THREE.Mesh(
           geometry,
@@ -2142,7 +2167,7 @@ function TopologyCanvas({
         labelSprites.set(node.id, label);
       });
 
-      const flowGeometry = new THREE.SphereGeometry(0.62, 12, 9);
+      const flowGeometry = new THREE.SphereGeometry(0.62, lowPower ? 6 : 8, lowPower ? 4 : 6);
       const edgeLines = edges.map((edge, index) => {
         const isDataFlow = /kafka|data|stream|log|elk/i.test(edge.type);
         const line = new THREE.Line(
@@ -2158,8 +2183,9 @@ function TopologyCanvas({
           flowGeometry,
           new THREE.MeshBasicMaterial({ color: isDataFlow ? 0xffd477 : 0x8ae8ff, transparent: true, opacity: 0.92 })
         );
+        particle.visible = index < (lowPower ? 64 : 140);
         scene.add(particle);
-        return { edge, line, particle, phase: (index * 0.173) % 1, isDataFlow };
+        return { edge, line, particle, phase: (index * 0.173) % 1, isDataFlow, curve: null as any };
       });
 
       const curveFor = (source: any, target: any) => {
@@ -2175,6 +2201,17 @@ function TopologyCanvas({
         }
         return new THREE.QuadraticBezierCurve3(source.position.clone(), midpoint, target.position.clone());
       };
+
+      const rebuildEdgeCurves = () => {
+        edgeLines.forEach((item) => {
+          const source = nodeMeshes.get(item.edge.source);
+          const target = nodeMeshes.get(item.edge.target);
+          if (!source || !target) return;
+          item.curve = curveFor(source, target);
+          item.line.geometry.setFromPoints(item.curve.getPoints(lowPower ? 9 : 14));
+        });
+      };
+      rebuildEdgeCurves();
 
       const raycaster = new THREE.Raycaster();
       const pointer = new THREE.Vector2();
@@ -2218,6 +2255,7 @@ function TopologyCanvas({
           dragged.position.copy(intersection);
           const label = labelSprites.get(String(dragged.userData.id));
           if (label) label.position.copy(intersection.clone().add(new THREE.Vector3(0, 4, 0)));
+          rebuildEdgeCurves();
         }
       };
       const onPointerUp = (event: PointerEvent) => {
@@ -2238,6 +2276,7 @@ function TopologyCanvas({
             const label = labelSprites.get(id);
             if (label && pos) label.position.copy(pos.clone().add(new THREE.Vector3(0, 4, 0)));
           });
+          rebuildEdgeCurves();
           camera.position.set(initialCamera.x, initialCamera.y, cameraDistance * Math.max(1, 0.9 / camera.aspect));
           controls.target.set(0, 0, 0);
           controls.update();
@@ -2248,8 +2287,23 @@ function TopologyCanvas({
         },
       };
 
-      const animate = () => {
-        controls.autoRotate = autoRotateRef.current && !dragged;
+      let canvasVisible = !document.hidden;
+      let lastFrameAt = 0;
+      const frameInterval = 1000 / (lowPower ? 24 : 30);
+      const visibilityObserver = new IntersectionObserver(([entry]) => {
+        canvasVisible = entry.isIntersecting && !document.hidden;
+      }, { rootMargin: "80px" });
+      visibilityObserver.observe(host);
+      const onVisibilityChange = () => {
+        canvasVisible = !document.hidden && host.getBoundingClientRect().bottom >= 0;
+      };
+      document.addEventListener("visibilitychange", onVisibilityChange);
+
+      const animate = (now = performance.now()) => {
+        frame = requestAnimationFrame(animate);
+        if (!canvasVisible || now - lastFrameAt < frameInterval) return;
+        lastFrameAt = now;
+        controls.autoRotate = !dragged;
         controls.update();
         starField.rotation.y += 0.000025;
         worlds.forEach(({ boundary, speed }) => {
@@ -2259,7 +2313,10 @@ function TopologyCanvas({
           const active = selectedIdRef.current === id;
           mesh.material.emissive.setHex(active ? 0x33ddff : 0x071b33);
           mesh.material.emissiveIntensity = active ? 0.86 : 0.18;
-          mesh.scale.lerp(new THREE.Vector3(active ? 1.28 : 1, active ? 1.28 : 1, active ? 1.28 : 1), 0.12);
+          const targetScale = active ? 1.28 : 1;
+          mesh.scale.x += (targetScale - mesh.scale.x) * 0.12;
+          mesh.scale.y += (targetScale - mesh.scale.y) * 0.12;
+          mesh.scale.z += (targetScale - mesh.scale.z) * 0.12;
           const label = labelSprites.get(id);
           const node = nodeById.get(id);
           const nodeType = `${node?.type || ""} ${node?.kind || ""}`.toLowerCase();
@@ -2268,18 +2325,12 @@ function TopologyCanvas({
           }
         });
         const elapsed = performance.now() * 0.00016;
-        edgeLines.forEach(({ edge, line, particle, phase, isDataFlow }) => {
-          const source = nodeMeshes.get(edge.source);
-          const target = nodeMeshes.get(edge.target);
-          if (source && target) {
-            const curve = curveFor(source, target);
-            line.geometry.setFromPoints(curve.getPoints(18));
-            line.geometry.attributes.position.needsUpdate = true;
+        edgeLines.forEach(({ particle, phase, isDataFlow, curve }) => {
+          if (curve && particle.visible) {
             particle.position.copy(curve.getPoint((elapsed * (isDataFlow ? 1.55 : 1) + phase) % 1));
           }
         });
         renderer.render(scene, camera);
-        frame = requestAnimationFrame(animate);
       };
       animate();
 
@@ -2289,12 +2340,14 @@ function TopologyCanvas({
         canvas.removeEventListener("pointermove", onPointerMove);
         canvas.removeEventListener("pointerup", onPointerUp);
         canvas.removeEventListener("pointerleave", onPointerUp);
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+        visibilityObserver.disconnect();
         controls.dispose();
         renderer.dispose();
         scene.traverse((obj: any) => {
           obj.geometry?.dispose?.();
-          if (Array.isArray(obj.material)) obj.material.forEach((m: any) => m.dispose?.());
-          else obj.material?.dispose?.();
+          if (Array.isArray(obj.material)) obj.material.forEach((m: any) => { m.map?.dispose?.(); m.dispose?.(); });
+          else { obj.material?.map?.dispose?.(); obj.material?.dispose?.(); }
         });
       };
     })().catch((error) => {
@@ -2315,9 +2368,9 @@ function TopologyCanvas({
 
   return <div className="topology-canvas-wrap">
     <canvas className="topology-canvas" ref={canvasRef} />
-    <div className={cx("topology-orbit-status", autoRotate && "active")}>
+    <div className="topology-orbit-status active">
       <i />
-      {autoRotate ? "AUTO ORBIT · LIVE" : "ORBIT PAUSED"}
+      AUTO ORBIT · ADAPTIVE 30 FPS
     </div>
     {canvasError && <div className="topology-canvas-error">{canvasError}</div>}
   </div>;
@@ -2335,22 +2388,22 @@ function colorForNode(THREE: any, node: TopologyNode) {
 
 function makeLabelSprite(THREE: any, label: string, color: string) {
   const canvas = document.createElement("canvas");
-  canvas.width = 768;
-  canvas.height = 176;
+  canvas.width = 384;
+  canvas.height = 88;
   const ctx = canvas.getContext("2d")!;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.font = "700 54px Inter, Segoe UI, Microsoft YaHei, Arial";
+  ctx.font = "700 27px Inter, Segoe UI, Microsoft YaHei, Arial";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillStyle = "rgba(3, 12, 28, 0.92)";
-  roundRect(ctx, 18, 38, 732, 100, 22);
+  roundRect(ctx, 9, 19, 366, 50, 11);
   ctx.fill();
   ctx.strokeStyle = "rgba(116, 199, 255, 0.55)";
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 1.5;
   ctx.stroke();
   ctx.fillStyle = color;
   const text = label.length > 22 ? `${label.slice(0, 20)}...` : label;
-  ctx.fillText(text, 384, 88);
+  ctx.fillText(text, 192, 44);
   const texture = new THREE.CanvasTexture(canvas);
   texture.needsUpdate = true;
   const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true }));
@@ -2699,7 +2752,7 @@ function EffectivenessPage() {
         <Metric title="恢复 Pod" value={summary.pods_recovered || 0} tone="good" />
       </div>
       <Panel className="span-all">
-        <PanelTitle icon={CheckCircle2} title="Flawless 已解决的问题" subtitle="这里只展示恢复验证已通过的运维结果" action={<button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button>} />
+        <PanelTitle icon={CheckCircle2} title="CISRE 已解决的问题" subtitle="这里只展示恢复验证已通过的运维结果" action={<button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button>} />
         {state.loading && <div className="quiet-empty">正在读取已验证的恢复记录...</div>}
         {state.error && <div className="error-box">{state.error}</div>}
         <div className="resolved-problem-list">
@@ -2719,7 +2772,7 @@ function EffectivenessPage() {
         </div>
       </Panel>
       {selectedRecord && <Panel className="span-all">
-        <PanelTitle icon={FileUp} title={issueTitle(selectedRecord)} subtitle="Flawless 解决细节" action={<button className="ghost tiny" onClick={() => setSelectedRecord(null)}>关闭</button>} />
+        <PanelTitle icon={FileUp} title={issueTitle(selectedRecord)} subtitle="CISRE 解决细节" action={<button className="ghost tiny" onClick={() => setSelectedRecord(null)}>关闭</button>} />
         <div className="effectiveness-detail">
           <div><span>目标</span><strong>{selectedRecord.target || selectedRecord.model_id || "-"}</strong></div>
           <div><span>范围</span><strong>{selectedRecord.cluster || "-"} / {selectedRecord.namespace || "-"}</strong></div>

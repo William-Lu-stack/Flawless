@@ -1,10 +1,10 @@
-# Flawless AIOps 用户使用与部署手册
+# CISRE 用户使用与部署手册
 
 这份文档只面向平台使用者、部署人员和现场运维人员。开发代码、模块负责人和扩展规则请看 [代码架构和维护扩展规则.md](代码架构和维护扩展规则.md)。
 
 ## 1. 产品是什么
 
-Flawless AIOps 是面向 Kubernetes、Rancher 多集群、数据库、虚拟机、中间件、企业存储和混合云环境的全栈基础设施 AI SRE 控制平台。它把资源证据、CMDB 拓扑、Prometheus 指标、日志、链路、LLM 诊断和受控修复组织成一个闭环：
+CISRE 是面向 Kubernetes、Rancher 多集群、数据库、虚拟机、中间件、企业存储和混合云环境的全栈基础设施智能可靠性控制平台。它把资源证据、CMDB 拓扑、Prometheus 指标、日志、链路、LLM 诊断和受控修复组织成一个闭环：
 
 ```text
 发现异常 -> 收集证据 -> 判断根因 -> 计算影响 -> 生成方案
@@ -130,7 +130,7 @@ Flawless AIOps 是面向 Kubernetes、Rancher 多集群、数据库、虚拟机�
 
 权限边界：
 
-- Flawless 主应用容器不直接运行 eBPF 抓包逻辑，不要求 `privileged`、`hostNetwork` 或额外 Linux capability。
+- CISRE 主应用容器不直接运行 eBPF 抓包逻辑，不要求 `privileged`、`hostNetwork` 或额外 Linux capability。
 - 如果集群没有 eBPF 服务，可从 0 部署内置 Beyla Collector：
 
 ```bash
@@ -307,7 +307,7 @@ kubectl get --raw /readyz
 
 ## 9. 运维 Skill 编写与添加指南
 
-Skill 是把资深运维人员的经验注入平台的标准方式。当前实现兼容 Agent Skills 开放规范：每项 Skill 都是独立目录，以 `SKILL.md` 为跨智能体可读主体，以 `references/ops-policy.yaml` 保存 Flawless 的证据、动作和恢复门禁。SRE 对话按“元数据发现 -> 命中后加载正文”的渐进披露方式使用 Skill。
+Skill 是把资深运维人员的经验注入平台的标准方式。当前实现兼容 Agent Skills 开放规范：每项 Skill 都是独立目录，以 `SKILL.md` 为跨智能体可读主体，以 `references/ops-policy.yaml` 保存 CISRE 的证据、动作和恢复门禁。SRE 对话按“元数据发现 -> 命中后加载正文”的渐进披露方式使用 Skill。
 
 ```text
 ops-skills/
@@ -337,7 +337,7 @@ ops-skills/
 
 - 点击 Skill 卡片的 **导出**，获得可移植 ZIP，可交给 Codex、Claude Code 或其他 Agent Skills 兼容智能体。
 - 点击 **导入 Skill** 上传标准 ZIP。只包含 `SKILL.md` 的通用 Skill 会以“指令型”导入，不自动取得集群写权限。
-- 带 `references/ops-policy.yaml` 的 Flawless Skill 会恢复结构化证据、动作和恢复判据。
+- 带 `references/ops-policy.yaml` 的 CISRE Skill 会恢复结构化证据、动作和恢复判据。
 - ZIP 中的 `scripts/` 可以随包迁移，但在本平台始终默认为不可信；只有 `OPS_APPROVED_SCRIPTS_JSON` 中登记的 `script_id` 才能成为执行候选。
 - 旧 `OPS_SKILL_STORE_PATH` JSON 会在启动时自动迁移到 `OPS_SKILL_ROOT`，之后以目录包为事实来源。
 - K8S 部署已把 `/var/lib/flawless` 挂载到 `flawless-runtime-store` PVC，Pod 重建不会丢失前端添加的 Skill。

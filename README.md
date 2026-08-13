@@ -1,22 +1,31 @@
-# Flawless
+# CISRE
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](#quick-start)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)](#development)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-ready-326CE5?logo=kubernetes&logoColor=white)](#kubernetes-deployment)
-[![Docker](https://img.shields.io/badge/Docker-flawless-2496ED?logo=docker&logoColor=white)](#docker)
+[![Docker](https://img.shields.io/badge/Docker-CISRE-2496ED?logo=docker&logoColor=white)](#docker)
 [![Langfuse](https://img.shields.io/badge/Langfuse-optional-111827)](#langfuse)
 [![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-red)](#license)
 
 **Your infrastructure can explain itself, heal safely, and prove it recovered.**<br>
 **让基础设施自己解释故障、安全完成修复，并证明它真的恢复了。**
 
-**Flawless** is an AI-native SRE control plane for Kubernetes and cloud infrastructure. It connects alerts, evidence, topology, human approval, controlled remediation, and recovery verification in one auditable AgenticOps loop.
+**CISRE** (Cloud Infrastructure Site Reliability Engine) is an AI-native reliability control plane for Kubernetes and cloud infrastructure. It connects alerts, evidence, topology, human approval, controlled remediation, and recovery verification in one auditable AgenticOps loop.
 
-它不是另一个只会给建议的运维聊天框。Flawless 将“发现问题、收集证据、生成预演、人工授权、执行变更、恢复验证、经验沉淀”连接成一个可审计闭环。
+它不是另一个只会给建议的运维聊天框。CISRE 将“发现问题、收集证据、生成预演、人工授权、执行变更、恢复验证、经验沉淀”连接成一个可审计闭环。
 
-Maintained by the **Flawless Contributors** community.
+Maintained by the **CISRE Contributors** community.
 
-Current release: **5.2.0**.
+Current release: **5.3.0**.
+
+本版本的总体架构、Harness 融合、Kubernetes 写后回读、拓扑性能和国产全栈适配合同见
+[`docs/CISRE_ARCHITECTURE_ZH.md`](docs/CISRE_ARCHITECTURE_ZH.md)。
+
+Release 5.3.0 introduces the CISRE brand and `CISREDurableHarness/v2`, proves
+every Kubernetes Workload mutation with same-transport read-after-write field
+matching, defaults the optimized 3D topology to automatic orbit, and opens
+credential-free inventory/discovery contracts for Alibaba Cloud and other
+domestic cloud, database, middleware, storage and virtualization providers.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
@@ -36,7 +45,7 @@ The default view shows only incidents whose recovery contract passed, with a
 clear problem title, target, Skill, completion time and recovered Pod count.
 Opening a record reveals the root cause, strategy history, approved changes,
 patch details and recovery proof; diagnosis-only and failed attempts no longer
-obscure what Flawless actually solved.
+obscure what CISRE actually solved.
 
 Release 5.0.8 deliberately uses the 5.0.4 code path as its base and changes only
 post-change recovery verification. Diagnosis, Skill routing and approval keep
@@ -82,7 +91,7 @@ against a real K3s controller for canary pause, status-subresource promotion,
 automatic abort, capacity recovery, and desired-state restoration.
 
 The same release also closes a post-remediation evidence gap: after a
-Deployment rollout deletes the originally selected Pod, Flawless now resolves
+Deployment rollout deletes the originally selected Pod, CISRE now resolves
 the replacement Pod through Workload ownership, records the old-to-new Pod
 lineage, and continues collecting current/previous logs for diagnosis and
 recovery verification.  This applies to both Rancher proxy and directly
@@ -167,7 +176,7 @@ Modern cloud systems fail in ways that are hard to reason about from a single lo
 - repeated human firefighting leaves valuable operational knowledge outside the platform;
 - model output is useful only when it is constrained by evidence, policy, permissions, and rollback.
 
-Flawless is built as an SRE control plane. It uses a model as a planner and explainer, but the platform keeps the execution boundary: RBAC, action catalog, dry-run, approval, audit, and recovery verification.
+CISRE is built as an SRE control plane. It uses a model as a planner and explainer, but the platform keeps the execution boundary: RBAC, action catalog, dry-run, approval, audit, and recovery verification.
 
 ## Core Features
 
@@ -220,7 +229,7 @@ You need Git, plus either:
 
 Each operating-system installer pulls only the canonical `main` branch, safely
 fast-forwards an existing clean checkout, verifies that `HEAD` exactly matches
-`origin/main`, and starts Flawless with Docker.
+`origin/main`, and starts CISRE with Docker.
 
 #### macOS (Docker Desktop)
 
@@ -494,7 +503,7 @@ For production, use your company Ingress/Gateway with TLS and identity middlewar
 
 ## Model Configuration
 
-Flawless supports two common model access patterns.
+CISRE supports two common model access patterns.
 
 ### OAuth Token URL + Base URL
 
@@ -685,7 +694,7 @@ runtime and are intentionally excluded from the public repository.
 
 ## Roadmap
 
-Flawless is designed to grow from a Kubernetes SRE console into an AgenticOps operating system for modern infrastructure.
+CISRE is designed to grow from a Kubernetes SRE console into an AgenticOps operating system for modern infrastructure.
 
 - **Kubernetes Autopilot**: cover the full lifecycle from alert, evidence, root-cause analysis, remediation preview, approval, execution, rollback, and recovery verification.
 - **Rancher Multi-Cluster Fleet**: make every cluster, namespace, workload, event, metric, and operation record searchable and governable from one control plane.

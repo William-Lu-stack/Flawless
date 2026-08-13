@@ -1,4 +1,4 @@
-"""Flawless 控制面的兼容运行时与应用装配模块。
+"""CISRE 控制面的兼容运行时与应用装配模块。
 
 历史接口实现暂时保留在这里，以保证生产行为和测试契约不因目录迁移而改变。
 HTTP 路由、请求模型和新增业务必须分别放入 ``api/features``、``schemas`` 和
@@ -66,9 +66,11 @@ from agents.runtime_resilience import AsyncBulkhead, BulkheadRejected, TTLCache,
 from cloud.adapters import cloud_adapters_payload
 from backend.app.services.knowledge_files import extract_knowledge_file
 from backend.app.services.infrastructure_providers import (
+    discover_adapter_resources as discover_infrastructure_adapter_resources,
     providers_payload as infrastructure_providers_payload,
     redact_sensitive as redact_infrastructure_sensitive,
     scan_resources as scan_infrastructure_provider_resources,
+    sync_inventory as sync_infrastructure_inventory,
 )
 from backend.app.services.external_traffic import build_external_traffic_payload
 from backend.app.services.ebpf_flows import normalize_observed_flow_payload
@@ -117,6 +119,8 @@ from backend.app.schemas.operations import (
     AlertScanRequest,
     ExternalTrafficFlowRequest,
     InfrastructureScanRequest,
+    InfrastructureDiscoveryRequest,
+    InfrastructureInventorySyncRequest,
     InspectionPreviewRequest,
     InspectionRequest,
     MCPToolRequest,
@@ -149,7 +153,7 @@ def _csv_env(name: str, default: str = "") -> list[str]:
 
 
 app = FastAPI(
-    title="flawless Control Plane API",
+    title="CISRE Control Plane API",
     version="2.0",
     docs_url=None if _env_bool("DISABLE_OPENAPI_DOCS", "true") else "/docs",
     redoc_url=None if _env_bool("DISABLE_OPENAPI_DOCS", "true") else "/redoc",
@@ -207,8 +211,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.2.0")
-APP_CODE_SIGNATURE = "kubernetes-skill-closure-v28"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.3.0")
+APP_CODE_SIGNATURE = "cisre-durable-harness-v2-readback-v1"
 BUILTIN_SKILL_POLICY_REVISION = "3.0.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -238,7 +242,7 @@ async def startup_build_banner():
             headers={"Accept": "application/json"},
         )
     print(
-        f"FLAWLESS_BACKEND_BUILD version={APP_BUILD_VERSION} "
+        f"CISRE_BACKEND_BUILD version={APP_BUILD_VERSION} "
         f"signature={APP_CODE_SIGNATURE} skill_policy={BUILTIN_SKILL_POLICY_REVISION}",
         flush=True,
     )
@@ -331,6 +335,8 @@ def _admin_write_route(request: Request) -> bool:
     if request.method == "DELETE" and path.startswith("/api/knowledge/documents/"):
         return True
     if path in {"/api/ops/skills", "/api/ops/skills/import"}:
+        return True
+    if path in {"/api/infrastructure/resources/sync", "/api/infrastructure/discover"}:
         return True
     if path.startswith("/api/ops/skills/") and (request.method == "DELETE" or path.endswith("/delete")):
         return True
@@ -503,7 +509,7 @@ async def request_bulkhead_middleware(request: Request, call_next):
             return _security_headers(JSONResponse(
                 status_code=401,
                 content={"status": "unauthorized", "error": "console authentication required"},
-                headers={"WWW-Authenticate": 'Basic realm="flawless SRE Console"'},
+                headers={"WWW-Authenticate": 'Basic realm="CISRE"'},
             ))
         if _admin_write_route(request) and not _request_is_admin(request):
             mode_enabled = _env_bool("CONSOLE_ADMIN_MODE", "false")
@@ -514,11 +520,11 @@ async def request_bulkhead_middleware(request: Request, call_next):
                     "error": (
                         "管理员身份校验失败"
                         if mode_enabled else
-                        "CONSOLE_ADMIN_MODE=false，模型、知识库和 Skill 写入已关闭"
+                        "CONSOLE_ADMIN_MODE=false，模型、知识库、Skill 与基础设施接入写入已关闭"
                     ),
                     "admin_mode": mode_enabled,
                 },
-                headers={"WWW-Authenticate": 'Basic realm="Flawless SRE Admin"'} if mode_enabled else {},
+                headers={"WWW-Authenticate": 'Basic realm="CISRE Admin"'} if mode_enabled else {},
             ))
         if not _rate_limit_allowed(request):
             return _security_headers(JSONResponse(
@@ -1443,7 +1449,7 @@ async def _route_chat_intent(req: ChatRequest) -> dict:
         return _fallback_chat_intent(req, "llm_intent_router_disabled")
 
     scope = _chat_scope(req)
-    prompt = f"""你是 flawless SRE Copilot 的意图路由器。请判断用户输入应该进入哪条链路：
+    prompt = f"""你是 CISRE（Cloud Infrastructure Site Reliability Engine）的意图路由器。请判断用户输入应该进入哪条链路：
 
 1. sre：任何可能和运维、SRE、DevOps、云、Kubernetes、Rancher、容器、应用稳定性、故障排查、发布变更、容量、性能、网络、存储、安全、日志、监控、告警、拓扑影响、中间件、数据库、云资源有关的问题。
 2. general：明确和运维无关的普通聊天、写作、翻译、生活、创意类问题。
@@ -1553,7 +1559,7 @@ async def _general_chat_response(req: ChatRequest, intent: dict | None = None) -
         metadata={"intent_router": intent or {}},
         prompt_name="flawless.chat.general.v1",
     )
-    prompt = f"""你是 flawless SRE Copilot。用户的问题不一定和 Kubernetes 运维有关。
+    prompt = f"""你是 CISRE SRE Copilot。用户的问题不一定和 Kubernetes 运维有关。
 如果问题和 K8S/SRE 无关，请直接用自然、清晰、专业的方式回答，不要强行生成故障诊断、修复流程或 Kubernetes 操作。
 如果问题需要澄清，可以简短说明。
 
@@ -2597,7 +2603,7 @@ async def ask_knowledge(req: KnowledgeAskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
     docs, retrieval_source = await _retrieve_knowledge(question, req.domain, use_vector=req.use_vector)
-    prompt = f"""你是 Flawless 的产品使用与运维知识库助手。请基于检索片段回答用户问题。
+    prompt = f"""你是 CISRE 的产品使用与运维知识库助手。请基于检索片段回答用户问题。
 要求：
 - 中文，简洁，直接告诉用户怎么做。
 - 如果用户问原理，才解释原理；否则只给操作步骤。
@@ -6932,7 +6938,13 @@ def _safe_workload_evidence(raw: dict) -> dict:
         })
     return {
         "apiVersion": raw.get("apiVersion"), "kind": kind,
-        "metadata": {"name": metadata.get("name"), "namespace": metadata.get("namespace"), "generation": metadata.get("generation")},
+        "metadata": {
+            "name": metadata.get("name"),
+            "namespace": metadata.get("namespace"),
+            "uid": metadata.get("uid"),
+            "resourceVersion": metadata.get("resourceVersion"),
+            "generation": metadata.get("generation"),
+        },
         "spec": {
             "replicas": spec.get("replicas"),
             "completions": spec.get("completions"),
@@ -6940,7 +6952,9 @@ def _safe_workload_evidence(raw: dict) -> dict:
             "suspend": spec.get("suspend"),
             "schedule": spec.get("schedule"),
             "strategy": spec.get("strategy"),
-            "template": {"spec": {
+            "template": {
+                "metadata": {"annotations": ((spec.get("template") or {}).get("metadata") or {}).get("annotations", {})},
+                "spec": {
             "containers": containers, "volumes": pod_spec.get("volumes", []), "securityContext": pod_spec.get("securityContext", {}),
             "imagePullSecrets": pod_spec.get("imagePullSecrets", []), "nodeSelector": pod_spec.get("nodeSelector", {}),
             "tolerations": pod_spec.get("tolerations", []), "affinity": pod_spec.get("affinity", {}),
@@ -7373,7 +7387,7 @@ def _ops_namespace_guard(plan: dict) -> dict:
                 "把目标 namespace 加入 ConfigMap k8s-agent-config 的 "
                 "ALLOWED_NAMESPACES（逗号分隔），或在明确接受全局纳管边界时设为 all。"
             ),
-            "重启 flawless Agents/MCP 与 k8s-agent-api，使新的白名单同时生效。",
+            "重启 CISRE Agents/MCP 与 k8s-agent-api，使新的白名单同时生效。",
             "重新运行同一运维任务；原人工审批不会跨配置变更复用。",
         ],
     }
@@ -9386,8 +9400,48 @@ async def _execute_change(change: dict, plan: dict) -> dict:
             "result": {"error": action_reason, "requires_high_risk_confirmation": "high risk" in action_reason},
         }
 
+    mutation_before: dict = {}
+    mutation_already_applied = False
+    if ctype in workload_change_types and ctype != "replace_immutable_workload":
+        try:
+            mutation_before, mutation_transport = await _read_live_workload_after_change(plan, change)
+            expected_before = _canonical_workload_patch(plan, change)
+            before_mismatches = _compare_declared_patch(
+                expected_before,
+                _canonical_workload_view(plan, change, mutation_before),
+            )
+            # Restart is intentionally never deduplicated: its desired state is
+            # a fresh timestamp even when an older restart annotation exists.
+            mutation_already_applied = bool(not before_mismatches and ctype != "restart")
+            change["_mutation_precondition"] = {
+                "transport": mutation_transport,
+                "uid": (mutation_before.get("metadata") or {}).get("uid"),
+                "resource_version": (mutation_before.get("metadata") or {}).get("resourceVersion"),
+                "generation": (mutation_before.get("metadata") or {}).get("generation"),
+                "already_applied": mutation_already_applied,
+                "mismatches": before_mismatches[:20],
+            }
+        except Exception as exc:
+            return {
+                "change": _redact_sensitive(change),
+                "status": "failed",
+                "result": {
+                    "error": (
+                        "Kubernetes 写前无法回读精确目标；为防止改错集群或 Workload，"
+                        f"本轮未发送变更：{type(exc).__name__}: {_redact_text(str(exc))}"
+                    ),
+                    "mutation_precondition_failed": True,
+                },
+            }
+
     try:
-        if ctype in progressive_change_types:
+        if mutation_already_applied:
+            result = {
+                "operation": "already_applied",
+                "message": "实时 Workload 已与审批 Patch 一致；未重复提交相同变更。",
+                "metadata": mutation_before.get("metadata") or {},
+            }
+        elif ctype in progressive_change_types:
             result = await _execute_progressive_change(
                 change,
                 plan,
@@ -9558,20 +9612,16 @@ async def _execute_change(change: dict, plan: dict) -> dict:
         elif use_managed_cluster and ctype in workload_change_types:
             manifest_kind = str(workload_type or "Deployment")
             api_version = _workload_api_version(manifest_kind)
-            patch = _materialize_patch(change.get("patch") or {})
-            if ctype == "restart":
-                patch = _materialize_patch({"spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": "<now>"}}}}})
-            elif ctype == "scale_out":
-                patch = {"spec": {"replicas": int(change.get("replicas") or 2)}}
+            canonical_patch = _canonical_workload_patch(plan, change)
             valid, reason = _validate_workload_patch(
-                patch,
+                canonical_patch,
                 allow_volume_patch=ctype == "patch_workload_volume",
                 allow_init_containers=operator_confirmed,
             )
             if not valid:
                 result = {"error": f"patch rejected by safety policy: {reason}"}
             else:
-                patch = _workload_patch_for_kind(manifest_kind, patch)
+                patch = _expected_workload_patch(plan, change)
                 result = await asyncio.to_thread(
                     CLUSTER_REGISTRY.patch_resource,
                     cluster_id,
@@ -9614,21 +9664,16 @@ async def _execute_change(change: dict, plan: dict) -> dict:
         elif _is_infrastructure_action(str(ctype)):
             result = await _execute_infrastructure_action(change, plan)
         elif use_rancher and ctype in workload_change_types:
-            patch = _materialize_patch(change.get("patch") or {})
-            if ctype == "restart":
-                patch = {"spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": "<now>"}}}}}
-                patch = _materialize_patch(patch)
-            elif ctype == "scale_out":
-                patch = {"spec": {"replicas": int(change.get("replicas") or 2)}}
+            canonical_patch = _canonical_workload_patch(plan, change)
             valid, reason = _validate_workload_patch(
-                patch,
+                canonical_patch,
                 allow_volume_patch=ctype == "patch_workload_volume",
                 allow_init_containers=operator_confirmed,
             )
             if not valid:
                 result = {"error": f"patch rejected by safety policy: {reason}"}
             else:
-                patch = _workload_patch_for_kind(workload_type, patch)
+                patch = _expected_workload_patch(plan, change)
                 result = await _rancher_k8s_patch(
                     cluster_id,
                     _workload_api_path(workload_type, namespace, workload_name),
@@ -9755,28 +9800,21 @@ async def _execute_change(change: dict, plan: dict) -> dict:
                 timeout=35,
             )
         elif ctype == "restart":
-            if str(workload_type).lower() == "deployment":
-                result = await _call_mcp_tool("restart_deployment", {
-                    "namespace": namespace,
-                    "deployment_name": workload_name,
-                    "dry_run": False,
-                })
-            else:
-                patch = _materialize_patch(change.get("patch") or {})
-                valid, reason = _validate_workload_patch(patch, allow_init_containers=operator_confirmed)
-                if not valid:
-                    return {
-                        "change": _redact_sensitive(change),
-                        "status": "failed",
-                        "result": {"error": f"patch rejected by safety policy: {reason}"},
-                    }
-                result = await _call_mcp_tool("patch_workload", {
-                    "namespace": namespace,
-                    "workload_type": workload_type,
-                    "workload_name": workload_name,
-                    "patch": patch,
-                    "dry_run": False,
-                })
+            patch = _canonical_workload_patch(plan, change)
+            valid, reason = _validate_workload_patch(patch, allow_init_containers=operator_confirmed)
+            if not valid:
+                return {
+                    "change": _redact_sensitive(change),
+                    "status": "failed",
+                    "result": {"error": f"patch rejected by safety policy: {reason}"},
+                }
+            result = await _call_mcp_tool("patch_workload", {
+                "namespace": namespace,
+                "workload_type": workload_type,
+                "workload_name": workload_name,
+                "patch": patch,
+                "dry_run": False,
+            })
         elif ctype == "replace_immutable_workload":
             result = await _call_mcp_tool("replace_immutable_workload", {
                 "namespace": namespace,
@@ -9786,7 +9824,7 @@ async def _execute_change(change: dict, plan: dict) -> dict:
                 "dry_run": False,
             })
         elif ctype in {"patch_workload", "patch_workload_volume", "patch_workload_runtime_security", "patch", "rollback_workload"}:
-            patch = _materialize_patch(change.get("patch") or {})
+            patch = _canonical_workload_patch(plan, change)
             valid, reason = _validate_workload_patch(
                 patch,
                 allow_volume_patch=ctype == "patch_workload_volume",
@@ -9849,29 +9887,21 @@ async def _execute_change(change: dict, plan: dict) -> dict:
                 "dry_run": False,
             })
         elif ctype == "scale_out":
-            if str(workload_type).lower() == "deployment":
-                result = await _call_mcp_tool("scale_deployment", {
-                    "namespace": namespace,
-                    "deployment_name": workload_name,
-                    "replicas": int(change.get("replicas") or 2),
-                    "dry_run": False,
-                })
-            else:
-                patch = {"spec": {"replicas": int(change.get("replicas") or 2)}}
-                valid, reason = _validate_workload_patch(patch, allow_init_containers=operator_confirmed)
-                if not valid:
-                    return {
-                        "change": _redact_sensitive(change),
-                        "status": "failed",
-                        "result": {"error": f"patch rejected by safety policy: {reason}"},
-                    }
-                result = await _call_mcp_tool("patch_workload", {
-                    "namespace": namespace,
-                    "workload_type": workload_type,
-                    "workload_name": workload_name,
-                    "patch": patch,
-                    "dry_run": False,
-                })
+            patch = _canonical_workload_patch(plan, change)
+            valid, reason = _validate_workload_patch(patch, allow_init_containers=operator_confirmed)
+            if not valid:
+                return {
+                    "change": _redact_sensitive(change),
+                    "status": "failed",
+                    "result": {"error": f"patch rejected by safety policy: {reason}"},
+                }
+            result = await _call_mcp_tool("patch_workload", {
+                "namespace": namespace,
+                "workload_type": workload_type,
+                "workload_name": workload_name,
+                "patch": patch,
+                "dry_run": False,
+            })
         elif ctype == "recreate_pod":
             result = await _call_mcp_tool("recreate_pod", {
                 "namespace": namespace,
@@ -9942,6 +9972,41 @@ async def _execute_change(change: dict, plan: dict) -> dict:
             "type": type(e).__name__,
             "trace": _redact_text(traceback.format_exc(limit=4)),
         }
+
+    if (
+        isinstance(result, dict)
+        and not result.get("error")
+        and ctype in workload_change_types
+        and ctype != "replace_immutable_workload"
+    ):
+        try:
+            postcondition = await _verify_workload_mutation_postcondition(plan, change, result)
+        except Exception as exc:
+            postcondition = {
+                "required": True,
+                "verified": False,
+                "error": f"写后回读失败：{type(exc).__name__}: {_redact_text(str(exc))}",
+            }
+        before_metadata = mutation_before.get("metadata") or {}
+        postcondition["before_resource_version"] = before_metadata.get("resourceVersion")
+        postcondition["before_generation"] = before_metadata.get("generation")
+        postcondition["already_applied"] = mutation_already_applied
+        after_rv = str(postcondition.get("resource_version") or "")
+        before_rv = str(before_metadata.get("resourceVersion") or "")
+        if (
+            postcondition.get("verified") is True
+            and not mutation_already_applied
+            and before_rv
+            and after_rv
+            and before_rv == after_rv
+        ):
+            postcondition.update({
+                "verified": False,
+                "error": "审批 Patch 字段看似匹配，但 resourceVersion 未变化，无法证明本次写操作真实生效。",
+            })
+        result["mutation_postcondition"] = postcondition
+        if postcondition.get("verified") is not True:
+            result["error"] = postcondition.get("error") or "Kubernetes workload mutation postcondition failed"
 
     outcome = {
         "change": _redact_sensitive(change),
@@ -10611,6 +10676,173 @@ def _live_workload_postcondition(plan: dict, workload: dict) -> tuple[bool | Non
     if mismatches:
         return False, "实时 Workload YAML 未完整落地审批 Patch：" + "; ".join(mismatches[:12])
     return True, "实时 Workload YAML 已逐字段匹配本轮审批 Patch"
+
+
+async def _read_live_workload_after_change(
+    plan: dict,
+    change: dict,
+) -> tuple[dict, str]:
+    """Read the exact workload through the same transport used for mutation."""
+    namespace = str(change.get("namespace") or plan.get("namespace") or "default")
+    workload_type = str(
+        change.get("workload_type")
+        or change.get("kind")
+        or _workload_identity_from_plan(plan)[1]
+        or "Deployment"
+    )
+    workload_name = str(
+        change.get("workload_name")
+        or change.get("name")
+        or _workload_identity_from_plan(plan)[2]
+        or ""
+    )
+    cluster_id = str(change.get("cluster_id") or plan.get("cluster_id") or "local")
+    if not workload_name:
+        raise RuntimeError("postcondition read requires workload_name")
+    transport = _ops_cluster_transport({**plan, "cluster_id": cluster_id})
+    if transport == "kubeconfig":
+        raw = await asyncio.to_thread(
+            CLUSTER_REGISTRY.read_resource,
+            cluster_id,
+            api_version=_workload_api_version(workload_type),
+            kind=workload_type,
+            name=workload_name,
+            namespace=namespace,
+        )
+        return raw, transport
+    if transport == "rancher":
+        raw = await _rancher_k8s_get(
+            cluster_id,
+            _workload_api_path(workload_type, namespace, workload_name),
+            timeout=25,
+        )
+        return raw, transport
+    if transport == "managed_unavailable":
+        raise RuntimeError(f"managed kubeconfig cluster {cluster_id!r} is no longer registered")
+    payload = await _call_mcp_tool("get_workload", {
+        "namespace": namespace,
+        "workload_type": workload_type,
+        "workload_name": workload_name,
+    })
+    if not isinstance(payload, dict) or payload.get("error"):
+        raise RuntimeError(str((payload or {}).get("error") or "MCP did not return workload"))
+    raw = payload.get("workload") or {}
+    if not raw:
+        raise RuntimeError("MCP returned an empty workload")
+    return raw, transport
+
+
+def _canonical_workload_patch(plan: dict, change: dict) -> dict:
+    materialized = change.get("_materialized_canonical_workload_patch")
+    if isinstance(materialized, dict) and materialized:
+        return copy.deepcopy(materialized)
+    ctype = str(change.get("type") or "")
+    expected_patch = copy.deepcopy(change.get("patch") or {})
+    if ctype == "scale_out":
+        expected_patch = {"spec": {"replicas": int(change.get("replicas") or 2)}}
+    elif ctype == "restart" and not expected_patch:
+        expected_patch = {"spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": "<now>"}}}}}
+    expected_patch = _materialize_patch(expected_patch)
+    change["_materialized_canonical_workload_patch"] = copy.deepcopy(expected_patch)
+    return expected_patch
+
+
+def _canonical_workload_view(plan: dict, change: dict, workload: dict) -> dict:
+    """Project raw Kubernetes and MCP evidence into the canonical template shape."""
+    kind = str(
+        change.get("workload_type")
+        or change.get("kind")
+        or _workload_identity_from_plan(plan)[1]
+        or ""
+    ).lower()
+    spec = copy.deepcopy((workload or {}).get("spec") or {})
+    if kind in {"pod", "pods"}:
+        return {"spec": {"template": {"spec": spec}}}
+    if kind in {"cronjob", "cronjobs"}:
+        template = spec.get("template") or (
+            (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template"))
+            or {}
+        )
+        canonical_spec = copy.deepcopy(spec)
+        canonical_spec["template"] = template
+        return {"spec": canonical_spec}
+    return {"spec": spec}
+
+
+def _expected_workload_patch(plan: dict, change: dict) -> dict:
+    materialized = change.get("_materialized_workload_patch")
+    if isinstance(materialized, dict) and materialized:
+        return copy.deepcopy(materialized)
+    expected_patch = _workload_patch_for_kind(
+        str(change.get("workload_type") or change.get("kind") or _workload_identity_from_plan(plan)[1]),
+        _canonical_workload_patch(plan, change),
+    )
+    # Freeze the exact approved payload.  Execution and read-after-write must
+    # compare the same timestamp/default expansion instead of regenerating it.
+    change["_materialized_workload_patch"] = copy.deepcopy(expected_patch)
+    return expected_patch
+
+
+async def _verify_workload_mutation_postcondition(
+    plan: dict,
+    change: dict,
+    raw_result: dict,
+) -> dict:
+    """Prove that an accepted write reached the intended live Kubernetes object.
+
+    A 2xx response only proves API admission.  Completion additionally requires
+    a read-after-write from the same transport and exact matching of every
+    approved patch field.  This closes the class of false-positive receipts
+    where a wrong cluster/target or a non-persisted patch was reported as done.
+    """
+    ctype = str(change.get("type") or "")
+    if ctype not in WORKLOAD_PATCH_CHANGE_TYPES or ctype == "replace_immutable_workload":
+        return {"required": False, "verified": None}
+    expected_patch = _canonical_workload_patch(plan, change)
+    if not expected_patch:
+        return {
+            "required": True,
+            "verified": False,
+            "error": "approved workload change has no verifiable declarative patch",
+        }
+    live, transport = await _read_live_workload_after_change(plan, change)
+    mismatches = _compare_declared_patch(
+        expected_patch,
+        _canonical_workload_view(plan, change, live),
+    )
+    metadata = live.get("metadata") or {}
+    result_metadata = raw_result.get("metadata") if isinstance(raw_result, dict) else {}
+    expected_uid = str((result_metadata or {}).get("uid") or "")
+    actual_uid = str(metadata.get("uid") or "")
+    if expected_uid and actual_uid and expected_uid != actual_uid:
+        mismatches.insert(0, f"metadata.uid: API returned {expected_uid}, read-back found {actual_uid}")
+    receipt = {
+        "required": True,
+        "verified": not mismatches,
+        "transport": transport,
+        "cluster_id": str(change.get("cluster_id") or plan.get("cluster_id") or "local"),
+        "namespace": str(change.get("namespace") or plan.get("namespace") or "default"),
+        "target": (
+            f"{change.get('workload_type') or change.get('kind') or _workload_identity_from_plan(plan)[1]}/"
+            f"{change.get('workload_name') or change.get('name') or _workload_identity_from_plan(plan)[2]}"
+        ),
+        "uid": actual_uid,
+        "resource_version": metadata.get("resourceVersion"),
+        "generation": metadata.get("generation"),
+        "observed_generation": (live.get("status") or {}).get("observedGeneration"),
+        "expected_patch_digest": hashlib.sha256(
+            json.dumps(expected_patch, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:20],
+        "mismatches": mismatches[:20],
+        "message": (
+            "Kubernetes 写后回读已逐字段匹配审批 Patch。"
+            if not mismatches else
+            "Kubernetes API 已返回，但实时 Workload 没有完整落地审批 Patch。"
+        ),
+    }
+    if mismatches:
+        receipt["error"] = receipt["message"] + " " + "; ".join(mismatches[:8])
+    return receipt
 
 
 def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) -> dict:
@@ -17101,6 +17333,44 @@ async def infrastructure_providers():
     return infrastructure_providers_payload()
 
 
+async def sync_infrastructure_resources(req: InfrastructureInventorySyncRequest):
+    try:
+        result = await asyncio.to_thread(
+            sync_infrastructure_inventory,
+            req.resources,
+            provider=req.provider,
+            source=req.source,
+            replace=req.replace,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _safe_audit_event(
+        "infrastructure.inventory.sync",
+        "console-admin",
+        f"{req.provider}/{req.source}",
+        "completed",
+        accepted=result.get("accepted"),
+        total=result.get("total"),
+        replace=req.replace,
+    )
+    return result
+
+
+async def discover_infrastructure_resources(req: InfrastructureDiscoveryRequest):
+    try:
+        return await discover_infrastructure_adapter_resources(
+            req.adapter_id,
+            resource_types=req.resource_types,
+            regions=req.regions,
+            account_ref=req.account_ref,
+            persist=req.persist,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"infrastructure discovery adapter failed: {type(exc).__name__}") from exc
+
+
 async def _enrich_infrastructure_findings_with_llm(payload: dict, model_profile_id: str = "") -> dict:
     findings = [item for item in payload.get("findings") or [] if isinstance(item, dict)]
     if not findings or not _env_bool("INFRASTRUCTURE_LLM_PLANNER_ENABLED", "true"):
@@ -17202,7 +17472,7 @@ async def ops_capabilities():
     skills = OPS_SKILL_REGISTRY.list()
     return {
         "status": "ok",
-        "planner": "ResumableSREHarness/v1 + DeepSeekRootCauseSkillRouter/v1 + UnifiedExecutableOpsSkillRuntime/v1 + ApprovalGate + RecoveryVerifier",
+        "planner": "CISREDurableHarness/v2 + DeepSeekRootCauseSkillRouter/v1 + UnifiedExecutableOpsSkillRuntime/v1 + ApprovalGate + ReadAfterWriteVerifier + RecoveryVerifier",
         "executable_skill_handlers": public_runtime_catalog(),
         "actions": action_catalog_payload(),
         "skill_options": skill_option_catalog(),
@@ -18871,6 +19141,7 @@ async def mcp_call(req: MCPToolRequest):
                 list_pods,
                 get_pod_events,
                 get_pod_logs,
+                get_workload,
                 get_pod_diagnostics,
                 list_nodes,
                 list_pod_metrics,
@@ -18910,6 +19181,7 @@ async def mcp_call(req: MCPToolRequest):
             "list_pods": list_pods,
             "get_pod_events": get_pod_events,
             "get_pod_logs": get_pod_logs,
+            "get_workload": get_workload,
             "get_pod_diagnostics": get_pod_diagnostics,
             "list_nodes": list_nodes,
             "list_pod_metrics": list_pod_metrics,
@@ -19698,7 +19970,7 @@ if __name__ == "__main__":
     port = int(os.getenv("FRONTEND_PORT", "8080"))
     print(f"""
 ╔══════════════════════════════════════════════════╗
-║     flawless Control Plane API                ║
+║     CISRE Control Plane API                  ║
 ║     访问: http://localhost:{port}                    ║
 ╚══════════════════════════════════════════════════╝
 """)

@@ -11,7 +11,7 @@ type CacheEntry = {
 
 const getCache = new Map<string, CacheEntry>();
 const pendingGets = new Map<string, Promise<unknown>>();
-const ADMIN_AUTH_KEY = "flawless-admin-basic";
+const ADMIN_AUTH_KEY = "cisre-admin-basic";
 
 export function adminAuthHeaders(extra: Record<string, string> = {}) {
   const token = window.sessionStorage.getItem(ADMIN_AUTH_KEY) || "";
@@ -19,12 +19,14 @@ export function adminAuthHeaders(extra: Record<string, string> = {}) {
 }
 
 export function setAdminCredentials(username: string, password: string) {
+  window.sessionStorage.removeItem("flawless-admin-basic");
   window.sessionStorage.setItem(ADMIN_AUTH_KEY, window.btoa(`${username}:${password}`));
   invalidateApiCache();
 }
 
 export function clearAdminCredentials() {
   window.sessionStorage.removeItem(ADMIN_AUTH_KEY);
+  window.sessionStorage.removeItem("flawless-admin-basic");
   invalidateApiCache();
 }
 

@@ -19,8 +19,8 @@ if (-not $OutputDirectory) {
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
 $replacements = [ordered]@{
-    "ghcr.dockerproxy.net/your-org/flawless:5.2.0" = "$registry/k8s-agent:5.2.0"
-    "ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36" = "$registry/k8s-agent-node-exec:1.36"
+    "ghcr.dockerproxy.net/your-org/cisre:5.3.0" = "$registry/k8s-agent:5.3.0"
+    "ghcr.dockerproxy.net/your-org/cisre-node-exec:1.36" = "$registry/k8s-agent-node-exec:1.36"
     "registry.cn-hangzhou.aliyuncs.com/google_containers/prometheus:v2.45.0" = "$registry/k8s-agent-prometheus:v2.45.0"
     "m.daocloud.io/registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.1" = "$registry/k8s-agent-kube-state-metrics:v2.10.1"
     "m.daocloud.io/docker.io/grafana/loki:3.7.3" = "$registry/k8s-agent-loki:3.7.3"

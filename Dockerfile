@@ -1,15 +1,15 @@
 # ============================================================
-# Dockerfile — Flawless
+# Dockerfile — CISRE
 # 必须在包含 Dockerfile、frontend/、requirements.lock 的项目根目录执行。
-# 构建: docker build -t <your-registry>/flawless:latest .
-# 推送: docker push <your-registry>/flawless:latest
+# 构建: docker build -t <your-registry>/cisre:latest .
+# 推送: docker push <your-registry>/cisre:latest
 # 国内网络构建:
 # docker build \
 #   --build-arg PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.13-slim \
 #   --build-arg NGINX_IMAGE=docker.m.daocloud.io/nginxinc/nginx-unprivileged:stable-alpine3.23 \
 #   --build-arg DEBIAN_MIRROR=https://mirrors.aliyun.com/debian \
 #   --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
-#   -t <your-registry>/flawless:latest .
+#   -t <your-registry>/cisre:latest .
 # ============================================================
 
 ARG NODE_IMAGE=node:24-slim

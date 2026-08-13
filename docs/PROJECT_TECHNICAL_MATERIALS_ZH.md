@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：5.2.0
+版本：5.3.0
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -297,7 +297,7 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-5.2.0 已完成：
+5.3.0 已完成：
 
 - Python 全量测试：229 passed + 25 subtests（含 11 个常见 Kubernetes 可执行 Skill 的统一执行契约矩阵）；标准库 unittest 门禁为 229 tests。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。

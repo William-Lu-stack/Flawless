@@ -27,13 +27,13 @@ class CloudAdapterSpec:
 
 DEFAULT_ADAPTERS = [
     CloudAdapterSpec("rancher", "private-cloud", "Rancher Multi-Cluster", True, ["kubernetes", "topology", "remediation"], "token", ["local"], "all-clusters", "namespace/workload allowlist + human approval"),
-    CloudAdapterSpec("generic-storage", "csi-storage", "Generic CSI Storage", False, ["storage", "csi", "metrics", "topology"], "secret-ref-or-service-account", ["example-region"], "storage-pool/cluster", "read-only discovery + explicit PVC/PV change approval"),
-    CloudAdapterSpec("virtualization-platform", "virtualization-platform", "Virtualization Platform", False, ["hci", "virtualization", "network", "storage", "security", "topology"], "api-token-or-service-account", ["example-dc"], "tenant/resource-pool", "tenant-scoped token + manual approval for infrastructure changes"),
-    CloudAdapterSpec("aliyun-ack", "aliyun", "Alibaba Cloud ACK", False, ["ack", "ecs", "slb", "arms", "sls", "cms"], "cloud-role-or-secret-ref", ["region-a", "region-b"], "resource-group", "RAM least privilege + change window"),
-    CloudAdapterSpec("aws-eks", "aws", "Amazon EKS", False, ["eks", "ec2", "elb", "cloudwatch", "xray"], "iam-role", ["ap-southeast-1"], "account/region", "IAM role + SCP guardrails"),
-    CloudAdapterSpec("azure-aks", "azure", "Azure AKS", False, ["aks", "vmss", "monitor", "app-insights"], "managed-identity", ["eastasia"], "subscription/resource-group", "Azure RBAC + policy"),
-    CloudAdapterSpec("gcp-gke", "gcp", "Google GKE", False, ["gke", "gce", "cloud-monitoring", "cloud-trace"], "workload-identity", ["asia-east1"], "project/region", "IAM + org policy"),
-    CloudAdapterSpec("openstack", "private-cloud", "OpenStack / VMware", False, ["compute", "network", "storage", "kubernetes"], "service-account", ["dc-1"], "tenant/project", "tenant-scoped account"),
+    CloudAdapterSpec("generic-storage", "csi-storage", "通用 CSI / NFS / Ceph", False, ["storage", "csi", "metrics", "topology"], "secret-ref-or-service-account", [], "storage-pool/cluster", "read-only discovery + explicit PVC/PV change approval"),
+    CloudAdapterSpec("domestic-hci", "private-cloud", "国产 HCI / 私有云", False, ["hci", "virtualization", "network", "storage", "security", "topology"], "api-token-or-service-account", [], "tenant/resource-pool", "tenant-scoped token + manual approval for infrastructure changes"),
+    CloudAdapterSpec("aliyun", "aliyun", "阿里云全栈资源", False, ["ack", "ecs", "rds", "polardb", "oceanbase", "slb", "nas", "oss", "arms", "sls", "cms", "rocketmq"], "ram-role-or-secret-ref", [], "account/resource-group/region", "RAM least privilege + read-only discovery + approved change window"),
+    CloudAdapterSpec("huawei-cloud", "huawei-cloud", "华为云", False, ["cce", "ecs", "rds", "gaussdb", "dcs", "elb", "obs", "cloud-eye", "lts"], "agency-or-secret-ref", [], "account/project/region", "IAM least privilege + approved change window"),
+    CloudAdapterSpec("tencent-cloud", "tencent-cloud", "腾讯云", False, ["tke", "cvm", "cdb", "tdsql", "clb", "cfs", "cos", "cls", "monitor"], "cam-role-or-secret-ref", [], "account/project/region", "CAM least privilege + approved change window"),
+    CloudAdapterSpec("domestic-database", "database", "国产数据库", False, ["oceanbase", "gaussdb", "tidb", "dameng", "kingbase", "gbase"], "external-secret", [], "instance/cluster", "read-only evidence + DBA approval for mutation"),
+    CloudAdapterSpec("openstack", "private-cloud", "OpenStack / 国产虚拟化", False, ["compute", "network", "storage", "kubernetes"], "service-account", [], "tenant/project", "tenant-scoped account + approval"),
 ]
 
 

@@ -114,7 +114,7 @@ def kubernetes_access_status() -> dict:
 def _k8s_url(path: str) -> str:
     if not _HOST:
         raise RuntimeError(
-            "Kubernetes access is not configured; provide a kubeconfig or run Flawless inside a cluster"
+            "Kubernetes access is not configured; provide a kubeconfig or run CISRE inside a cluster"
         )
     return f"{_HOST}{path}"
 
@@ -794,10 +794,18 @@ def _safe_workload_evidence(raw: dict) -> dict:
         })
     return {
         "apiVersion": raw.get("apiVersion"), "kind": raw.get("kind"),
-        "metadata": {"name": metadata.get("name"), "namespace": metadata.get("namespace"), "generation": metadata.get("generation")},
+        "metadata": {
+            "name": metadata.get("name"),
+            "namespace": metadata.get("namespace"),
+            "uid": metadata.get("uid"),
+            "resourceVersion": metadata.get("resourceVersion"),
+            "generation": metadata.get("generation"),
+        },
         "spec": {
             "replicas": spec.get("replicas"), "strategy": spec.get("strategy"),
-            "template": {"spec": {
+            "template": {
+                "metadata": {"annotations": (template.get("metadata") or {}).get("annotations", {})},
+                "spec": {
                 "containers": containers, "volumes": pod_spec.get("volumes", []),
                 "securityContext": pod_spec.get("securityContext", {}), "imagePullSecrets": pod_spec.get("imagePullSecrets", []),
                 "nodeSelector": pod_spec.get("nodeSelector", {}), "tolerations": pod_spec.get("tolerations", []),
@@ -806,6 +814,31 @@ def _safe_workload_evidence(raw: dict) -> dict:
         },
         "status": raw.get("status", {}),
     }
+
+
+@mcp.tool()
+def get_workload(namespace: str, workload_type: str, workload_name: str) -> dict:
+    """Read one workload after an approved mutation.
+
+    The response deliberately uses the same redacted operational projection as
+    diagnostics.  It is used by the control plane to prove that an accepted
+    Kubernetes PATCH really changed the intended object; Secret and literal
+    environment values are never returned.
+    """
+    try:
+        raw = _k8s_get(_workload_api_path(workload_type, namespace, workload_name))
+        return {
+            "status": "ok",
+            "workload": _safe_workload_evidence(raw),
+        }
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        return {"error": f"HTTP {exc.code}: {body or exc.reason}"}
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 @mcp.tool()

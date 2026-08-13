@@ -6,7 +6,7 @@ on:
       version:
         description: Immutable release tag to publish (for example 3.2.16)
         required: true
-        default: "5.2.0"
+        default: "5.3.0"
   push:
     tags:
       - "v*"
@@ -22,8 +22,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/flawless
-  NODE_EXEC_IMAGE_NAME: ${{ github.repository_owner }}/flawless-node-exec
+  IMAGE_NAME: ${{ github.repository_owner }}/cisre
+  NODE_EXEC_IMAGE_NAME: ${{ github.repository_owner }}/cisre-node-exec
 
 jobs:
   publish:
@@ -49,14 +49,16 @@ jobs:
         id: metadata
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/flawless
           tags: |
             type=raw,value=latest
             type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
             type=semver,pattern={{version}}
             type=sha,prefix=sha-,format=short
           labels: |
-            org.opencontainers.image.title=Flawless Kubernetes Agent
+            org.opencontainers.image.title=CISRE Kubernetes Agent
             org.opencontainers.image.description=Human-approved, skill-driven Kubernetes SRE agent suite
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.documentation=https://github.com/${{ github.repository }}
@@ -89,10 +91,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
+            ${{ env.REGISTRY }}/${{ steps.package-owner.outputs.value }}/cisre-node-exec:1.36
+            ${{ env.REGISTRY }}/${{ steps.package-owner.outputs.value }}/cisre-node-exec:latest
             ${{ env.REGISTRY }}/${{ steps.package-owner.outputs.value }}/flawless-node-exec:1.36
             ${{ env.REGISTRY }}/${{ steps.package-owner.outputs.value }}/flawless-node-exec:latest
           labels: |
-            org.opencontainers.image.title=Flawless Kubernetes Node Executor
+            org.opencontainers.image.title=CISRE Kubernetes Node Executor
             org.opencontainers.image.description=Short-lived executor used for explicitly approved Kubernetes node operations
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.documentation=https://github.com/${{ github.repository }}
@@ -117,8 +121,8 @@ jobs:
           set -euo pipefail
           short_sha="${GITHUB_SHA::7}"
           owner="${GITHUB_REPOSITORY_OWNER,,}"
-          app_image="ghcr.dockerproxy.net/${owner}/flawless:sha-${short_sha}"
-          node_image="ghcr.dockerproxy.net/${owner}/flawless-node-exec:1.36"
+          app_image="ghcr.dockerproxy.net/${owner}/cisre:sha-${short_sha}"
+          node_image="ghcr.dockerproxy.net/${owner}/cisre-node-exec:1.36"
 
           for image in "$app_image" "$node_image"; do
             pulled=false

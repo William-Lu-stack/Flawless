@@ -194,6 +194,8 @@ export function InfrastructurePage({ activeModelId = "" }: { activeModelId?: str
   const selectedFinding = findings.find((item: any) => item.id === selectedFindingId) || findings[0];
   const selectedPlan = selectedFinding?.ops_plan;
   const summary = scan.data?.summary || {};
+  const providerCatalog = list(providers.data?.provider_catalog);
+  const discoveryAdapters = list(providers.data?.adapters);
 
   async function runScan() {
     setScan({ loading: true });
@@ -233,6 +235,23 @@ export function InfrastructurePage({ activeModelId = "" }: { activeModelId?: str
       <Kpi label="中间件" value={providers.data?.summary?.by_type?.middleware || 0} detail="Kafka / MQ / ELK" />
       <Kpi label="本次异常" value={summary.total || 0} detail={`${summary.p1 || 0} P1 · ${summary.p2 || 0} P2`} tone={summary.total ? "danger" : "good"} />
       <Kpi label="受控执行器" value={providers.data?.summary?.action_webhook_configured ? "Ready" : "待配置"} detail="外部变更 Webhook" tone={providers.data?.summary?.action_webhook_configured ? "good" : ""} />
+    </section>
+    <section className="surface domestic-provider-surface">
+      <SectionHead icon={CloudCog} title="国产全栈适配矩阵" meta={`${providerCatalog.length} 类 Provider · ${discoveryAdapters.length} 个只读发现适配器`} />
+      <div className="domestic-provider-grid">
+        {providerCatalog.map((item: any) => <article key={item.id} className={item.recommended ? "recommended" : ""}>
+          <div><span className="resource-icon"><CloudCog size={15} /></span><strong>{item.name}</strong>{item.recommended && <StatusPill status="recommended" text="主力云" />}</div>
+          <small>{item.kind}</small>
+          <p>{list(item.products).join(" · ")}</p>
+        </article>)}
+      </div>
+      <div className="infra-contract-strip">
+        <span><b>库存推送</b><code>POST /api/infrastructure/resources/sync</code></span>
+        <span><b>只读发现</b><code>POST /api/infrastructure/discover</code></span>
+        <span><b>巡检</b><code>POST /api/infrastructure/scan</code></span>
+        <span><b>受控变更</b><code>OpsJob → 审批 → Webhook → 验证</code></span>
+      </div>
+      <div className="quiet-note"><ShieldCheck size={14} />云凭据只从服务端 Secret/env 引用解析；库存和发现请求不接受明文 AccessKey、Token 或密码。</div>
     </section>
     <section className="unified-grid infrastructure-grid">
       <div className="surface">
@@ -376,7 +395,7 @@ const fallbackActionOptions: SkillChoice[] = [
   { id: "apply_manifest", label: "应用 Kubernetes YAML", description: "创建或更新任意 Kubernetes API 资源。", risk: "high", when_to_use: "AI 已基于真实对象生成完整 YAML。", operator_note: "展示完整 YAML 与差异后逐步确认。" },
   { id: "patch_resource", label: "修改 Kubernetes 资源", description: "Patch Workload、ConfigMap、Secret、PV/PVC 等资源。", risk: "high", when_to_use: "已锁定 apiVersion、kind、namespace、name 和最小 Patch。", operator_note: "必须保存原对象快照。" },
   { id: "delete_resource", label: "删除 Kubernetes 资源", description: "删除一个明确目标资源。", risk: "high", when_to_use: "证据证明删除必要且影响可控。", operator_note: "必须显示恢复快照并逐步确认。" },
-  { id: "run_shell", label: "执行平台 Shell", description: "在 Flawless 运行环境执行完整命令。", risk: "high", when_to_use: "Skill 明确要求平台侧命令。", operator_note: "逐步确认、超时、输出审计。" },
+  { id: "run_shell", label: "执行平台 Shell", description: "在 CISRE 运行环境执行完整命令。", risk: "high", when_to_use: "Skill 明确要求平台侧命令。", operator_note: "逐步确认、超时、输出审计。" },
   { id: "exec_pod", label: "执行 Pod 命令", description: "进入指定 Pod/container 执行命令。", risk: "high", when_to_use: "必须在容器内取证或处置。", operator_note: "显示完整命令与目标后逐步确认。" },
   { id: "exec_node", label: "执行节点命令", description: "通过受控节点执行器运行命令。", risk: "high", when_to_use: "必须在指定 Kubernetes 节点处置。", operator_note: "特权高风险，逐步确认并审计。" },
   { id: "patch_workload", label: "修改 Workload 配置", description: "修正镜像、探针、资源、副本、环境变量或安全上下文。", risk: "medium", when_to_use: "证据确认 Deployment、StatefulSet 或 DaemonSet 模板配置有误。", operator_note: "执行前展示差异，可恢复原模板回滚。" },
@@ -920,7 +939,7 @@ export function IntegrationsPage() {
     </section>
     <div className="integration-groups">{groups.map(([id, title, Icon]) => <section className="surface" key={id}><SectionHead icon={Icon} title={title} /><div className="integration-cards">{list(state.data?.items).filter((item: any) => item.category === id).map((item: any) => <div key={item.id}><span className="resource-icon"><CloudCog size={16} /></span><div><strong>{item.name}</strong><p>{item.capability}</p><small>{item.configuration_hint}</small></div><div className="integration-actions"><StatusPill status={item.status} />{id === "collaboration" && item.status === "configured" && <button className="channel-test" onClick={() => testChannel(item.id)} disabled={testing === item.id} title={`发送 ${item.name} 测试通知`}>{testing === item.id ? <Loader2 className="spin" size={13} /> : <Send size={13} />}</button>}</div></div>)}</div></section>)}</div>
     <section className="surface"><SectionHead icon={GitBranch} title="云资源适配器" meta="Rancher · Generic CSI Storage · Virtualization Platform · Public Cloud" /><div className="capability-grid">{cloudAdapters.length ? cloudAdapters.map((item: any) => <div className="capability-card" key={item.id || item.provider}><span>{item.enabled ? "enabled" : "available"}</span><strong>{item.display_name || item.name || item.provider}</strong><p>{list(item.capabilities).join(" · ") || item.description}</p><small>{item.auth_mode} · {item.inventory_scope}</small></div>) : <Empty text="通过 CLOUD_ADAPTERS_JSON 接入阿里云、通用 CSI 存储、虚拟化平台或其他云适配器" />}</div></section>
-    <section className="surface"><SectionHead icon={CheckCircle2} title="能力覆盖" meta="对标 OnGrid 已发布能力，同时保留 Flawless 的差异化能力" /><div className="coverage-table"><div><strong>能力</strong><strong>本系统</strong><strong>说明</strong></div>{list(state.data?.coverage).map((item: any) => <div key={item.capability}><span>{item.capability}</span><StatusPill status={item.status} /><small>{item.detail}</small></div>)}</div></section>
+    <section className="surface"><SectionHead icon={CheckCircle2} title="能力覆盖" meta="持续演进的全栈智能可靠性能力" /><div className="coverage-table"><div><strong>能力</strong><strong>本系统</strong><strong>说明</strong></div>{list(state.data?.coverage).map((item: any) => <div key={item.capability}><span>{item.capability}</span><StatusPill status={item.status} /><small>{item.detail}</small></div>)}</div></section>
   </div>;
 }
 
@@ -953,11 +972,11 @@ export function AssistantDock({ page }: { page: string }) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState<AssistantMessage[]>(() => {
-    try { return JSON.parse(localStorage.getItem("flawless-unified-assistant") || "[]"); } catch { return []; }
+    try { return JSON.parse(localStorage.getItem("cisre-unified-assistant") || localStorage.getItem("flawless-unified-assistant") || "[]"); } catch { return []; }
   });
   const suggestions = useMemo(() => assistantSuggestions(page), [page]);
   const scroller = useRef<HTMLDivElement | null>(null);
-  useEffect(() => { localStorage.setItem("flawless-unified-assistant", JSON.stringify(messages.slice(-40))); requestAnimationFrame(() => { if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }); }, [messages]);
+  useEffect(() => { localStorage.setItem("cisre-unified-assistant", JSON.stringify(messages.slice(-40))); requestAnimationFrame(() => { if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }); }, [messages]);
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setOpen(true); }
@@ -983,10 +1002,10 @@ export function AssistantDock({ page }: { page: string }) {
     } finally { setLoading(false); }
   }
   return <>
-    <button className="assistant-launcher" onClick={() => setOpen(true)} title="打开 Flawless 助手"><Bot size={19} /><span>助手</span><kbd>⌘K</kbd></button>
+    <button className="assistant-launcher" onClick={() => setOpen(true)} title="打开 CISRE 助手"><Bot size={19} /><span>助手</span><kbd>⌘K</kbd></button>
     <aside className={`assistant-drawer ${open ? "open" : ""}`} aria-hidden={!open}>
       <header>
-        <div><span className="assistant-mark"><Bot size={18} /></span><div><strong>Flawless 助手</strong><small>当前页面：{page}</small></div></div>
+        <div><span className="assistant-mark"><Bot size={18} /></span><div><strong>CISRE 助手</strong><small>当前页面：{page}</small></div></div>
         <div className="assistant-header-actions">
           <button onClick={() => setMessages([])} title="清空对话"><RefreshCcw size={15} /></button>
           <button onClick={() => setOpen(false)} title="关闭"><X size={18} /></button>
@@ -1001,7 +1020,7 @@ export function AssistantDock({ page }: { page: string }) {
       </div>
       <div className="assistant-messages" ref={scroller}>
         {messages.length ? messages.map((item, index) => <div className={`assistant-message ${item.role}`} key={`${item.at}-${index}`}>
-          <span>{item.role === "assistant" ? "Flawless" : "你"}{item.page ? ` · ${item.page}` : ""}{item.domain ? ` · ${item.domain === "ops" ? "运维知识" : "产品知识"}` : ""}</span>
+          <span>{item.role === "assistant" ? "CISRE" : "你"}{item.page ? ` · ${item.page}` : ""}{item.domain ? ` · ${item.domain === "ops" ? "运维知识" : "产品知识"}` : ""}</span>
           <p>{item.text}</p>
           {item.role === "assistant" && typeof item.sourceCount === "number" && <small>{item.sourceCount} 个知识片段参与回答</small>}
         </div>) : <div className="assistant-welcome"><BrainCircuit size={24} /><strong>需要我帮你怎么用这套系统？</strong><p>我会结合当前页面、产品知识库和运维 Runbook 给出下一步。</p></div>}

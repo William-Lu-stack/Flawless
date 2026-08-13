@@ -1873,6 +1873,107 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(exec_call.call_args.args[0], configuration)
         self.assertEqual(exec_call.call_args.kwargs["pod_name"], "orders-api-abc")
 
+    async def test_workload_change_completes_only_after_exact_live_readback(self):
+        change = {
+            "type": "scale_out",
+            "namespace": "prod",
+            "workload_type": "Deployment",
+            "workload_name": "orders-api",
+            "replicas": 2,
+            "human_approved": True,
+            "operator_confirmed": True,
+        }
+        plan = {
+            "cluster_id": "local",
+            "namespace": "prod",
+            "target": "Deployment/orders-api",
+            "_operator": "unit-test",
+        }
+        before = {
+            "metadata": {"uid": "uid-1", "resourceVersion": "41", "generation": 3},
+            "spec": {"replicas": 1},
+        }
+        after = {
+            "metadata": {"uid": "uid-1", "resourceVersion": "42", "generation": 4},
+            "spec": {"replicas": 2},
+            "status": {"observedGeneration": 3},
+        }
+        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[]), patch.object(
+            server,
+            "_read_live_workload_after_change",
+            AsyncMock(side_effect=[(before, "local_mcp"), (after, "local_mcp")]),
+        ), patch.object(
+            server,
+            "_call_mcp_tool",
+            AsyncMock(return_value={"metadata": {"uid": "uid-1", "resourceVersion": "42"}}),
+        ) as patch_call:
+            result = await server._execute_change(change, plan)
+        self.assertEqual(result["status"], "completed")
+        receipt = result["result"]["mutation_postcondition"]
+        self.assertTrue(receipt["verified"])
+        self.assertEqual(receipt["before_resource_version"], "41")
+        self.assertEqual(receipt["resource_version"], "42")
+        self.assertEqual(
+            patch_call.await_args.args[1]["patch"],
+            {"spec": {"replicas": 2}},
+        )
+
+    async def test_workload_change_fails_when_api_accepts_but_live_object_does_not_change(self):
+        change = {
+            "type": "scale_out",
+            "namespace": "prod",
+            "workload_type": "Deployment",
+            "workload_name": "orders-api",
+            "replicas": 2,
+            "human_approved": True,
+            "operator_confirmed": True,
+        }
+        plan = {"cluster_id": "local", "namespace": "prod", "target": "Deployment/orders-api"}
+        unchanged = {
+            "metadata": {"uid": "uid-1", "resourceVersion": "41", "generation": 3},
+            "spec": {"replicas": 1},
+        }
+        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[]), patch.object(
+            server,
+            "_read_live_workload_after_change",
+            AsyncMock(side_effect=[(unchanged, "local_mcp"), (unchanged, "local_mcp")]),
+        ), patch.object(
+            server,
+            "_call_mcp_tool",
+            AsyncMock(return_value={"metadata": {"uid": "uid-1", "resourceVersion": "41"}}),
+        ):
+            result = await server._execute_change(change, plan)
+        self.assertEqual(result["status"], "failed")
+        receipt = result["result"]["mutation_postcondition"]
+        self.assertFalse(receipt["verified"])
+        self.assertIn("spec.replicas", receipt["mismatches"][0])
+
+    async def test_matching_workload_patch_is_idempotent_and_not_sent_twice(self):
+        change = {
+            "type": "scale_out",
+            "namespace": "prod",
+            "workload_type": "Deployment",
+            "workload_name": "orders-api",
+            "replicas": 2,
+            "human_approved": True,
+            "operator_confirmed": True,
+        }
+        plan = {"cluster_id": "local", "namespace": "prod", "target": "Deployment/orders-api"}
+        live = {
+            "metadata": {"uid": "uid-1", "resourceVersion": "42", "generation": 4},
+            "spec": {"replicas": 2},
+        }
+        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[]), patch.object(
+            server,
+            "_read_live_workload_after_change",
+            AsyncMock(side_effect=[(live, "local_mcp"), (live, "local_mcp")]),
+        ), patch.object(server, "_call_mcp_tool", AsyncMock()) as patch_call:
+            result = await server._execute_change(change, plan)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result"]["operation"], "already_applied")
+        self.assertTrue(result["result"]["mutation_postcondition"]["already_applied"])
+        patch_call.assert_not_awaited()
+
     def test_recovery_criteria_require_workload_rollout_evidence(self):
         criteria = server._assess_recovery_criteria(
             {"namespace": "prod", "target": "Deployment/orders", "success_criteria": ["pod_ready"]},

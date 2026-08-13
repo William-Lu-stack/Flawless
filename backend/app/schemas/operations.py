@@ -164,3 +164,22 @@ class InfrastructureScanRequest(BaseModel):
     model_profile_id: str = ""
     production_mode: bool = True
     include_probe: bool = True
+
+
+class InfrastructureInventorySyncRequest(BaseModel):
+    """外部 CMDB/云适配器推送标准化库存；请求体不得包含任何凭据。"""
+
+    provider: str = Field(default="external", min_length=1, max_length=96)
+    source: str = Field(default="api", min_length=1, max_length=128)
+    replace: bool = False
+    resources: list[dict] = Field(default_factory=list, max_length=5000)
+
+
+class InfrastructureDiscoveryRequest(BaseModel):
+    """调用服务端白名单中的只读发现适配器。"""
+
+    adapter_id: str = Field(min_length=1, max_length=96)
+    resource_types: list[str] = Field(default_factory=list, max_length=16)
+    regions: list[str] = Field(default_factory=list, max_length=64)
+    account_ref: str = Field(default="", max_length=256)
+    persist: bool = True

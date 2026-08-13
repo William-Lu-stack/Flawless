@@ -28,8 +28,8 @@ docs/OFFLINE_K8S_DEPLOY_ZH.md                   本说明
 
 | 顺序 | 本地及私库镜像标签 |
 |---:|---|
-| 1 | `registry.example.com/platform/flawless:5.2.0` |
-| 2 | `registry.example.com/platform/flawless-node-exec:1.36` |
+| 1 | `registry.example.com/platform/cisre:5.3.0` |
+| 2 | `registry.example.com/platform/cisre-node-exec:1.36` |
 | 3 | `registry.example.com/google_containers/prometheus:v2.45.0` |
 | 4 | `registry.example.com/kube-state-metrics/kube-state-metrics:v2.10.1` |
 | 5 | `registry.example.com/grafana/loki:3.7.3` |
@@ -62,7 +62,7 @@ docker images --format '{{.Repository}}:{{.Tag}}' | \
 
 ```bash
 docker image inspect \
-  registry.example.com/platform/flawless:5.2.0 \
+  registry.example.com/platform/cisre:5.3.0 \
   --format '{{.Os}}/{{.Architecture}}'
 ```
 

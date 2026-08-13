@@ -1,6 +1,6 @@
 """Agent Skills 标准目录包的编解码与安全导入导出。
 
-标准 ``SKILL.md`` 保持跨智能体可读；Flawless 专有的证据、动作和恢复门禁放在
+标准 ``SKILL.md`` 保持跨智能体可读；CISRE 专有的证据、动作和恢复门禁放在
 ``references/ops-policy.yaml``。平台不会直接执行导入包中的脚本，脚本执行仍只能
 引用企业批准目录中的 ``script_id``。
 """
@@ -183,14 +183,14 @@ Do not report success until the following observable conditions hold:
 
 ## Host Integration
 
-Read `references/ops-policy.yaml` when the host supports Flawless structured evidence and action gates.
+Read `references/ops-policy.yaml` when the host supports CISRE structured evidence and action gates.
 Imported scripts are not trusted automatically; use only scripts explicitly approved by the host platform.
 """.strip()
     return _yaml_frontmatter(name, _description(skill)) + "\n" + body + "\n"
 
 
 def render_ops_policy(skill: dict[str, Any]) -> str:
-    """生成可选的 Flawless 机器可读扩展。"""
+    """生成可选的 CISRE 机器可读扩展。"""
     payload = {
         "schema": OPS_POLICY_SCHEMA,
         "identity": {

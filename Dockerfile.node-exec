@@ -1,7 +1,7 @@
 ARG BUSYBOX_IMAGE=docker.io/library/busybox:1.36
 FROM ${BUSYBOX_IMAGE}
 
-LABEL org.opencontainers.image.title="Flawless Kubernetes Node Executor" \
+LABEL org.opencontainers.image.title="CISRE Kubernetes Node Executor" \
       org.opencontainers.image.description="Short-lived executor used for explicitly approved Kubernetes node operations" \
       org.opencontainers.image.source="https://github.com/your-org/Flawless" \
       org.opencontainers.image.documentation="https://github.com/your-org/Flawless" \

@@ -86,12 +86,12 @@ names=(
   "Approved Node Executor"
 )
 sources=(
-  "ghcr.dockerproxy.net/your-org/flawless:5.2.0"
-  "ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36"
+  "ghcr.dockerproxy.net/your-org/cisre:5.3.0"
+  "ghcr.dockerproxy.net/your-org/cisre-node-exec:1.36"
 )
 targets=(
-  "your-org/flawless:5.2.0"
-  "your-org/flawless-node-exec:1.36"
+  "your-org/cisre:5.3.0"
+  "your-org/cisre-node-exec:1.36"
 )
 
 if [[ "$include_observability" == "true" ]]; then

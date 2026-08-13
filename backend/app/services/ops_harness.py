@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-HARNESS_VERSION = "ResumableSREHarness/v1"
+HARNESS_VERSION = "CISREDurableHarness/v2"
 PHASES = ("evidence", "root_cause", "change", "verification")
 
 
@@ -57,6 +57,7 @@ def new_ops_harness(plan: dict, *, created_at: str = "") -> dict:
         "created_at": created,
         "updated_at": created,
         "checkpoint_seq": 0,
+        "resume_token": "",
         "current_phase": "evidence",
         "todos": [
             {"id": phase, "status": "pending", "updated_at": created}
@@ -65,7 +66,11 @@ def new_ops_harness(plan: dict, *, created_at: str = "") -> dict:
         "attempts": [],
         "tool_receipts": [],
         "model_calls": [],
+        "events": [],
+        "approval_ledger": [],
+        "idempotency_ledger": {},
         "last_trajectory_digest": "",
+        "last_progress_digest": "",
         "no_progress_count": 0,
         "stuck_detected": False,
         "completion": {
@@ -73,11 +78,31 @@ def new_ops_harness(plan: dict, *, created_at: str = "") -> dict:
             "recovered": False,
             "reason": "尚未完成恢复验证。",
         },
+        "budgets": {
+            "max_strategy_attempts": max(1, int(plan.get("max_attempts") or 12)),
+            "max_model_calls": max(1, int(plan.get("max_model_calls") or 24)),
+            "max_mutations": max(1, int(plan.get("max_mutations") or 16)),
+            "strategy_attempts_used": 0,
+            "model_calls_used": 0,
+            "mutations_used": 0,
+        },
+        "phase_contracts": {
+            "evidence": "fresh logs/events/workload or typed infrastructure evidence",
+            "root_cause": "ranked hypothesis + one primary Skill + bounded recovery criteria",
+            "change": "human approval + API receipt + exact live read-after-write postcondition",
+            "verification": "fresh rollout/health evidence proves recovery and stability",
+        },
         "capabilities": {
             "checkpoint_after_transition": True,
+            "resume_from_checkpoint": True,
             "human_approval": True,
+            "approval_pause_without_worker_slot": True,
+            "idempotent_tool_execution": True,
+            "read_after_write_postconditions": True,
             "trajectory_stuck_detection": True,
             "deterministic_completion_evaluator": True,
+            "bounded_context_compaction": True,
+            "strategy_budgeting": True,
             "model_independent_execution": True,
         },
     }
@@ -100,6 +125,22 @@ def checkpoint_event(harness: dict, stage: str, message: str, values: dict | Non
         "message": str(message or "")[:500],
         "timestamp": now,
     }
+    state["resume_token"] = _stable_digest({
+        "target": state.get("target"),
+        "seq": state["checkpoint_seq"],
+        "stage": stage,
+        "timestamp": now,
+    })
+    event_log = state.setdefault("events", [])
+    event_log.append({
+        "seq": state["checkpoint_seq"],
+        "timestamp": now,
+        "stage": stage,
+        "phase": phase,
+        "message": str(message or "")[:500],
+        "status": str(values.get("status") or "running"),
+    })
+    del event_log[:-160]
 
     terminal_status = str(values.get("status") or "")
     phase_done = (
@@ -129,6 +170,17 @@ def checkpoint_event(harness: dict, stage: str, message: str, values: dict | Non
         })
         del receipts[:-80]
 
+    if "approval" in stage.lower() or values.get("approved") is not None:
+        approvals = state.setdefault("approval_ledger", [])
+        approvals.append({
+            "timestamp": now,
+            "stage": stage,
+            "target": values.get("target") or values.get("change_target") or "",
+            "approved": values.get("approved"),
+            "operator": values.get("operator") or "",
+        })
+        del approvals[:-80]
+
     if "llm" in stage.lower() or values.get("model_profile_id") or values.get("planner_source") == "llm":
         calls = state.setdefault("model_calls", [])
         model_status = (
@@ -144,6 +196,7 @@ def checkpoint_event(harness: dict, stage: str, message: str, values: dict | Non
             "model_profile_id": values.get("model_profile_id") or "",
         })
         del calls[:-40]
+        state.setdefault("budgets", {})["model_calls_used"] = len(calls)
     return state
 
 
@@ -180,6 +233,14 @@ def record_attempt(harness: dict, plan: dict, result: dict) -> dict:
     state = copy.deepcopy(harness or new_ops_harness(plan))
     completion = evaluate_completion(result)
     verification = result.get("verification") if isinstance(result.get("verification"), dict) else {}
+    mutation_receipts: list[dict] = []
+    for item in result.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("result") if isinstance(item.get("result"), dict) else {}
+        receipt = raw.get("mutation_postcondition") if isinstance(raw, dict) else None
+        if isinstance(receipt, dict):
+            mutation_receipts.append(copy.deepcopy(receipt))
     trajectory = {
         "skill": plan.get("selected_skill_id") or "",
         "changes": plan.get("changes") or [],
@@ -187,14 +248,39 @@ def record_attempt(harness: dict, plan: dict, result: dict) -> dict:
         "verification_recovered": verification.get("recovered"),
         "verification_reason": verification.get("reason") or verification.get("message") or "",
         "failure_class": verification.get("failure_class") or result.get("blocked_reason") or "",
+        "mutation_postconditions": [
+            {
+                "target": item.get("target"),
+                "verified": item.get("verified"),
+                "resource_version": item.get("resource_version"),
+                "expected_patch_digest": item.get("expected_patch_digest"),
+            }
+            for item in mutation_receipts
+        ],
     }
     digest = _stable_digest(trajectory)
+    progress = {
+        "status": result.get("status") or "",
+        "recovered": completion["recovered"],
+        "failure_class": trajectory["failure_class"],
+        "resource_versions": sorted({
+            str(item.get("resource_version") or "")
+            for item in mutation_receipts
+            if item.get("resource_version")
+        }),
+        "verified_mutations": sum(item.get("verified") is True for item in mutation_receipts),
+        "ready_pods": len(verification.get("recovered_pods") or []),
+        "unresolved": len(verification.get("unresolved") or []),
+    }
+    progress_digest = _stable_digest(progress)
     previous = str(state.get("last_trajectory_digest") or "")
-    if digest == previous and not completion["recovered"]:
+    previous_progress = str(state.get("last_progress_digest") or "")
+    if digest == previous and progress_digest == previous_progress and not completion["recovered"]:
         state["no_progress_count"] = int(state.get("no_progress_count") or 0) + 1
     else:
         state["no_progress_count"] = 0
     state["last_trajectory_digest"] = digest
+    state["last_progress_digest"] = progress_digest
     state["stuck_detected"] = bool(state["no_progress_count"] >= 2)
     state["completion"] = completion
     state["updated_at"] = _now()
@@ -205,9 +291,44 @@ def record_attempt(harness: dict, plan: dict, result: dict) -> dict:
         "skill_id": str(plan.get("selected_skill_id") or ""),
         "status": str(result.get("status") or "unknown"),
         "recovered": completion["recovered"],
-        "progress": not (digest == previous),
+        "progress": not (digest == previous and progress_digest == previous_progress),
+        "progress_digest": progress_digest,
+        "mutation_postconditions": mutation_receipts,
     })
     del attempts[:-40]
+    budgets = state.setdefault("budgets", {})
+    budgets["strategy_attempts_used"] = len(attempts)
+    budgets["mutations_used"] = sum(
+        len(item.get("mutation_postconditions") or [])
+        for item in attempts
+    )
+    receipts = state.setdefault("tool_receipts", [])
+    for receipt in mutation_receipts:
+        receipt_id = _stable_digest({
+            "target": receipt.get("target"),
+            "patch": receipt.get("expected_patch_digest"),
+            "resource_version": receipt.get("resource_version"),
+        })
+        state.setdefault("idempotency_ledger", {})[receipt_id] = {
+            "verified": receipt.get("verified") is True,
+            "target": receipt.get("target") or "",
+            "resource_version": receipt.get("resource_version"),
+            "updated_at": state["updated_at"],
+        }
+        receipts.append({
+            "timestamp": state["updated_at"],
+            "stage": "mutation_postcondition",
+            "action": "kubernetes_read_after_write",
+            "target": receipt.get("target") or "",
+            "status": "verified" if receipt.get("verified") is True else "failed",
+            "receipt_id": receipt_id,
+            "resource_version": receipt.get("resource_version"),
+        })
+    del receipts[:-80]
+    ledger = state.setdefault("idempotency_ledger", {})
+    if len(ledger) > 120:
+        keep = list(ledger)[-120:]
+        state["idempotency_ledger"] = {key: ledger[key] for key in keep}
     if completion["recovered"]:
         for todo in state.get("todos") or []:
             todo["status"] = "completed"

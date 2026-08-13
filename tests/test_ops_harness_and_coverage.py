@@ -1,10 +1,14 @@
 import asyncio
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from agents.runtime_resilience import AsyncBulkhead, BulkheadRejected
 from backend.app import application as server
 from backend.app.services.ops_harness import checkpoint_event, new_ops_harness, record_attempt
+from backend.app.services.infrastructure_providers import providers_payload, sync_inventory
 
 
 class OpsHarnessAndCoverageTests(unittest.TestCase):
@@ -153,6 +157,46 @@ class OpsHarnessAndCoverageTests(unittest.TestCase):
         state = checkpoint_event(state, "recovered", "recovery contract passed")
         self.assertEqual(state["completion"]["status"], "recovered")
         self.assertTrue(all(item["status"] == "completed" for item in state["todos"]))
+
+    def test_harness_records_verified_mutation_receipt_and_progress(self):
+        plan = {"target": "Deployment/api", "selected_skill_id": "skill-rollout-recovery", "changes": [{"type": "scale_out"}]}
+        state = new_ops_harness(plan)
+        result = {
+            "status": "unresolved",
+            "results": [{"status": "completed", "result": {"mutation_postcondition": {
+                "target": "Deployment/api",
+                "verified": True,
+                "resource_version": "88",
+                "expected_patch_digest": "patch-1",
+            }}}],
+            "verification": {"recovered": False, "unresolved": [{"pod": "api-new"}]},
+        }
+        state = record_attempt(state, plan, result)
+        self.assertEqual(state["version"], "CISREDurableHarness/v2")
+        self.assertEqual(state["budgets"]["mutations_used"], 1)
+        self.assertEqual(state["tool_receipts"][-1]["status"], "verified")
+        self.assertTrue(state["idempotency_ledger"])
+
+    def test_infrastructure_inventory_sync_supports_domestic_stack_without_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "inventory.json"
+            with patch.dict(os.environ, {"INFRASTRUCTURE_INVENTORY_STORE_PATH": str(store)}):
+                result = sync_inventory([
+                    {"id": "ecs-1", "name": "业务主机", "type": "virtual_machine", "provider": "aliyun", "region": "cn-test"},
+                    {"id": "db-1", "name": "核心数据库", "type": "database", "provider": "oceanbase", "engine": "oceanbase"},
+                ], provider="aliyun", source="cmdb", replace=True)
+                payload = providers_payload()
+            self.assertEqual(result["accepted"], 2)
+            self.assertEqual(payload["summary"]["total"], 2)
+            self.assertTrue(any(item["id"] == "aliyun" for item in payload["provider_catalog"]))
+
+    def test_infrastructure_inventory_rejects_plaintext_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"INFRASTRUCTURE_INVENTORY_STORE_PATH": str(Path(directory) / "inventory.json")}):
+                with self.assertRaisesRegex(ValueError, "must not contain credentials"):
+                    sync_inventory([
+                        {"id": "db-1", "type": "database", "password": "should-never-enter-inventory"},
+                    ], provider="external", source="api")
 
     def test_beyla_coverage_compares_ready_collectors_with_every_linux_node(self):
         payload = {

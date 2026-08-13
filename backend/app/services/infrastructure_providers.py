@@ -13,11 +13,13 @@ import json
 import os
 import re
 import socket
+import tempfile
 import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
+from pathlib import Path
 
 import httpx
 
@@ -60,6 +62,37 @@ RESOURCE_TYPE_CATALOG: list[dict[str, Any]] = [
     },
 ]
 
+DOMESTIC_PROVIDER_CATALOG: list[dict[str, Any]] = [
+    {
+        "id": "aliyun", "name": "阿里云", "kind": "public_cloud", "recommended": True,
+        "products": ["ECS", "ACK", "RDS", "PolarDB", "OceanBase", "SLB", "NAS", "OSS", "SLS", "ARMS", "CloudMonitor", "RocketMQ"],
+    },
+    {
+        "id": "huawei-cloud", "name": "华为云", "kind": "public_cloud",
+        "products": ["ECS", "CCE", "RDS", "GaussDB", "DCS", "ELB", "OBS", "Cloud Eye", "LTS"],
+    },
+    {
+        "id": "tencent-cloud", "name": "腾讯云", "kind": "public_cloud",
+        "products": ["CVM", "TKE", "CDB", "TDSQL", "CLB", "CFS", "COS", "CLS", "Cloud Monitor"],
+    },
+    {
+        "id": "domestic-database", "name": "国产数据库", "kind": "database",
+        "products": ["OceanBase", "GaussDB", "TiDB", "达梦", "人大金仓", "GBase"],
+    },
+    {
+        "id": "domestic-middleware", "name": "国产中间件", "kind": "middleware",
+        "products": ["RocketMQ", "Kafka", "Redis", "Nacos", "Sentinel", "TongLINK/Q", "东方通 TongRDS"],
+    },
+    {
+        "id": "domestic-storage", "name": "国产存储", "kind": "storage",
+        "products": ["华为 OceanStor/Dorado", "深信服 aSAN/HCI", "浪潮 AS13000", "Ceph", "NFS", "通用 CSI"],
+    },
+    {
+        "id": "private-compute", "name": "私有云与虚拟化", "kind": "virtual_machine",
+        "products": ["OpenStack", "深信服 HCI", "华为 FusionCompute", "VMware", "Harvester", "裸金属"],
+    },
+]
+
 
 DEFAULT_THRESHOLDS = {
     "cpu_percent": 85,
@@ -97,6 +130,19 @@ def _json_env(name: str, default: str = "[]") -> Any:
         return json.loads(raw)
     except json.JSONDecodeError:
         return []
+
+
+def _runtime_inventory_path() -> Path:
+    return Path(os.getenv("INFRASTRUCTURE_INVENTORY_STORE_PATH", "/var/lib/flawless/infrastructure-resources.json"))
+
+
+def _runtime_inventory() -> list[dict[str, Any]]:
+    path = _runtime_inventory_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return []
+    return [item for item in _as_list(payload) if isinstance(item, dict)]
 
 
 def redact_sensitive(value: Any) -> Any:
@@ -183,6 +229,11 @@ def load_resources() -> list[dict[str, Any]]:
     for item in _as_list(_json_env("STORAGE_TARGETS_JSON", "[]")):
         if isinstance(item, dict):
             resources.append(_normalize_resource(item, default_type="storage"))
+    for item in _as_list(_json_env("CLOUD_RESOURCE_TARGETS_JSON", "[]")):
+        if isinstance(item, dict):
+            resources.append(_normalize_resource(item, default_type="cloud_service"))
+    for item in _runtime_inventory():
+        resources.append(_normalize_resource(item, default_type=str(item.get("type") or "external")))
 
     dedup: dict[str, dict[str, Any]] = {}
     for item in resources:
@@ -199,19 +250,141 @@ def providers_payload() -> dict[str, Any]:
     return {
         "status": "ok",
         "catalog": deepcopy(RESOURCE_TYPE_CATALOG),
+        "provider_catalog": deepcopy(DOMESTIC_PROVIDER_CATALOG),
+        "adapters": configured_adapters(),
         "resources": [redact_sensitive(item) for item in resources],
         "summary": {
             "total": len(resources),
             "by_type": counts,
             "configured": bool(resources),
             "action_webhook_configured": bool(os.getenv("INFRASTRUCTURE_ACTION_WEBHOOK_URL", "").strip()),
+            "discovery_adapters_configured": len(configured_adapters()),
         },
         "configuration": {
             "unified": "INFRASTRUCTURE_RESOURCES_JSON",
             "database": "DATABASE_TARGETS_JSON",
             "virtual_machine": "VM_TARGETS_JSON",
+            "middleware": "MIDDLEWARE_TARGETS_JSON",
+            "storage": "STORAGE_TARGETS_JSON",
+            "cloud_service": "CLOUD_RESOURCE_TARGETS_JSON",
+            "adapter_registry": "INFRASTRUCTURE_ADAPTERS_JSON",
+            "runtime_inventory_store": str(_runtime_inventory_path()),
             "action_webhook": "INFRASTRUCTURE_ACTION_WEBHOOK_URL",
         },
+        "contracts": {
+            "inventory_push": "POST /api/infrastructure/resources/sync",
+            "adapter_discovery": "POST /api/infrastructure/discover",
+            "read_only_scan": "POST /api/infrastructure/scan",
+            "guarded_mutation": "OpsJob -> ApprovalGate -> INFRASTRUCTURE_ACTION_WEBHOOK_URL -> postcondition",
+            "credential_rule": "API requests never carry cloud secrets; adapters resolve secret_env/secret-ref server-side.",
+        },
+    }
+
+
+def configured_adapters() -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for raw in _as_list(_json_env("INFRASTRUCTURE_ADAPTERS_JSON", "[]")):
+        if not isinstance(raw, dict) or not raw.get("id") or not raw.get("discovery_url"):
+            continue
+        auth_env = str(raw.get("auth_env") or "")
+        result.append({
+            "id": _safe_id(str(raw.get("id")), "adapter"),
+            "provider": str(raw.get("provider") or "custom"),
+            "display_name": str(raw.get("display_name") or raw.get("name") or raw.get("id")),
+            "resource_types": [str(item) for item in raw.get("resource_types") or []],
+            "regions": [str(item) for item in raw.get("regions") or []],
+            "auth_mode": str(raw.get("auth_mode") or ("server-secret-env" if auth_env else "workload-identity")),
+            "credential_configured": bool(not auth_env or os.getenv(auth_env, "")),
+            "enabled": bool(raw.get("enabled", True)),
+            "read_only": True,
+            "discovery_url_configured": True,
+        })
+    return result
+
+
+def sync_inventory(resources: list[dict[str, Any]], *, provider: str, source: str, replace: bool = False) -> dict[str, Any]:
+    """Persist normalized inventory facts; credentials and arbitrary actions are rejected."""
+    if len(resources) > 5000:
+        raise ValueError("a single inventory sync is limited to 5000 resources")
+    allowed_types = {str(item["id"]) for item in RESOURCE_TYPE_CATALOG}
+    normalized: list[dict[str, Any]] = []
+    for raw in resources:
+        if not isinstance(raw, dict):
+            continue
+        if any(SECRET_KEYS.search(str(key)) for key in raw):
+            raise ValueError("inventory payload must not contain credentials or secret fields")
+        item = _normalize_resource({**raw, "provider": raw.get("provider") or provider}, default_type=str(raw.get("type") or "external"))
+        if item["type"] not in allowed_types:
+            raise ValueError(f"unsupported resource type: {item['type']}")
+        item["inventory_source"] = _safe_id(source or "api", "api")
+        item["observed_at"] = _now()
+        normalized.append(item)
+    previous = [] if replace else _runtime_inventory()
+    merged = {
+        str(item.get("id")): item
+        for item in [*previous, *normalized]
+        if isinstance(item, dict) and item.get("id")
+    }
+    path = _runtime_inventory_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        json.dump({"version": 1, "updated_at": _now(), "resources": list(merged.values())}, handle, ensure_ascii=False, indent=2)
+        temporary = Path(handle.name)
+    temporary.replace(path)
+    return {
+        "status": "synced",
+        "accepted": len(normalized),
+        "total": len(merged),
+        "provider": provider,
+        "source": source,
+        "replace": replace,
+    }
+
+
+async def discover_adapter_resources(
+    adapter_id: str,
+    *,
+    resource_types: list[str],
+    regions: list[str],
+    account_ref: str,
+    persist: bool,
+) -> dict[str, Any]:
+    raw_adapters = [item for item in _as_list(_json_env("INFRASTRUCTURE_ADAPTERS_JSON", "[]")) if isinstance(item, dict)]
+    adapter = next((item for item in raw_adapters if str(item.get("id")) == adapter_id and item.get("enabled", True)), None)
+    if not adapter:
+        raise ValueError(f"unknown or disabled infrastructure adapter: {adapter_id}")
+    allowed_types = {str(item["id"]) for item in RESOURCE_TYPE_CATALOG}
+    requested_types = [item for item in resource_types if item in allowed_types]
+    auth_env = str(adapter.get("auth_env") or "")
+    headers = {"Content-Type": "application/json", "X-CISRE-Adapter": adapter_id}
+    if auth_env:
+        credential = os.getenv(auth_env, "")
+        if not credential:
+            raise ValueError(f"adapter credential environment {auth_env!r} is not configured")
+        headers["Authorization"] = f"Bearer {credential}"
+    request_body = {
+        "contract_version": "cisre.infrastructure.discovery/v1",
+        "adapter_id": adapter_id,
+        "account_ref": account_ref,
+        "resource_types": requested_types or list(adapter.get("resource_types") or []),
+        "regions": regions or list(adapter.get("regions") or []),
+        "read_only": True,
+    }
+    timeout = max(5, min(int(os.getenv("INFRASTRUCTURE_DISCOVERY_TIMEOUT_SECONDS", "45")), 180))
+    async with httpx.AsyncClient(timeout=timeout, verify=os.getenv("INFRASTRUCTURE_VERIFY_SSL", "true").lower() in {"1", "true", "yes", "on"}) as client:
+        response = await client.post(str(adapter["discovery_url"]), json=request_body, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+    discovered = [item for item in _as_list(payload) if isinstance(item, dict)]
+    sync_result = None
+    if persist:
+        sync_result = sync_inventory(discovered, provider=str(adapter.get("provider") or adapter_id), source=f"adapter:{adapter_id}")
+    return {
+        "status": "ok",
+        "adapter_id": adapter_id,
+        "resource_count": len(discovered),
+        "resources": [redact_sensitive(_normalize_resource(item, default_type=str(item.get("type") or "external"))) for item in discovered],
+        "persisted": sync_result,
     }
 
 

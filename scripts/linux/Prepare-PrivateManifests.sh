@@ -65,8 +65,8 @@ rewrite_manifest() {
   local source_path="$1"
   local target_path="$2"
   sed \
-    -e "s|ghcr.dockerproxy.net/your-org/flawless:5.2.0|$private_registry/$image_namespace/flawless:5.2.0|g" \
-    -e "s|ghcr.dockerproxy.net/your-org/flawless-node-exec:1.36|$private_registry/$image_namespace/flawless-node-exec:1.36|g" \
+    -e "s|ghcr.dockerproxy.net/your-org/cisre:5.3.0|$private_registry/$image_namespace/cisre:5.3.0|g" \
+    -e "s|ghcr.dockerproxy.net/your-org/cisre-node-exec:1.36|$private_registry/$image_namespace/cisre-node-exec:1.36|g" \
     -e "s|registry.cn-hangzhou.aliyuncs.com/google_containers/prometheus:v2.45.0|$private_registry/google_containers/prometheus:v2.45.0|g" \
     -e "s|m.daocloud.io/registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.1|$private_registry/kube-state-metrics/kube-state-metrics:v2.10.1|g" \
     -e "s|m.daocloud.io/docker.io/grafana/loki:3.7.3|$private_registry/grafana/loki:3.7.3|g" \
