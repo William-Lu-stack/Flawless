@@ -268,6 +268,7 @@ data:
       rule { source_labels = ["__meta_kubernetes_namespace"] target_label = "namespace" }
       rule { source_labels = ["__meta_kubernetes_pod_name"] target_label = "pod" }
       rule { source_labels = ["__meta_kubernetes_pod_container_name"] target_label = "container" }
+      rule { source_labels = ["__meta_kubernetes_pod_node_name"] target_label = "node" }
       rule { replacement = sys.env("CLUSTER_NAME") target_label = "cluster" }
     }
 
@@ -281,7 +282,7 @@ data:
       forward_to = [loki.write.default.receiver]
     }
     loki.write "default" {
-      endpoint { url = "http://k8s-agent-loki.k8s-agent.svc.cluster.local:3100/loki/api/v1/push" }
+      endpoint { url = sys.env("LOKI_PUSH_URL") }
     }
 
     otelcol.receiver.otlp "default" {
@@ -302,6 +303,10 @@ metadata:
   name: k8s-agent-alloy
   namespace: k8s-agent
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 10%}
+  minReadySeconds: 5
   selector:
     matchLabels: {app: k8s-agent-alloy}
   template:
@@ -309,6 +314,10 @@ spec:
       labels: {app: k8s-agent-alloy}
     spec:
       serviceAccountName: k8s-agent-alloy
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
       securityContext:
         runAsUser: 0
         seccompProfile: {type: RuntimeDefault}
@@ -323,10 +332,18 @@ spec:
                 configMapKeyRef:
                   name: k8s-agent-config
                   key: LOCAL_CLUSTER_NAME
+            - name: LOKI_PUSH_URL
+              # 跨集群集中采集时，把这里改成各节点可达的中央 Loki push URL。
+              value: http://k8s-agent-loki.k8s-agent.svc.cluster.local:3100/loki/api/v1/push
           ports:
             - {name: http, containerPort: 12345}
             - {name: otlp-grpc, containerPort: 4317}
             - {name: otlp-http, containerPort: 4318}
+          readinessProbe:
+            httpGet: {path: /-/ready, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false

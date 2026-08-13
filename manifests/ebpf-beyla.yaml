@@ -113,6 +113,11 @@ metadata:
     app.kubernetes.io/name: flawless-beyla
     app: flawless-beyla
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  minReadySeconds: 5
   selector:
     matchLabels:
       app: flawless-beyla
@@ -123,6 +128,8 @@ spec:
         app: flawless-beyla
     spec:
       serviceAccountName: flawless-beyla
+      nodeSelector:
+        kubernetes.io/os: linux
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet

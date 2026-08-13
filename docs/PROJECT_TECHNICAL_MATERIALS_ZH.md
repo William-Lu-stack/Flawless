@@ -1,6 +1,6 @@
 # Flawless 项目技术材料
 
-版本：5.1.0
+版本：5.2.0
 
 材料用途：技术评审、项目汇报、生产交付、运维培训
 
@@ -297,10 +297,13 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 ## 8. 本次版本验证证据
 
-5.1.0 已完成：
+5.2.0 已完成：
 
-- Python 全量测试：221 passed。
+- Python 全量测试：243 passed（含 11 个常见 Kubernetes 可执行 Skill 的统一执行契约矩阵）。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
+- 新增 `ResumableSREHarness/v1`：阶段检查点、工具/变更回执、重复轨迹停滞检测和确定性完成判定均随 OpsJob 持久化；模型不能自行把任务标记为恢复。
+- HTTP 并发门禁改为排队而不是 1.5 秒后返回“运维过载”；任务创建、状态读取、逐项审批和中断属于优先控制链路，不会被看板或慢清单请求饿死。
+- Beyla 与 Alloy 均按兼容 Linux 节点全覆盖调度并容忍所有污点；Alloy 写入 cluster/node Loki 标签，拓扑页分别展示采集器覆盖率和当前窗口真实 flow 节点，缺失节点可直接定位；Loki 无数据时还会经 Rancher/kubeconfig 对每个 collector Pod 做限时只读日志兜底，不再把转发链故障误报成没有 eBPF。
 - 常见 Kubernetes 故障已从“Skill 名称匹配”升级为 12 个版本化服务端执行器：卷/SQLite 写权限、PVC/PV、OOM、探针慢启动、镜像鉴权与架构、ConfigMap 引用、Service/Endpoint、发布回归、节点压力、PDB 死锁、CPU 容量和 DNS/CNI；调度/配额/准入与证书/Webhook 使用独立高风险 Skill，在没有批准目标值、Secret 或 PKI 制品时只诊断不编造变更。
 - 运维并发改为实际 Kubernetes 写入租约：证据采集和人工审批等待不占执行槽，超过全局写入上限的任务进入队列，同一资源保持 single-flight，消除遗留审批任务导致的“自动运维并发达到保护阈值”。
 - 3D 拓扑新增默认自动环绕、暂停/恢复控制、实时状态标识和深色星空层次；本地模拟 6 节点/6 条关系边验证了 Three.js 渲染和持续旋转，浏览器控制台无 warning/error。

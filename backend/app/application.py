@@ -21,7 +21,7 @@ import threading
 import time
 import traceback
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -76,6 +76,7 @@ from backend.app.services.resource_catalog import build_resource_catalog
 from backend.app.services.cluster_registry import ClusterRegistry
 from cmdb.local_cmdb import _collect_cluster_topology
 from backend.app.services.ops_execution import StageTimeoutError, run_with_heartbeat
+from backend.app.services.ops_harness import checkpoint_event, new_ops_harness, record_attempt
 from backend.app.services.log_evidence import triage_kubernetes_logs
 from backend.app.services.ops_skill_registry import OpsSkillRegistry, approved_script_catalog, skill_option_catalog
 from backend.app.services.ops_skill_runtime import (
@@ -206,7 +207,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.1.0")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.2.0")
 APP_CODE_SIGNATURE = "kubernetes-skill-closure-v28"
 BUILTIN_SKILL_POLICY_REVISION = "3.0.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -479,6 +480,14 @@ def _security_headers(response):
     return response
 
 
+def _priority_control_route(path: str) -> bool:
+    return (
+        path == "/api/ops/jobs"
+        or path.startswith("/api/ops/jobs/")
+        or path in {"/health", "/api/health", "/api/build"}
+    )
+
+
 @app.middleware("http")
 async def request_bulkhead_middleware(request: Request, call_next):
     try:
@@ -517,12 +526,20 @@ async def request_bulkhead_middleware(request: Request, call_next):
                 content={"status": "rate_limited", "error": "write request rate limit exceeded", "request_id": request_id},
                 headers={"Retry-After": "60"},
             ))
-        async with REQUEST_BULKHEAD.slot():
+        # Queue application work instead of turning a short admission timeout
+        # into a false "operations overloaded" failure. Ops lifecycle routes
+        # are deliberately outside this general-purpose gate: their handlers
+        # only create/read/approve/cancel persisted jobs and must remain
+        # responsive while dashboards or slow inventory calls are in flight.
+        # Actual K8s writes still use the separate target-aware execution lease.
+        priority_control_route = _priority_control_route(request.url.path)
+        admission = nullcontext() if priority_control_route else REQUEST_BULKHEAD.slot(queue=True)
+        async with admission:
             response = await call_next(request)
             response.headers.setdefault("X-Request-ID", request_id)
             response.headers.setdefault("Server-Timing", f"app;dur={(time.perf_counter() - request_started) * 1000:.1f}")
             return _security_headers(response)
-    except BulkheadRejected as exc:
+    except BulkheadRejected as exc:  # defensive: queued admission does not reject
         return _security_headers(JSONResponse(
             status_code=503,
             content={
@@ -4384,6 +4401,7 @@ async def _rancher_inventory_cluster(cluster: dict) -> dict:
             "cluster": cluster["name"],
             "cluster_id": cid,
             "name": meta.get("name", ""),
+            "os": (meta.get("labels") or {}).get("kubernetes.io/os") or (status.get("nodeInfo") or {}).get("operatingSystem") or "",
             "ready": ready,
             "health": "healthy" if ready and not problems else "degraded",
             "problems": problems,
@@ -4445,7 +4463,7 @@ async def _managed_inventory_cluster(cluster: dict) -> dict:
         problems = [condition["type"] for condition in summary if condition["type"] != "Ready" and condition["status"] == "True"]
         if not ready:
             problems.append("NotReady")
-        nodes.append({"cluster": cluster["name"], "cluster_id": cluster["id"], "name": meta.get("name", ""), "ready": ready, "health": "healthy" if ready and not problems else "degraded", "problems": problems, "condition_summary": summary, "allocatable": status.get("allocatable") or {}})
+        nodes.append({"cluster": cluster["name"], "cluster_id": cluster["id"], "name": meta.get("name", ""), "os": (meta.get("labels") or {}).get("kubernetes.io/os") or (status.get("nodeInfo") or {}).get("operatingSystem") or "", "ready": ready, "health": "healthy" if ready and not problems else "degraded", "problems": problems, "condition_summary": summary, "allocatable": status.get("allocatable") or {}})
     namespaces = [{"cluster": cluster["name"], "cluster_id": cluster["id"], "name": (item.get("metadata") or {}).get("name", ""), "status": (item.get("status") or {}).get("phase", ""), "created_at": (item.get("metadata") or {}).get("creationTimestamp", "")} for item in raw.get("namespaces") or []]
     return {"cluster": cluster, "errors": [], "nodes": nodes, "namespaces": namespaces, "pods": pods, "workloads": workloads}
 
@@ -5110,7 +5128,7 @@ def _beyla_loki_payload_lines(payload: dict) -> tuple[list[str], int, list[dict]
                 for key, value in (stream.get("stream") or {}).items()
                 if str(key) in {
                     "namespace", "namespace_name", "pod", "pod_name",
-                    "container", "container_name", "job", "app",
+                    "container", "container_name", "job", "app", "node", "node_name", "cluster",
                 }
             })
         values = stream.get("values") if isinstance(stream, dict) else []
@@ -5122,6 +5140,278 @@ def _beyla_loki_payload_lines(payload: dict) -> tuple[list[str], int, list[dict]
             if extracted:
                 flow_lines.append(extracted)
     return flow_lines, raw_lines, stream_labels
+
+
+def _beyla_collector_inventory(req: ExternalTrafficFlowRequest, inventory_payload: dict) -> list[dict]:
+    requested_cluster = str(req.cluster_id or req.cluster or "all")
+    namespace = os.getenv("BEYLA_LOKI_NAMESPACE", "flawless-ebpf").strip() or "flawless-ebpf"
+    collectors: list[dict] = []
+    for cluster_inventory in inventory_payload.get("inventory") or []:
+        cluster_meta = cluster_inventory.get("cluster") or {}
+        cluster_name = str(cluster_meta.get("name") or cluster_meta.get("id") or "")
+        cluster_id = str(cluster_meta.get("id") or cluster_name)
+        if requested_cluster not in {"", "all", cluster_name, cluster_id}:
+            continue
+        for pod in cluster_inventory.get("pods") or []:
+            labels = pod.get("labels") or {}
+            if str(pod.get("namespace") or "") != namespace:
+                continue
+            identity = " ".join([
+                str(pod.get("workload_name") or ""),
+                str(pod.get("name") or ""),
+                str(labels.get("app") or ""),
+                str(labels.get("app.kubernetes.io/name") or ""),
+            ]).lower()
+            if "beyla" not in identity:
+                continue
+            container_names = [
+                str(item.get("name") or "")
+                for item in (pod.get("containers") or [])
+                if isinstance(item, dict) and item.get("name")
+            ]
+            container = next((name for name in container_names if "beyla" in name.lower()), "")
+            collectors.append({
+                "cluster": cluster_meta,
+                "cluster_id": cluster_id,
+                "cluster_name": cluster_name,
+                "namespace": namespace,
+                "pod": pod,
+                "pod_name": str(pod.get("name") or ""),
+                "node": str(pod.get("node") or ""),
+                "container": container or (container_names[0] if container_names else "beyla"),
+            })
+    return collectors
+
+
+async def _fetch_beyla_direct_pod_log_flows(
+    req: ExternalTrafficFlowRequest,
+) -> tuple[list[dict], dict]:
+    """Read real Beyla flow logs through Rancher/kubeconfig when Loki is empty.
+
+    This is a bounded recovery path, not the primary ingestion architecture.
+    It prevents a broken Alloy/Loki path from making healthy per-node eBPF
+    collectors invisible and reports exactly which collector logs failed.
+    """
+    if not _env_bool("BEYLA_DIRECT_LOG_FALLBACK_ENABLED", "true") or req.source == "static":
+        return [], {"id": "ebpf_beyla_direct", "status": "disabled"}
+    timeout = max(4, min(30, int(os.getenv("BEYLA_DIRECT_LOG_TIMEOUT_SECONDS", "12"))))
+    tail_lines = max(20, min(2000, int(os.getenv("BEYLA_DIRECT_LOG_TAIL_LINES", "300"))))
+    concurrency = max(1, min(32, int(os.getenv("BEYLA_DIRECT_LOG_CONCURRENCY", "12"))))
+    try:
+        inventory_payload = await asyncio.wait_for(rancher_inventory(), timeout=timeout)
+    except Exception as exc:
+        return [], {
+            "id": "ebpf_beyla_direct",
+            "status": "failed",
+            "error": f"inventory {type(exc).__name__}: {_redact_text(str(exc))}",
+        }
+    collectors = _beyla_collector_inventory(req, inventory_payload)
+    if not collectors:
+        return [], {
+            "id": "ebpf_beyla_direct",
+            "status": "empty",
+            "collectors": 0,
+            "hint": "纳管清单中没有匹配到 Beyla DaemonSet Pod。",
+        }
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def read_collector(collector: dict) -> dict:
+        async with semaphore:
+            cluster = collector.get("cluster") or {}
+            cluster_id = str(collector.get("cluster_id") or "")
+            namespace = str(collector.get("namespace") or "")
+            pod_name = str(collector.get("pod_name") or "")
+            container = str(collector.get("container") or "beyla")
+            try:
+                if str(cluster.get("source") or "") == "kubeconfig":
+                    payload = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            CLUSTER_REGISTRY.pod_priority_evidence,
+                            cluster_id,
+                            namespace=namespace,
+                            pod_name=pod_name,
+                            tail_lines=tail_lines,
+                        ),
+                        timeout=timeout,
+                    )
+                    container_logs = (payload.get("logs") or {}).get(container) or {}
+                    raw = "\n".join(filter(None, [
+                        str(container_logs.get("current") or ""),
+                        str(container_logs.get("previous") or ""),
+                    ]))
+                else:
+                    path = (
+                        f"/api/v1/namespaces/{quote(namespace, safe='')}/pods/"
+                        f"{quote(pod_name, safe='')}/log?"
+                        f"{urlencode({'tailLines': tail_lines, 'container': container})}"
+                    )
+                    payload = await asyncio.wait_for(
+                        _rancher_k8s_get(cluster_id, path, timeout=timeout),
+                        timeout=timeout + 1,
+                    )
+                    raw = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+                lines = [
+                    extracted
+                    for line in str(raw or "").splitlines()
+                    if (extracted := _extract_beyla_flow_line(line))
+                ]
+                return {**collector, "lines": lines, "error": ""}
+            except Exception as exc:
+                return {
+                    **collector,
+                    "lines": [],
+                    "error": f"{type(exc).__name__}: {_clip_text(_redact_text(str(exc)), 500)}",
+                }
+
+    try:
+        rows = await asyncio.wait_for(
+            asyncio.gather(*(read_collector(item) for item in collectors)),
+            timeout=timeout * max(2, (len(collectors) + concurrency - 1) // concurrency),
+        )
+    except asyncio.TimeoutError:
+        return [], {
+            "id": "ebpf_beyla_direct",
+            "status": "failed",
+            "collectors": len(collectors),
+            "error": "direct collector log read exceeded bounded deadline",
+        }
+
+    raw_flows: list[dict] = []
+    observed_nodes: set[tuple[str, str]] = set()
+    errors: list[dict] = []
+    collectors_with_flows = 0
+    for row in rows:
+        if row.get("error"):
+            errors.append({
+                "cluster": row.get("cluster_name"),
+                "node": row.get("node"),
+                "pod": row.get("pod_name"),
+                "error": row.get("error"),
+            })
+        if row.get("lines"):
+            collectors_with_flows += 1
+            observed_nodes.add((str(row.get("cluster_name") or ""), str(row.get("node") or "")))
+        for line in row.get("lines") or []:
+            raw_flows.append(_parse_beyla_network_flow_line(
+                line,
+                cluster_hint=str(row.get("cluster_name") or row.get("cluster_id") or ""),
+            ))
+    flows = normalize_observed_flow_payload(
+        raw_flows,
+        source_system="beyla",
+        cluster_hint=req.cluster_id or req.cluster or "",
+        default_namespace=req.namespace or "",
+    )
+    observed_labels = [
+        {"cluster": cluster, "node": node}
+        for cluster, node in sorted(observed_nodes)
+        if node
+    ]
+    node_coverage = await _beyla_node_coverage(req, observed_labels)
+    return flows, {
+        "id": "ebpf_beyla_direct",
+        "status": "connected" if flows else "degraded" if errors else "empty",
+        "mode": "managed_cluster_pod_logs",
+        "collectors": len(collectors),
+        "collectors_with_flows": collectors_with_flows,
+        "flows": len(flows),
+        "observed_flow_nodes": observed_labels,
+        "node_coverage": node_coverage,
+        "errors": errors[:20],
+        "hint": (
+            "Alloy/Loki 未返回 flow，已直接从已纳管集群的 Beyla Pod 日志恢复真实数据。"
+            if flows else
+            "Beyla Pod 可访问但当前日志窗口没有 network_flow；请先制造跨 Pod/Service 流量并检查 collector 日志。"
+        ),
+    }
+
+
+async def _beyla_node_coverage(req: ExternalTrafficFlowRequest, stream_labels: list[dict]) -> dict:
+    """Compare all compatible cluster nodes with ready Beyla collectors.
+
+    A Running DaemonSet alone is not evidence that every node is covered. This
+    contract reports both scheduling/readiness coverage and nodes that emitted
+    actual ``network_flow`` records in the selected window.
+    """
+    try:
+        inventory_payload = await asyncio.wait_for(
+            rancher_inventory(),
+            timeout=max(2.0, min(15.0, float(os.getenv("BEYLA_COVERAGE_TIMEOUT_SECONDS", "8")))),
+        )
+    except Exception as exc:
+        return {
+            "status": "unknown",
+            "error": f"{type(exc).__name__}: {_redact_text(str(exc))}",
+            "hint": "无法在时限内读取节点/DaemonSet 清单；流量数据仍保留，但不能宣称全节点覆盖。",
+        }
+
+    requested_cluster = str(req.cluster_id or req.cluster or "all")
+    expected: set[tuple[str, str]] = set()
+    ready_collectors: set[tuple[str, str]] = set()
+    for cluster_inventory in inventory_payload.get("inventory") or []:
+        cluster_meta = cluster_inventory.get("cluster") or {}
+        cluster_name = str(cluster_meta.get("name") or cluster_meta.get("id") or "")
+        cluster_id = str(cluster_meta.get("id") or cluster_name)
+        if requested_cluster not in {"", "all", cluster_name, cluster_id}:
+            continue
+        for node in cluster_inventory.get("nodes") or []:
+            if str(node.get("os") or "linux").lower() not in {"", "linux"}:
+                continue
+            node_name = str(node.get("name") or "")
+            if node_name:
+                expected.add((cluster_name, node_name))
+        for pod in cluster_inventory.get("pods") or []:
+            labels = pod.get("labels") or {}
+            if str(pod.get("namespace") or "") != os.getenv("BEYLA_LOKI_NAMESPACE", "flawless-ebpf"):
+                continue
+            collector_identity = " ".join([
+                str(pod.get("workload_name") or ""),
+                str(pod.get("name") or ""),
+                str(labels.get("app") or ""),
+                str(labels.get("app.kubernetes.io/name") or ""),
+            ]).lower()
+            if "beyla" not in collector_identity:
+                continue
+            if pod.get("phase") == "Running" and pod.get("ready") is True and pod.get("node"):
+                ready_collectors.add((cluster_name, str(pod.get("node"))))
+
+    default_cluster = str(
+        req.cluster_id
+        or req.cluster
+        or os.getenv("LOCAL_CLUSTER_NAME", "local")
+    )
+    observed: set[tuple[str, str]] = set()
+    for labels in stream_labels:
+        node_name = str(labels.get("node") or labels.get("node_name") or "")
+        cluster_name = str(labels.get("cluster") or default_cluster)
+        if node_name:
+            observed.add((cluster_name, node_name))
+
+    def public_nodes(values: set[tuple[str, str]]) -> list[dict]:
+        return [
+            {"cluster": cluster, "node": node}
+            for cluster, node in sorted(values)
+        ]
+
+    missing_collectors = expected - ready_collectors
+    collector_percent = round((len(ready_collectors & expected) / len(expected)) * 100, 1) if expected else None
+    status = "complete" if expected and not missing_collectors else "partial" if expected else "unknown"
+    return {
+        "status": status,
+        "expected_linux_nodes": len(expected),
+        "ready_collector_nodes": len(ready_collectors & expected),
+        "collector_coverage_percent": collector_percent,
+        "flow_observed_nodes": len(observed),
+        "missing_collector_nodes": public_nodes(missing_collectors),
+        "observed_flow_nodes": public_nodes(observed),
+        "contract": "all compatible Linux nodes have one Ready Beyla collector; flow-observed nodes emitted real network_flow data in the selected window",
+        "hint": (
+            "Beyla 尚未覆盖所有兼容 Linux 节点；先修复列出的缺失 DaemonSet Pod，再评估拓扑完整性。"
+            if missing_collectors else
+            "全节点采集器已就绪；没有业务流量的节点在当前窗口可能不会产生 network_flow。"
+        ),
+    }
 
 
 def _parse_beyla_network_flow_line(line: str, *, cluster_hint: str = "") -> dict:
@@ -5270,6 +5560,7 @@ async def _fetch_beyla_loki_flows(req: ExternalTrafficFlowRequest) -> tuple[list
             cluster_hint=req.cluster_id or req.cluster or "",
             default_namespace=req.namespace or "",
         )
+        node_coverage = await _beyla_node_coverage(req, stream_labels)
         return flows, [{
             "id": "ebpf_beyla",
             "status": "connected" if flows else "empty",
@@ -5285,6 +5576,7 @@ async def _fetch_beyla_loki_flows(req: ExternalTrafficFlowRequest) -> tuple[list
             "lines": len(raw_flows),
             "malformed_lines": malformed_lines,
             "flows": len(flows),
+            "node_coverage": node_coverage,
             "stream_labels": stream_labels[:5],
             "hint": (
                 "已通过备用 Loki label 查询发现 Beyla 流；请把页面显示的 effective_query 固化到 BEYLA_LOKI_QUERY。"
@@ -5498,6 +5790,24 @@ async def _fetch_configured_observed_flows(req: ExternalTrafficFlowRequest) -> t
     cfg = _observed_flow_endpoint_config()
     url = str(cfg.get("url") or "")
     beyla_flows, beyla_status = await _fetch_beyla_loki_flows(req)
+    if not beyla_flows and req.source != "static":
+        direct_flows, direct_status = await _fetch_beyla_direct_pod_log_flows(req)
+        if direct_status.get("status") != "disabled":
+            beyla_status = [*beyla_status, direct_status]
+        if direct_flows:
+            beyla_flows = direct_flows
+            for status_item in beyla_status:
+                if status_item.get("id") != "ebpf_beyla":
+                    continue
+                status_item["primary_path_status"] = status_item.get("status")
+                status_item.update({
+                    "status": "connected",
+                    "mode": direct_status.get("mode"),
+                    "flows": len(direct_flows),
+                    "node_coverage": direct_status.get("node_coverage") or {},
+                    "fallback_used": True,
+                    "hint": direct_status.get("hint") or status_item.get("hint"),
+                })
     if not url or req.source == "static":
         if beyla_status:
             if beyla_flows or req.source != "static":
@@ -14354,6 +14664,8 @@ async def _execute_ops_plan_once(
             f"提交变更：{change.get('type', 'change')} -> {change_target}",
             change_index=index,
             changes_total=len(changes),
+            action=change.get("type"),
+            change_target=change_target,
             change={
                 "type": change.get("type"),
                 "target": change_target,
@@ -14467,6 +14779,8 @@ async def _execute_ops_plan_once(
             ),
             change_index=index,
             changes_total=len(changes),
+            action=change.get("type"),
+            change_target=change_target,
             change_status=change_status,
             change_result={
                 "status": change_status,
@@ -16888,7 +17202,7 @@ async def ops_capabilities():
     skills = OPS_SKILL_REGISTRY.list()
     return {
         "status": "ok",
-        "planner": "DeepSeekRootCauseSkillRouter/v1 + UnifiedExecutableOpsSkillRuntime/v1 + ApprovalGate + RecoveryVerifier",
+        "planner": "ResumableSREHarness/v1 + DeepSeekRootCauseSkillRouter/v1 + UnifiedExecutableOpsSkillRuntime/v1 + ApprovalGate + RecoveryVerifier",
         "executable_skill_handlers": public_runtime_catalog(),
         "actions": action_catalog_payload(),
         "skill_options": skill_option_catalog(),
@@ -16959,6 +17273,12 @@ async def _append_ops_job_event(job_id: str, stage: str, message: str, **values)
         events.append(event)
         del events[:-240]
         job.update(values)
+        job["harness"] = checkpoint_event(
+            job.get("harness") or new_ops_harness(job.get("plan") or {}, created_at=job.get("created_at") or now),
+            stage,
+            message,
+            values,
+        )
         if update_stage:
             job["stage"] = stage
             job["message"] = message
@@ -17309,7 +17629,18 @@ async def _run_ops_job(job_id: str, initial_plan: dict, autonomous: bool, cancel
             del history[:-60]
             result = _attach_ops_continuation_context(job_id, current, result, attempted, history)
             history[-1]["result"] = result
-            await _update_ops_job(job_id, history=history, result=result)
+            harness = record_attempt((OPS_JOBS.get(job_id) or {}).get("harness") or {}, current, result)
+            await _update_ops_job(job_id, history=history, result=result, harness=harness)
+            if harness.get("stuck_detected"):
+                await _append_ops_job_event(
+                    job_id,
+                    "trajectory_stuck_detected",
+                    "Harness 检测到连续无进展轨迹；保留证据并强制换 Skill/变更指纹，不再重复原方案。",
+                    status="running",
+                    trajectory_digest=harness.get("last_trajectory_digest"),
+                    no_progress_count=harness.get("no_progress_count"),
+                    level="warning",
+                )
             active_skill_id = str(current.get("selected_skill_id") or "")
             skill_was_executed = bool(result.get("results"))
             if active_skill_id and skill_was_executed:
@@ -17860,6 +18191,7 @@ async def _enqueue_ops_job(plan_input: dict, actor: str, *, autonomous: bool, co
         "created_at": now,
         "updated_at": now,
         "plan": copy.deepcopy(plan),
+        "harness": new_ops_harness(plan, created_at=now),
     }
     cancel_event = asyncio.Event()
     async with OPS_JOBS_LOCK:

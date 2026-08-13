@@ -4,7 +4,7 @@ metadata:
   name: k8s-agent-config
   namespace: k8s-agent
 data:
-  APP_BUILD_VERSION: '5.1.0'
+  APP_BUILD_VERSION: '5.2.0'
   OAUTH_TOKEN_URL: ''
   LLM_GATEWAY_BASE: ''
   LLM_API_BASE: http://ollama.default.svc.cluster.local:11434/v1
@@ -74,6 +74,11 @@ data:
   # 从 0 部署 eBPF 时，Beyla 会把 network_flow 输出到日志；Alloy 收集到 Loki 后由后端解析成真实数据流。
   BEYLA_LOKI_FLOW_ENABLED: 'true'
   BEYLA_LOKI_NAMESPACE: flawless-ebpf
+  BEYLA_COVERAGE_TIMEOUT_SECONDS: '8'
+  BEYLA_DIRECT_LOG_FALLBACK_ENABLED: 'true'
+  BEYLA_DIRECT_LOG_TIMEOUT_SECONDS: '12'
+  BEYLA_DIRECT_LOG_CONCURRENCY: '12'
+  BEYLA_DIRECT_LOG_TAIL_LINES: '300'
   BEYLA_LOKI_POD_SELECTOR: flawless-beyla.*
   BEYLA_LOKI_FLOW_LIMIT: '500'
   BEYLA_FLOW_QUERY_WINDOW: 5m
@@ -289,7 +294,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: mcp-server
-        image: ghcr.dockerproxy.net/your-org/flawless:5.1.0
+        image: ghcr.dockerproxy.net/your-org/flawless:5.2.0
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -327,7 +332,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: observability-agent
-        image: ghcr.dockerproxy.net/your-org/flawless:5.1.0
+        image: ghcr.dockerproxy.net/your-org/flawless:5.2.0
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -384,7 +389,7 @@ spec:
             cpu: 1
             memory: 1Gi
       - name: healing-agent
-        image: ghcr.dockerproxy.net/your-org/flawless:5.1.0
+        image: ghcr.dockerproxy.net/your-org/flawless:5.2.0
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -422,7 +427,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: incident-agent
-        image: ghcr.dockerproxy.net/your-org/flawless:5.1.0
+        image: ghcr.dockerproxy.net/your-org/flawless:5.2.0
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -460,7 +465,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: postmortem-agent
-        image: ghcr.dockerproxy.net/your-org/flawless:5.1.0
+        image: ghcr.dockerproxy.net/your-org/flawless:5.2.0
         imagePullPolicy: Always
         command:
         - sh
@@ -512,7 +517,7 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 3
       - name: openwebui-adapter
-        image: ghcr.dockerproxy.net/your-org/flawless:5.1.0
+        image: ghcr.dockerproxy.net/your-org/flawless:5.2.0
         imagePullPolicy: Always
         command:
         - uvicorn

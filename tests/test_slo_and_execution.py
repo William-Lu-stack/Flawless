@@ -2494,7 +2494,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "network_flow: k8s.src.namespace=apps k8s.src.owner.name=api "
                 "k8s.src.owner.type=Deployment k8s.dst.namespace=data "
                 "k8s.dst.owner.name=postgres k8s.dst.owner.type=StatefulSet "
-                "src.address=10.0.0.2 dst.address=10.0.0.3 dst.port=5432 transport=TCP"
+                "src.address=192.0.2.2 dst.address=192.0.2.3 dst.port=5432 transport=TCP"
             ),
         })
         payload = {
@@ -2521,7 +2521,7 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             "network_flow: k8s.src.namespace=apps k8s.src.owner.name=api "
             "k8s.src.owner.type=Deployment k8s.dst.namespace=data "
             "k8s.dst.owner.name=postgres k8s.dst.owner.type=StatefulSet "
-            "src.address=10.0.0.2 dst.address=10.0.0.3 dst.port=5432 transport=TCP"
+            "src.address=192.0.2.2 dst.address=192.0.2.3 dst.port=5432 transport=TCP"
         )
 
         class Response:

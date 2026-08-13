@@ -387,6 +387,7 @@ export function OpsJobProgress({
   );
   const completedThrough = Math.max(-1, ...events.map((event: any) => completedPhase(event?.stage)));
   const pendingApproval = currentJob?.pending_approval;
+  const harness = currentJob?.harness || {};
 
   useEffect(() => {
     setLiveJob(job);
@@ -523,6 +524,8 @@ export function OpsJobProgress({
         <div><span>集群/命名空间</span><strong>{currentJob?.cluster || "-"} / {currentJob?.namespace || "-"}</strong></div>
         <div><span>操作员</span><strong>{currentJob?.operator || "system"}</strong></div>
         <div><span>更新时间</span><strong>{formatTime(currentJob?.updated_at)}</strong></div>
+        <div><span>执行 Harness</span><strong>{harness.version || "legacy"} · checkpoint {harness.checkpoint_seq || 0}</strong></div>
+        <div><span>完成判定</span><strong>{harness.completion?.recovered === true ? "已验证恢复" : harness.stuck_detected ? "停滞已换路" : "持续验证"}</strong></div>
       </div>
       {!active && result?.verification && result.verification.recovered !== true && <div className="ops-blocked-guidance">
         <b>故障闭环仍然打开</b>

@@ -1768,6 +1768,7 @@ function TopologyPage() {
   const blast = policy.blast_radius || {};
   const ebpfStatuses = asList(topology.data?.diagnostics?.ebpf_flow_status);
   const beylaStatus = ebpfStatuses.find((item: any) => item?.id === "ebpf_beyla") || ebpfStatuses[0];
+  const beylaCoverage = beylaStatus?.node_coverage || {};
   return (
     <section className="topology-modern">
       <Panel className="topology-map">
@@ -1840,12 +1841,18 @@ function TopologyPage() {
           <Metric title="eBPF 流边" value={topology.data?.summary?.ebpf_observed_edges || 0} />
         </div>
         {beylaStatus && (
-          <div className={cx("analysis-card", beylaStatus.status === "connected" ? "success" : "warning")}>
+          <div className={cx("analysis-card", beylaStatus.status === "connected" && beylaCoverage.status === "complete" ? "success" : "warning")}>
             <span>eBPF/Beyla 接入 · {beylaStatus.status || "unknown"}</span>
             <strong>{beylaStatus.flows || 0} 条有效流 / {beylaStatus.lines || 0} 条 flow 日志</strong>
             <p>
-              {beylaStatus.hint || beylaStatus.error || `Loki 查询：${beylaStatus.effective_query || beylaStatus.configured_query || "-"}`}
+              节点采集覆盖：{beylaCoverage.ready_collector_nodes ?? "-"}/{beylaCoverage.expected_linux_nodes ?? "-"}
+              {beylaCoverage.collector_coverage_percent != null ? `（${beylaCoverage.collector_coverage_percent}%）` : ""}
+              · 当前窗口真实流节点 {beylaCoverage.flow_observed_nodes ?? 0}
             </p>
+            <p>
+              {beylaCoverage.hint || beylaStatus.hint || beylaStatus.error || `Loki 查询：${beylaStatus.effective_query || beylaStatus.configured_query || "-"}`}
+            </p>
+            {asList(beylaCoverage.missing_collector_nodes).length > 0 && <small>缺失节点：{asList(beylaCoverage.missing_collector_nodes).slice(0, 8).map((item: any) => `${item.cluster}/${item.node}`).join("、")}</small>}
             {beylaStatus.query_fallback_used && <small>配置的 Loki labels 未命中；当前通过备用查询发现数据，请按 effective_query 更新 ConfigMap。</small>}
           </div>
         )}

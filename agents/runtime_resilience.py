@@ -16,23 +16,45 @@ class BulkheadRejected(RuntimeError):
 
 
 class AsyncBulkhead:
-    """Bound concurrent work and fail fast instead of exhausting the process."""
+    """Bound concurrent work with either queued or fail-fast admission.
+
+    Long-running SRE requests must not be reported as an overloaded operation
+    merely because a short acquire timeout elapsed.  Callers that represent a
+    user/control-plane workflow can opt into ``queue=True`` while outbound
+    best-effort integrations retain the fail-fast default.
+    """
 
     def __init__(self, limit: int, acquire_timeout: float = 1.5):
         self.limit = max(1, int(limit or 1))
         self.acquire_timeout = max(0.05, float(acquire_timeout or 1.5))
         self._sem = asyncio.Semaphore(self.limit)
         self.in_flight = 0
+        self.queued = 0
         self.rejected = 0
+        self.admitted = 0
+        self.peak_in_flight = 0
+        self.peak_queued = 0
+        self.total_wait_seconds = 0.0
 
     @asynccontextmanager
-    async def slot(self):
+    async def slot(self, *, queue: bool = False):
+        started = time.monotonic()
+        self.queued += 1
+        self.peak_queued = max(self.peak_queued, self.queued)
         try:
-            await asyncio.wait_for(self._sem.acquire(), timeout=self.acquire_timeout)
+            if queue:
+                await self._sem.acquire()
+            else:
+                await asyncio.wait_for(self._sem.acquire(), timeout=self.acquire_timeout)
         except asyncio.TimeoutError as exc:
             self.rejected += 1
             raise BulkheadRejected(f"bulkhead full: limit={self.limit}") from exc
+        finally:
+            self.queued = max(0, self.queued - 1)
+            self.total_wait_seconds += max(0.0, time.monotonic() - started)
         self.in_flight += 1
+        self.admitted += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
         try:
             yield
         finally:
@@ -40,7 +62,16 @@ class AsyncBulkhead:
             self._sem.release()
 
     def snapshot(self) -> dict[str, Any]:
-        return {"limit": self.limit, "in_flight": self.in_flight, "rejected": self.rejected}
+        return {
+            "limit": self.limit,
+            "in_flight": self.in_flight,
+            "queued": self.queued,
+            "rejected": self.rejected,
+            "admitted": self.admitted,
+            "peak_in_flight": self.peak_in_flight,
+            "peak_queued": self.peak_queued,
+            "total_wait_seconds": round(self.total_wait_seconds, 3),
+        }
 
 
 class TTLCache:

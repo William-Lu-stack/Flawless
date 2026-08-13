@@ -16,17 +16,22 @@
 
 Maintained by the **Flawless Contributors** community.
 
-Current release: **5.1.0**.
+Current release: **5.2.0**.
 
 中文技术架构、工程实现、测试证据和项目工具材料见
 [`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
 灰度发布的生产安装、配置和状态语义见
 [`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
 
-Release 5.1.0 expands the executable Kubernetes Skill runtime, queues real
-mutations without charging human approval wait time, and adds a refined 3D
-topology with an operator-controlled automatic orbit. Operations Effectiveness
-continues to show only verified resolutions with expandable evidence.
+Release 5.2.0 adds a persistent, model-independent SRE execution harness with
+phase checkpoints, tool receipts, repeated-trajectory detection and a
+deterministic completion evaluator. General API admission now queues instead
+of surfacing false operations-overload errors, while job control and approval
+remain responsive and actual Kubernetes mutations keep their target-aware
+single-flight lease. Beyla and Alloy now cover tainted Linux nodes, attach node
+and cluster labels, and expose expected-versus-ready collector coverage beside
+the real flow topology. Operations Effectiveness continues to show only
+verified resolutions with expandable evidence.
 The default view shows only incidents whose recovery contract passed, with a
 clear problem title, target, Skill, completion time and recovered Pod count.
 Opening a record reveals the root cause, strategy history, approved changes,

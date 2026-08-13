@@ -11,7 +11,7 @@ namespaceOverride: k8s-agent
 
 image:
   repository: ghcr.dockerproxy.net/your-org/flawless
-  tag: 5.1.0
+  tag: 5.2.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
