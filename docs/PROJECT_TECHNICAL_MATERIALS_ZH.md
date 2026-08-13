@@ -299,7 +299,7 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 
 5.2.0 已完成：
 
-- Python 全量测试：243 passed（含 11 个常见 Kubernetes 可执行 Skill 的统一执行契约矩阵）。
+- Python 全量测试：229 passed + 25 subtests（含 11 个常见 Kubernetes 可执行 Skill 的统一执行契约矩阵）；标准库 unittest 门禁为 229 tests。
 - 前端生产构建：TypeScript 校验和 Vite build 通过。
 - 新增 `ResumableSREHarness/v1`：阶段检查点、工具/变更回执、重复轨迹停滞检测和确定性完成判定均随 OpsJob 持久化；模型不能自行把任务标记为恢复。
 - HTTP 并发门禁改为排队而不是 1.5 秒后返回“运维过载”；任务创建、状态读取、逐项审批和中断属于优先控制链路，不会被看板或慢清单请求饿死。
