@@ -37,7 +37,6 @@ orjson>=3.10.0
 tenacity>=8.5.0
 packaging>=24.0
 msgpack>=1.2.1,<2.0.0
-setuptools>=78.1.1
 
 mcp>=1.0.0,<2.0.0
 jsonschema>=4.23.0

@@ -100,7 +100,12 @@ RUN set -eux; \
       --retries ${PIP_RETRIES}; \
     pip install --require-hashes -r requirements.lock \
       --timeout ${PIP_TIMEOUT} \
-      --retries ${PIP_RETRIES}
+      --retries ${PIP_RETRIES}; \
+    # The runtime never installs packages. Removing build tooling also removes
+    # pip's vendored dependency copies from the production attack surface.
+    python -m pip uninstall -y setuptools; \
+    python -m pip uninstall -y pip; \
+    rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.13
 
 COPY . .
 # 保留静态制品用于本地单进程开发；生产环境使用 frontend-runtime 独立部署。
