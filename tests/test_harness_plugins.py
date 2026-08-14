@@ -5,6 +5,7 @@ import unittest
 from backend.app.services.harness_plugins import (
     HarnessPluginRuntime,
     HarnessPolicyDenied,
+    LocalServiceProvider,
     PluginManifest,
     compact_planner_context,
     guard_execution_request,
@@ -13,6 +14,57 @@ from backend.app.services.harness_plugins import (
 
 
 class HarnessPluginRuntimeTests(unittest.TestCase):
+    def test_builtin_capability_can_be_rebound_to_an_invokable_provider(self):
+        runtime = HarnessPluginRuntime(runtime_id="test")
+        runtime.mount(
+            PluginManifest(id="provider", provides=("evidence.reader",)),
+            lambda context: context.provide("evidence.reader", {"descriptor": True}),
+        )
+
+        async def collect(payload):
+            return {"target": payload["target"], "ready": True}
+
+        runtime.bind_service(
+            "provider",
+            "evidence.reader",
+            LocalServiceProvider(
+                plugin_id="provider",
+                operations={"collect": collect},
+            ),
+            priority=5000,
+        )
+        result = asyncio.run(runtime.invoke("evidence.reader", "collect", {"target": "workload-a"}))
+
+        self.assertEqual(result, {"target": "workload-a", "ready": True})
+        binding = runtime.diagnostics()["service_bindings"]["evidence.reader"][0]
+        self.assertTrue(binding["invokable"])
+        runtime.unmount("provider")
+        self.assertFalse(runtime.has_service("evidence.reader"))
+
+    def test_rebinding_same_concrete_provider_is_idempotent(self):
+        runtime = HarnessPluginRuntime(runtime_id="test")
+        runtime.mount(
+            PluginManifest(id="provider", provides=("planner",)),
+            lambda context: context.provide("planner", {"descriptor": True}),
+        )
+        runtime.bind_service(
+            "provider",
+            "planner",
+            LocalServiceProvider(plugin_id="provider", operations={"run": lambda _payload: 1}),
+        )
+        runtime.bind_service(
+            "provider",
+            "planner",
+            LocalServiceProvider(plugin_id="provider", operations={"run": lambda _payload: 2}),
+        )
+
+        self.assertEqual(asyncio.run(runtime.invoke("planner", "run")), 2)
+        concrete = [
+            item for item in runtime.diagnostics()["service_bindings"]["planner"]
+            if item["invokable"]
+        ]
+        self.assertEqual(len(concrete), 1)
+
     def test_dependencies_activate_after_provider_and_unwind_on_unmount(self):
         runtime = HarnessPluginRuntime(runtime_id="test")
         disposed: list[str] = []

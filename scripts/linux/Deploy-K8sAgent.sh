@@ -290,7 +290,7 @@ helm_args=(
 if [[ "$image_mode" == "private" ]]; then
   helm_args+=(
     --set-string "image.repository=$private_registry/$image_namespace/flawless"
-    --set-string "image.tag=5.5.1"
+    --set-string "image.tag=5.6.0"
     --set-string "config.NODE_EXEC_IMAGE=$private_registry/$image_namespace/cisre-node-exec:1.36"
   )
 fi

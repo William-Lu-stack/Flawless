@@ -80,7 +80,9 @@ from cmdb.local_cmdb import _collect_cluster_topology
 from backend.app.services.ops_execution import StageTimeoutError, run_with_heartbeat
 from backend.app.services.ops_harness import checkpoint_event, new_ops_harness, record_attempt
 from backend.app.services.harness_plugins import (
+    CISRE_HARNESS_RUNTIME,
     HarnessPolicyDenied,
+    LocalServiceProvider,
     compact_planner_context,
     guard_execution_request,
     harness_capabilities_payload,
@@ -219,7 +221,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.5.1")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.6.0")
 APP_CODE_SIGNATURE = "cisre-durable-harness-v2-target-binding-closure-v2"
 BUILTIN_SKILL_POLICY_REVISION = "3.0.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -11108,7 +11110,7 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             "rollout_complete",
             "restart_count_stable",
             "events_no_new_backoff",
-            "current_logs_checked",
+            "current_logs_or_ready_state",
             "runtime_failure_absent",
         ])
     workload_change_applied, workload_change_proof = _live_workload_postcondition(
@@ -11146,9 +11148,13 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
     mandatory = list(dict.fromkeys(mandatory))
     normalized_requested = {item.strip().lower().replace(" ", "_") for item in requested}
     requested = requested + [item for item in mandatory if item not in normalized_requested]
+    pod_state_text = _pod_state_text(pod).lower()
+    event_text = json.dumps(
+        _redact_sensitive(events), ensure_ascii=False, default=str,
+    ).lower()
     historical_text = " ".join([
-        _pod_state_text(pod),
-        json.dumps(_redact_sensitive(events), ensure_ascii=False, default=str),
+        pod_state_text,
+        event_text,
         json.dumps(_redact_sensitive(logs), ensure_ascii=False, default=str),
     ]).lower()
     current_log_payload = {
@@ -11156,11 +11162,11 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
         for name, content in logs.items()
         if isinstance(content, dict) and "current" in content
     }
-    current_text = " ".join([
-        _pod_state_text(pod),
-        json.dumps(_redact_sensitive(events), ensure_ascii=False, default=str),
-        json.dumps(_redact_sensitive(current_log_payload), ensure_ascii=False, default=str),
-    ]).lower()
+    current_log_text = json.dumps(
+        _redact_sensitive(current_log_payload), ensure_ascii=False, default=str,
+    ).lower()
+    current_runtime_text = " ".join([pod_state_text, current_log_text]).lower()
+    current_text = " ".join([current_runtime_text, event_text]).lower()
     current_logs_checked = any(
         "current" in content and not content.get("current_error")
         for content in logs.values()
@@ -11178,7 +11184,7 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
         else current_restarts <= max(1, baseline_restarts)
     )
     restart_samples[pod_key] = current_restarts
-    write_error_absent = not any(term in current_text for term in (
+    write_error_absent = not any(term in current_runtime_text for term in (
         "permission denied", "operation not permitted", "read-only file system", "mkdir:",
         "unable to open database file", "can't open database file", "cannot open database file",
         "attempt to write a readonly database", "attempt to write a read-only database",
@@ -11188,7 +11194,7 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
         "failed to create temporary file", "data directory is not writable",
         " is not writable", "paths_data", "path_data",
     ))
-    write_probe_succeeded = any(term in current_text for term in (
+    write_probe_succeeded = any(term in current_runtime_text for term in (
         "file_create_ok",
         "file create ok",
         "write_probe_ok",
@@ -11298,7 +11304,27 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
         "createcontainerconfigerror", "runcontainererror", "exec format error",
         "permission denied", "read-only file system", "unable to open database file",
     )
-    runtime_failure_absent = not any(term in current_text for term in runtime_failure_terms)
+    runtime_failure_absent = not any(
+        term in current_runtime_text for term in runtime_failure_terms
+    )
+    event_failure_terms = (
+        "backoff", "back-off restarting", "failedmount", "failedattachvolume",
+        "errimagepull", "imagepullbackoff", "failedcreatepodsandbox",
+    )
+    historical_event_failure = any(term in event_text for term in event_failure_terms)
+    # Kubernetes keeps Warning Events after a Pod has recovered. A historical
+    # BackOff must not hold the incident open forever once the new Pod is
+    # Ready, the owning Workload has converged and restart_count is stable.
+    # The stability window repeats this check and catches a real recurrence.
+    active_event_failure = bool(
+        historical_event_failure
+        and not (
+            verification.get("recovered") is True
+            and bool(pod and (pod.get("ready") or _pod_completed_successfully(pod)))
+            and rollout_complete
+            and restart_count_stable
+        )
+    )
     known: dict[str, tuple[bool | None, str]] = {
         "pod_ready": (
             verification.get("recovered") is True and bool(pod and (pod.get("ready") or _pod_completed_successfully(pod))),
@@ -11325,12 +11351,41 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             current_logs_checked,
             "已读取新 Pod 当前容器日志；previous 日志只用于根因追溯，不参与恢复失败判定",
         ),
+        "current_logs_or_ready_state": (
+            bool(
+                current_logs_checked
+                or (
+                    verification.get("recovered") is True
+                    and bool(pod and (pod.get("ready") or _pod_completed_successfully(pod)))
+                    and rollout_complete
+                    and restart_count_stable
+                )
+            ),
+            (
+                "已读取新 Pod current logs；previous logs 只用于诊断"
+                if current_logs_checked else
+                "current logs 通道不可用，但变更后 Pod 身份、容器 Ready、Workload rollout 与重启稳定共同证明运行态健康"
+            ),
+        ),
         "runtime_failure_absent": (
             runtime_failure_absent,
             "新 Pod 当前状态、当前日志和 Events 无 CrashLoop/ImagePull/Mount/OOM/权限等故障签名",
         ),
-        "events_no_new_backoff": (not any(term in current_text for term in ("backoff", "back-off restarting", "failedmount", "errimagepull")), "新 Pod Events 无 BackOff/FailedMount/ImagePull"),
-        "mount_events_absent": (not any(term in current_text for term in ("failedmount", "failedattachvolume", "mountvolume")), "新 Pod 无挂载失败事件"),
+        "events_no_new_backoff": (
+            not active_event_failure,
+            (
+                "旧 Warning Event 已由新 Pod Ready、rollout 收敛和重启稳定证据取代"
+                if historical_event_failure and not active_event_failure
+                else "新 Pod 无活跃 BackOff/FailedMount/ImagePull"
+            ),
+        ),
+        "mount_events_absent": (
+            not (
+                any(term in event_text for term in ("failedmount", "failedattachvolume", "mountvolume"))
+                and active_event_failure
+            ),
+            "新 Pod 无活跃挂载失败；历史 Event 不覆盖当前运行态证据",
+        ),
         "write_errors_absent": (
             write_error_absent,
             "新 Pod 日志无直接或应用层包装的路径写入错误",
@@ -11343,15 +11398,15 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             write_probe_succeeded,
             "新 Pod 日志包含明确的文件/数据库写探针成功标记",
         ),
-        "oom_absent": ("oomkilled" not in current_text and "out of memory" not in current_text, "新 Pod 无 OOM 证据"),
-        "probe_failures_absent": ("probe failed" not in current_text and "unhealthy" not in current_text, "新 Pod 无探针失败证据"),
-        "image_pulled": (not any(term in current_text for term in ("imagepullbackoff", "errimagepull", "pull access denied")), "新 Pod 无镜像拉取失败"),
+        "oom_absent": ("oomkilled" not in current_runtime_text and "out of memory" not in current_runtime_text, "新 Pod 无 OOM 证据"),
+        "probe_failures_absent": ("probe failed" not in current_runtime_text and "unhealthy" not in current_runtime_text, "新 Pod 无探针失败证据"),
+        "image_pulled": (not any(term in current_runtime_text for term in ("imagepullbackoff", "errimagepull", "pull access denied")), "新 Pod 无镜像拉取失败"),
         "pvc_bound": (
             all(str(item.get("pvc_phase") or "") == "Bound" for item in storage if isinstance(item, dict) and item.get("pvc"))
             if any(isinstance(item, dict) and item.get("pvc") for item in storage) else None,
             "关联 PVC 均为 Bound",
         ),
-        "config_ref_exists": (not any(term in current_text for term in ("configmap not found", "secret not found", "createcontainerconfigerror")), "新 Pod 无配置引用缺失"),
+        "config_ref_exists": (not any(term in current_runtime_text for term in ("configmap not found", "secret not found", "createcontainerconfigerror")), "新 Pod 无配置引用缺失"),
         "pod_scheduled": (bool(pod.get("node")) if pod else None, "Pod 已分配节点"),
         "endpoint_ready": (
             all(int(item.get("ready_endpoints") or 0) > 0 for item in services) if services else None,
@@ -11375,8 +11430,8 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             "新 Pod 已运行且无镜像架构不匹配证据",
         ),
         "constraint_satisfied": (bool(pod.get("node")) if pod else None, "Pod 已满足调度约束并分配节点"),
-        "admission_allowed": (bool(pod) and not any(term in current_text for term in ("exceeded quota", "limitrange", "admission webhook denied")), "新 Pod 无准入/配额拒绝"),
-        "pod_sandbox_ready": (verification.get("recovered") is True and "failedcreatepodsandbox" not in current_text, "Pod sandbox 已建立"),
+        "admission_allowed": (bool(pod) and not any(term in current_runtime_text for term in ("exceeded quota", "limitrange", "admission webhook denied")), "新 Pod 无准入/配额拒绝"),
+        "pod_sandbox_ready": (verification.get("recovered") is True and "failedcreatepodsandbox" not in current_runtime_text, "Pod sandbox 已建立"),
     }
     evaluations = []
     failed: list[str] = []
@@ -20375,6 +20430,150 @@ def _fallback_diagnosis_response(req: ChatRequest) -> dict:
 async def _submit_release_job(release: dict, actor: str) -> dict:
     """兼容旧调用点，实际转换逻辑位于独立发布执行服务。"""
     return await submit_release_job(release, actor, _enqueue_ops_job)
+
+
+def _bind_builtin_harness_services() -> None:
+    """Bind the real SRE pipeline behind the stable plugin service seams."""
+
+    async def planner(payload: dict) -> list[dict]:
+        return await _evidence_based_replan(
+            payload.get("plan") or {},
+            payload.get("steps") or [],
+            set(payload.get("attempted_actions") or []),
+            include_llm=payload.get("include_llm") is not False,
+        )
+
+    async def execute(payload: dict) -> dict:
+        return await _execute_change(payload.get("change") or {}, payload.get("plan") or {})
+
+    async def mutation_readback(payload: dict) -> dict:
+        return await _verify_workload_mutation_postcondition(
+            payload.get("plan") or {},
+            payload.get("change") or {},
+            payload.get("result") or {},
+        )
+
+    async def recovery_verify(payload: dict) -> dict:
+        return await _verify_plan_recovery(
+            payload.get("plan") or {},
+            payload.get("results") or [],
+        )
+
+    async def run_agent_loop(payload: dict) -> dict:
+        return await _execute_ops_plan_once(
+            payload.get("plan") or {},
+            summarize=payload.get("summarize") is not False,
+        )
+
+    async def enqueue_owned_job(payload: dict) -> dict:
+        return await _enqueue_ops_job(
+            payload.get("plan") or {},
+            str(payload.get("actor") or "harness"),
+            autonomous=payload.get("autonomous") is True,
+            confirmed=payload.get("confirmed") is True,
+        )
+
+    async def orchestrate_diagnostics(payload: dict) -> dict:
+        """Run bounded read-only specialists without sharing mutation authority."""
+        plans = [
+            copy.deepcopy(item)
+            for item in (payload.get("plans") or [])[:8]
+            if isinstance(item, dict)
+        ]
+        if not plans:
+            raise ValueError("agent orchestration requires at least one plan")
+        if any(item.get("changes") for item in plans):
+            raise HarnessPolicyDenied(
+                "delegated agents are read-only; mutations require the owner OpsJob approval chain"
+            )
+
+        async def run_child(index: int, child: dict) -> dict:
+            child.setdefault("source", "harness-specialist-delegation")
+            child.setdefault("steps", [{
+                "title": "领域专家诊断",
+                "description": "收集本域证据并返回类型化方案，不执行真实变更。",
+                "status": "pending",
+            }])
+            result = await _execute_ops_plan_once(
+                child,
+                summarize=payload.get("summarize") is not False,
+            )
+            return {"index": index, "domain": child.get("domain"), "result": result}
+
+        requested_mode = str(payload.get("mode") or "sequential")
+        mode = requested_mode if requested_mode in {"sequential", "parallel"} else "sequential"
+        if mode == "parallel":
+            children = await asyncio.gather(*(
+                run_child(index, child) for index, child in enumerate(plans)
+            ))
+        else:
+            children = []
+            for index, child in enumerate(plans):
+                children.append(await run_child(index, child))
+        return {
+            "mode": mode,
+            "child_count": len(children),
+            "mutation_authority": False,
+            "children": children,
+        }
+
+    bindings = (
+        (
+            "cisre.context-compaction",
+            "context.compactor",
+            {"compact": lambda payload: compact_planner_context(
+                plan=payload.get("plan") or {},
+                evidence=payload.get("evidence") or {},
+                failure=payload.get("failure") or {},
+                attempted_actions=set(payload.get("attempted_actions") or []),
+                blocked_fingerprints=set(payload.get("blocked_fingerprints") or []),
+                max_chars=payload.get("max_chars"),
+            )},
+        ),
+        ("cisre.deepseek-planner", "planner.deepseek-compatible", {"plan": planner}),
+        (
+            "cisre.skill-router",
+            "skill.router",
+            {"materialize": lambda payload: _materialize_executable_skill(
+                payload.get("plan") or {},
+                payload.get("signal") or {},
+                str(payload.get("skill_id") or ""),
+            )},
+        ),
+        ("cisre.kubernetes-executor", "tool.executor.kubernetes", {"execute": execute}),
+        ("cisre.read-after-write", "verifier.mutation", {"verify": mutation_readback}),
+        ("cisre.recovery-verifier", "verifier.recovery", {"verify": recovery_verify}),
+        (
+            "cisre.goal-round-driver",
+            "goal.driver",
+            {"record": lambda payload: record_attempt(
+                payload.get("harness") or {},
+                payload.get("plan") or {},
+                payload.get("result") or {},
+            )},
+        ),
+        ("cisre.owner-scoped-jobs", "jobs.owner-scoped", {"enqueue": enqueue_owned_job}),
+        ("cisre.agent-loop", "agent.loop", {"run": run_agent_loop}),
+        (
+            "cisre.agent-orchestrator",
+            "agent.orchestration",
+            {"delegate": orchestrate_diagnostics},
+        ),
+        (
+            "cisre.agent.kubernetes",
+            "agent.domain.kubernetes",
+            {"run": run_agent_loop},
+        ),
+    )
+    for plugin_id, service, operations in bindings:
+        CISRE_HARNESS_RUNTIME.bind_service(
+            plugin_id,
+            service,
+            LocalServiceProvider(plugin_id=plugin_id, operations=operations),
+        )
+
+
+_bind_builtin_harness_services()
 
 
 # ============================================================

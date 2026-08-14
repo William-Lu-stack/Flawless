@@ -2,7 +2,7 @@
 
 CISRE（Cloud Infrastructure Site Reliability Engine）把基础设施的风险发现、证据采集、根因诊断、人工审批、受控变更、恢复验证和经验沉淀连接成一条可审计闭环。
 
-当前版本：**5.5.1**。
+当前版本：**5.6.0**。
 
 ## 一句话理解
 
@@ -22,7 +22,7 @@ CISRE（Cloud Infrastructure Site Reliability Engine）把基础设施的风险�
 - **AI 巡检**：定时或手动发现风险，并复用与 SRE Run 相同的运维内核。
 - **拓扑影响**：展示资源依赖、流量和爆炸半径，辅助风险门禁。
 - **Skill 库**：维护问题触发条件、渐进取证、动作、回滚与成功判据。
-- **插件中心**：查看插件详情、调用条件、服务依赖、安全边界、最近调用；支持可视化或模型辅助创建插件。
+- **插件中心**：查看插件详情、调用条件、服务依赖、安全边界、最近调用；支持可视化或模型辅助创建，并一键下载可运行的 Provider + Skill + 测试 + 部署工程。
 - **平台能力**：运行总览、资源事件、插件与 Profile、Agent Trace、运维成效。
 - **运维成效**：只统计已经通过恢复验证的问题；可展开根因、Skill、变更和恢复证据。
 
@@ -73,7 +73,8 @@ typed action → policy / blast radius → human approval → executor
 2. 点击“新建插件”，选择数据库、VM、存储等领域模板，用表单生成 Manifest。
 3. 或在“AI 辅助开发”中描述目标，让当前兼容模型生成草案。
 4. 检查生成的 `provides`、`requires`、权限、Agent Loop 和安全边界。
-5. 先校验，再安装/热重载；生产页面写入默认关闭，需要平台配置显式开启。
+5. 点击“下载完整插件项目”，得到独立 Provider、领域 Skill、合同测试、安全说明、Dockerfile 和 Kubernetes YAML。
+6. 先校验，再安装/热重载；生产页面写入默认关闭，需要平台配置显式开启。
 
 模型生成的只是声明式草案，必须通过 Schema 和权限校验，不会自动获得凭据或执行权。
 
@@ -106,8 +107,10 @@ team-<domain>-sre-plugin/
 - [插件团队接入手册](docs/PLUGIN_TEAM_ONBOARDING_ZH.md)
 - [代码架构、团队协作与扩展指南](docs/TEAM_ARCHITECTURE_AND_EXTENSION_GUIDE_ZH.md)
 - [Harness 适配设计](docs/DEEPSEEK_HARNESS_INTEGRATION_ZH.md)
+- [Harness 能力对照矩阵](docs/DEEPSEEK_HARNESS_PARITY_MATRIX_ZH.md)
 - [Plugin-first 重构路线](docs/PLUGIN_FIRST_REFACTOR_ROADMAP_ZH.md)
 - [企业平台评审材料](docs/CISRE_ENTERPRISE_OPS_PLATFORM.pptx)
+- [企业平台评审逐页讲稿](docs/CISRE_ENTERPRISE_REVIEW_SPEAKER_NOTES_ZH.md)
 
 ## 代码架构
 
@@ -124,7 +127,7 @@ tests/                            合同、回归和闭环测试
 docs/                             架构、插件、部署与团队手册
 ```
 
-不要向 `backend/app/application.py` 继续堆厂商 SDK 或新业务分支。新能力应先定义合同，再落入 `services/` 或 `adapters/<domain>/`，通过 `api/features/` 暴露，并补充失败、超时与脱敏测试。
+不要向 `backend/app/application.py` 继续堆厂商 SDK 或新业务分支。新能力应优先作为外置插件交付；必须进入可信内核时，先定义稳定合同，再落入 `services/` 或 `adapters/<domain>/`，通过 `api/features/` 暴露，并补充失败、超时与脱敏测试。
 
 ## 核心稳定与规模化
 

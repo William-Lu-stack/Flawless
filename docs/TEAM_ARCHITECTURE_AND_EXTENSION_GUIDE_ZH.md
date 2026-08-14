@@ -117,6 +117,7 @@ repository/
 │   │   ├── ops_harness.py            # 持久状态机和唯一完成语义
 │   │   ├── harness_plugins.py        # 可插拔 Planner/Skill/Gate/Executor/Verifier
 │   │   ├── harness_packages.py       # 外置插件包、服务依赖、Profile/Bundle/Patch 与权限
+│   │   ├── harness_scaffold.py       # 完整团队插件工程生成器
 │   │   ├── harness_events.py         # 追加式事件、哈希链、回放、分支、恢复、子会话
 │   │   ├── ops_execution.py          # 执行编排与防并发重复
 │   │   ├── ops_skill_*.py            # Skill 注册、运行、统计
@@ -177,9 +178,11 @@ repository/
   -> Rancher / Kubeconfig / MCP 在真实目标执行
   -> 同通道读取 UID/resourceVersion/generation 和补丁字段
   -> 等待新 ReplicaSet/Pod
-  -> 验证新 Pod Ready、重启稳定、错误消失、业务探针
+  -> 验证新 Pod Ready、rollout 收敛、重启稳定、当前错误消失、业务探针
   -> 未恢复则换策略；恢复才写入 Records
 ```
+
+验证阶段只用 `--previous` 日志追溯根因，不把旧日志当作新 Pod 仍失败。若 Rancher 当前日志端点返回 400，但新 Pod 身份、Ready、Workload rollout 和重启稳定均成立，允许由这些实时状态证据替代日志传输证据。Kubernetes 尚未过期的历史 Warning Event 也不能永久阻塞闭环；连续稳定窗口会重新采样 Pod 状态、rollout 和重启数，真实复发会立即撤销恢复结论。
 
 传输必须始终使用任务绑定的 `cluster_id`。写后回读必须使用与变更相同的通道，不能变更走 Rancher、验证走本地集群。
 
@@ -338,6 +341,7 @@ CISRE 调用 Adapter 的请求：
 | `GET /api/harness/profiles` | Profile/Bundle/外置包目录 | 只读 |
 | `POST /api/harness/profiles/activate` | 组合层切换 | 默认关闭，显式开启且审计 |
 | `POST /api/harness/plugins/reload` | 重新发现挂载目录 | 不加载任意进程内代码 |
+| `POST /api/harness/plugins/scaffold` | 下载 Provider + Skill + tests + Docker/K8s 的完整插件工程 | 生成代码默认只读且未实现，不授予生产写权限 |
 | `POST /api/harness/services/{service}/invoke` | 调用签名 remote Provider 声明的只读操作 | 固定目标、操作白名单、超时/大小限制 |
 | `GET /api/harness/sessions/{id}/events` | 事件、哈希完整性与子会话 | 脱敏 |
 | `POST /api/harness/sessions/{id}/fork` | 从事件边界创建分支 | 不复用变更审批 |

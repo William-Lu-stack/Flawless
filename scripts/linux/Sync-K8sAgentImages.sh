@@ -86,11 +86,11 @@ names=(
   "Approved Node Executor"
 )
 sources=(
-  "ghcr.dockerproxy.net/your-org/cisre:5.5.1"
+  "ghcr.dockerproxy.net/your-org/cisre:5.6.0"
   "ghcr.dockerproxy.net/your-org/cisre-node-exec:1.36"
 )
 targets=(
-  "your-org/cisre:5.5.1"
+  "your-org/cisre:5.6.0"
   "your-org/cisre-node-exec:1.36"
 )
 

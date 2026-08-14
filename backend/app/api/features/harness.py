@@ -6,12 +6,13 @@ import json
 import os
 import re
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from backend.app.services.harness_events import HARNESS_EVENT_STORE
 from backend.app.services.harness_packages import HARNESS_PACKAGE_MANAGER, HarnessPackageError
 from backend.app.services.harness_plugins import harness_capabilities_payload
+from backend.app.services.harness_scaffold import build_plugin_project
 from backend.app.kernel import scalability_profile
 
 
@@ -196,6 +197,31 @@ def build_router() -> APIRouter:
         except HarnessPackageError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"status": "valid", "package": package}
+
+    @router.post("/api/harness/plugins/scaffold")
+    async def scaffold_plugin(body: PluginManifestRequest, request: Request):
+        """Download a complete, isolated Provider + Skill team project."""
+        try:
+            package = HARNESS_PACKAGE_MANAGER.validate_source(body.manifest)
+            filename, payload = build_plugin_project(body.manifest, package)
+        except HarnessPackageError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        HARNESS_EVENT_STORE.append(
+            "plugin-authoring",
+            "plugin/scaffold-exported",
+            stage="plugin_scaffold_exported",
+            phase="authoring",
+            status="completed",
+            message=f"Plugin project {package.get('id')} exported",
+            actor=_actor(request),
+            plugin_id="cisre.plugin-loader",
+            data={"exported_plugin": package.get("id"), "version": package.get("version")},
+        )
+        return Response(
+            content=payload,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @router.post("/api/harness/plugins/install")
     async def install_plugin(body: PluginManifestRequest, request: Request):

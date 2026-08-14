@@ -28,6 +28,26 @@ class HarnessPolicyDenied(RuntimeError):
     """Raised when a monotonic Harness guard rejects a tool request."""
 
 
+@dataclass(slots=True)
+class LocalServiceProvider:
+    """Callable provider used by trusted built-in plugins.
+
+    External packages stay declarative or out-of-process.  The composition
+    root uses this provider to replace a service descriptor with a concrete
+    implementation without bypassing the plugin lifecycle.
+    """
+
+    plugin_id: str
+    operations: dict[str, Listener]
+    internal_only: bool = True
+
+    async def invoke(self, operation: str, payload: dict[str, Any]) -> Any:
+        handler = self.operations.get(str(operation or ""))
+        if handler is None:
+            raise KeyError(f"operation is not provided by {self.plugin_id}: {operation}")
+        return await _resolve(handler(copy.deepcopy(payload or {})))
+
+
 @dataclass(frozen=True, slots=True)
 class PluginManifest:
     """Stable, serialisable description of one Harness plugin."""
@@ -182,6 +202,55 @@ class HarnessPluginRuntime:
         self._plugins[manifest.id] = _Registration(manifest=manifest, setup=setup)
         self._reconcile()
         return lambda: self.unmount(manifest.id)
+
+    def bind_service(
+        self,
+        plugin_id: str,
+        name: str,
+        value: Any,
+        *,
+        scope: str | None = None,
+        priority: int = 5000,
+    ) -> Disposer:
+        """Attach a concrete implementation to a mounted service contract."""
+        registration = self._plugins.get(plugin_id)
+        if registration is None:
+            raise KeyError(f"plugin is not mounted: {plugin_id}")
+        if name not in registration.manifest.provides:
+            raise ValueError(f"plugin {plugin_id} did not declare service: {name}")
+        # A development reload may invoke the composition root more than once.
+        # Replace this plugin's previous concrete provider, while preserving
+        # its descriptor and every competing Provider registered by Profile.
+        for binding in list(self._services.get(name) or []):
+            if (
+                binding.plugin_id == plugin_id
+                and callable(getattr(binding.value, "invoke", None))
+            ):
+                self._services[name].remove(binding)
+        disposer = self._provide(
+            plugin_id,
+            name,
+            value,
+            scope=scope or registration.manifest.scope,
+            priority=priority,
+        )
+        registration.disposers.append(disposer)
+        return disposer
+
+    async def invoke(
+        self,
+        name: str,
+        operation: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        scopes: tuple[str, ...] = (),
+    ) -> Any:
+        """Invoke the selected provider behind a scoped capability seam."""
+        provider = self.resolve(name, scopes=scopes)
+        invoke = getattr(provider, "invoke", None)
+        if not callable(invoke):
+            raise TypeError(f"service has no invokable provider: {name}")
+        return await _resolve(invoke(operation, copy.deepcopy(payload or {})))
 
     def _reconcile(self) -> None:
         """Activate every dependency-complete plugin in deterministic order."""
@@ -392,6 +461,11 @@ class HarnessPluginRuntime:
                 "pending": sum(item["status"] == "pending_dependencies" for item in plugins),
                 "failed": sum(item["status"] == "failed" for item in plugins),
                 "services": sum(len(values) for values in self._services.values()),
+                "invokable_services": sum(
+                    callable(getattr(item.value, "invoke", None))
+                    for values in self._services.values()
+                    for item in sorted(values, key=lambda value: (-value.priority, -value.sequence))
+                ),
                 "event_subscriptions": sum(len(values) for values in self._events.values()),
             },
             "service_bindings": {
@@ -400,11 +474,13 @@ class HarnessPluginRuntime:
                         "plugin_id": item.plugin_id,
                         "scope": item.scope,
                         "priority": item.priority,
+                        "invokable": callable(getattr(item.value, "invoke", None)),
+                        "internal_only": bool(getattr(item.value, "internal_only", False)),
                         "selected_globally": bool(
                             values and sorted(values, key=lambda value: (-value.priority, -value.sequence))[0] is item
                         ),
                     }
-                    for item in values
+                    for item in sorted(values, key=lambda value: (-value.priority, -value.sequence))
                 ]
                 for name, values in sorted(self._services.items())
             },
@@ -970,6 +1046,7 @@ def harness_capabilities_payload() -> dict[str, Any]:
         "profile_bundle_patch_composition": True,
         "versioned_service_requirements": True,
         "swappable_service_providers": True,
+        "callable_builtin_service_providers": True,
         "plugin_permission_policy": True,
         "unsigned_privileged_plugins_fail_closed": True,
         "progressive_context_loading": True,
@@ -980,6 +1057,7 @@ def harness_capabilities_payload() -> dict[str, Any]:
         "official_runtime_cannot_mutate_kubernetes": True,
         "ui_manifest_validation_and_install": True,
         "ui_visual_plugin_authoring": True,
+        "ui_complete_plugin_project_export": True,
         "ui_plugin_invocation_and_security_details": True,
         "shared_and_domain_plugin_classification": True,
         "domain_agent_composition": True,

@@ -1470,6 +1470,13 @@ body[data-theme="dark"] .topology-stage.mode-2d { background: linear-gradient(18
 .ops-permission-card { grid-column: 1/-1; display: grid; gap: 5px; padding: 8px; border: 1px solid color-mix(in srgb,var(--danger) 34%,var(--line)); border-radius: 7px; background: color-mix(in srgb,var(--danger) 5%,var(--surface)); }
 .ops-permission-card > b { color: var(--danger); font-size: 9px; }.ops-permission-card p { margin: 0; color: var(--muted); font-size: 8px; line-height: 1.45; }.ops-permission-card span { display: grid; grid-template-columns: 16px 1fr; gap: 5px; color: var(--text); font-size: 8px; line-height: 1.45; }.ops-permission-card span i { width: 15px; height: 15px; display: grid; place-items: center; border-radius: 50%; color: var(--danger); background: color-mix(in srgb,var(--danger) 10%,var(--surface)); font-style: normal; }.ops-permission-card small { color: var(--soft); font-size: 7px; line-height: 1.45; }
 .ops-verification { grid-column: 1/-1; }
+.ops-verification-proof { grid-column: 1/-1; display: grid; gap: 6px; margin-top: 7px; }
+.ops-verification-proof > span { display: grid; grid-template-columns: 20px minmax(130px,.65fr) 1.35fr; align-items: center; gap: 7px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; background: color-mix(in srgb,var(--surface) 72%,transparent); }
+.ops-verification-proof i { display: grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; font-style: normal; color: #06121d; background: var(--good); }
+.ops-verification-proof .failed i { background: var(--danger); }
+.ops-verification-proof .unknown i { background: var(--warning); }
+.ops-verification-proof small,.ops-verification-meta { color: var(--muted); font-size: 8px; line-height: 1.45; }
+.ops-verification-meta { grid-column: 1/-1; display: block; margin-top: 6px; }
 
 /* External Traffic */
 .traffic-page { display: grid; gap: 12px; }

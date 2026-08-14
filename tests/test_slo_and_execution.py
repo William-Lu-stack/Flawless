@@ -2084,6 +2084,155 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(write_check["passed"])
 
+    def test_ready_rollout_can_close_when_current_log_transport_is_unavailable(self):
+        plan = {
+            "namespace": "monitoring",
+            "target": "Deployment/metrics-ui",
+            "changes": [{
+                "type": "patch_workload_runtime_security",
+                "patch": {"spec": {"template": {"spec": {"securityContext": {"fsGroup": 10002}}}}},
+                "_mutation_postcondition": {"verified": True, "generation": 9},
+            }],
+            "evidence": {"pod": {"restart_count": 17}},
+        }
+        evidence = {
+            "pod": {
+                "name": "metrics-ui-new",
+                "ready": True,
+                "restart_count": 0,
+                "containers": [{"name": "app", "ready": True, "state": "running"}],
+            },
+            "events": [],
+            "logs": {"app": {"current_error": "log endpoint returned 400"}},
+            "workload": {
+                "metadata": {"generation": 9},
+                "spec": {
+                    "replicas": 1,
+                    "template": {"spec": {"securityContext": {"fsGroup": 10002}}},
+                },
+                "status": {
+                    "observedGeneration": 9,
+                    "updatedReplicas": 1,
+                    "readyReplicas": 1,
+                    "availableReplicas": 1,
+                    "unavailableReplicas": 0,
+                },
+            },
+        }
+
+        criteria = server._assess_recovery_criteria(plan, {"recovered": True}, evidence)
+
+        self.assertTrue(criteria["passed"], criteria)
+        self.assertIn("current_logs_or_ready_state", criteria["mandatory"])
+        self.assertFalse(criteria["fresh_evidence"]["current_logs_checked"])
+        proof = next(
+            item for item in criteria["evaluations"]
+            if item["criterion"] == "current_logs_or_ready_state"
+        )
+        self.assertTrue(proof["passed"])
+
+    async def test_full_recovery_verifier_closes_healthy_new_pod_despite_log_400(self):
+        plan = {
+            "namespace": "monitoring",
+            "target": "Deployment/metrics-ui",
+            "changes": [{
+                "type": "patch_workload_runtime_security",
+                "patch": {"spec": {"template": {"spec": {"securityContext": {"fsGroup": 10002}}}}},
+                "_mutation_postcondition": {"verified": True, "generation": 9},
+            }],
+            "evidence": {"pod": {"restart_count": 17}},
+        }
+        probe = {
+            "status": "completed",
+            "recovered": True,
+            "recovered_pods": ["metrics-ui-new"],
+            "new_pod_lineage_verified": True,
+        }
+        evidence = {
+            "pod": {
+                "name": "metrics-ui-new", "ready": True, "restart_count": 0,
+                "containers": [{"name": "app", "ready": True, "state": "running"}],
+            },
+            "events": [],
+            "logs": {"app": {"current_error": "log endpoint returned 400"}},
+            "workload": {
+                "metadata": {"generation": 9},
+                "spec": {"replicas": 1, "template": {"spec": {"securityContext": {"fsGroup": 10002}}}},
+                "status": {
+                    "observedGeneration": 9, "updatedReplicas": 1,
+                    "readyReplicas": 1, "availableReplicas": 1, "unavailableReplicas": 0,
+                },
+            },
+        }
+        with patch.dict(os.environ, {
+            "OPS_VERIFY_INITIAL_GRACE_SECONDS": "0",
+            "OPS_RECOVERY_STABILITY_SECONDS": "0",
+        }), patch.object(
+            server, "_probe_plan_recovery", AsyncMock(return_value=probe)
+        ), patch.object(
+            server, "_collect_plan_priority_evidence", AsyncMock(return_value=evidence)
+        ):
+            verification = await server._verify_plan_recovery(plan, [{"status": "completed"}])
+
+        self.assertTrue(verification["recovered"], verification)
+        self.assertEqual(verification["status"], "verified")
+        self.assertTrue(verification["criteria"]["passed"])
+
+    def test_stale_backoff_event_does_not_block_healthy_stable_rollout(self):
+        plan = {
+            "namespace": "platform",
+            "workload_type": "Deployment",
+            "deployment": "metrics-ui",
+            "changes": [{
+                "type": "patch_workload_runtime_security",
+                "_mutation_postcondition": {"verified": True, "generation": 9},
+            }],
+            "success_criteria": ["pod_ready", "events_no_new_backoff"],
+            "evidence": {"pod": {"restart_count": 4}},
+        }
+        evidence = {
+            "pod": {
+                "name": "metrics-ui-new",
+                "ready": True,
+                "restart_count": 0,
+                "phase": "Running",
+                "containers": [{"name": "ui", "ready": True, "restart_count": 0}],
+            },
+            "workload": {
+                "kind": "Deployment",
+                "metadata": {"generation": 9},
+                "spec": {"replicas": 1},
+                "status": {
+                    "observedGeneration": 9,
+                    "updatedReplicas": 1,
+                    "readyReplicas": 1,
+                    "availableReplicas": 1,
+                    "unavailableReplicas": 0,
+                },
+            },
+            "events": [{
+                "type": "Warning",
+                "reason": "BackOff",
+                "message": "Back-off restarting failed container from before recovery",
+            }],
+            "logs": {"ui": {"current": "server is ready"}},
+            "storage": [],
+            "services": [],
+        }
+
+        criteria = server._assess_recovery_criteria(
+            plan,
+            {"recovered": True},
+            evidence,
+        )
+
+        event_criterion = next(
+            item for item in criteria["evaluations"]
+            if item["criterion"] == "events_no_new_backoff"
+        )
+        self.assertTrue(event_criterion["passed"])
+        self.assertTrue(criteria["passed"], criteria)
+
     async def test_recovery_does_not_accept_pre_mutation_healthy_pod(self):
         plan = {
             "namespace": "prod",

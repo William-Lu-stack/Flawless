@@ -615,6 +615,10 @@ export function OpsJobProgress({
                 <b>{result.verification.status || "verified"}</b>
                 <span className={result.verification.recovered === true ? "success" : "warning"}>{result.verification.recovered === true ? "已恢复" : result.verification.recovered === false ? "未恢复" : "尚未证明"}</span>
                 <p>{result.verification.message || result.verification.proof || "验证完成"}</p>
+                {asList(result.verification?.criteria?.evaluations).length > 0 && <div className="ops-verification-proof">
+                  {asList(result.verification.criteria.evaluations).map((criterion: any, index: number) => <span className={criterion.passed === true ? "passed" : criterion.passed === false ? "failed" : "unknown"} key={`${criterion.criterion}-${index}`}><i>{criterion.passed === true ? "✓" : criterion.passed === false ? "×" : "?"}</i><b>{criterion.criterion}</b><small>{criterion.proof}</small></span>)}
+                </div>}
+                <small className="ops-verification-meta">{result.verification.new_pod_lineage_verified === false ? "未证明新 Pod 身份" : "新 Pod / 当前 revision 已核对"} · {result.verification.stability_verified ? `稳定窗 ${result.verification.stability_seconds || 0}s 已通过` : `已验证 ${result.verification.attempts || 1} 次`}</small>
               </article>
             </section>
           )}

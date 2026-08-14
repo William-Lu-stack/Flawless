@@ -138,6 +138,17 @@ runtime:
 
 前端“平台能力 → 插件中心”提供两种开发入口：可视化表单生成声明式 Manifest，或输入目标让当前模型生成经过 Schema/权限校验的插件草案。模型只能生成声明与编排元数据，不能取得凭据、绕过审批或直接执行任意代码。插件详情会展示触发条件、服务依赖、安全边界和最近调用记录。
 
+Manifest 校验通过后点击“下载完整插件项目”，或调用：
+
+```http
+POST /api/harness/plugins/scaffold
+Content-Type: application/json
+
+{"manifest": "<HarnessPlugin YAML>"}
+```
+
+返回 ZIP 已包含独立 FastAPI Provider、`SKILL.md`、合同测试、Dockerfile、加固后的 Kubernetes Deployment/Service、安全边界说明和 `pyproject.toml`。脚手架的 Provider 默认只读并返回 `implemented: false`，防止尚未接厂商系统的模板被误当成真实能力。团队只需在 Provider 中实现 `discover`、`collect_evidence`、`verify` 和类型化 `propose`，不需要复制 Agent Loop、审批、事件流、Trace、并发控制或恢复状态机。
+
 生产 API 仍要求单副本，直到接入分布式执行租约与支持跨进程串行追加的事件后端。当前 JSONL 事实流与 OpsJob 快照互补：前者负责审计/回放，后者负责快速页面读取和现有故障恢复。
 
 ## 7. 验收清单
@@ -150,3 +161,4 @@ runtime:
 6. 运维事件重启后仍可读取，哈希链可校验；
 7. fork 产生 parent/child 关系，replay/resume 可重建阶段状态；
 8. 所有 K8s 写操作仍逐项审批、写后回读并以新 Pod 恢复证据闭环。
+9. 插件工程下载后可独立通过合同测试，未接真实 Provider 时不会伪造成功。

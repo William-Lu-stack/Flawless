@@ -51,7 +51,7 @@ flowchart LR
 
 | 官方 Harness 能力 | CISRE 落点 | 真实约束 |
 |---|---|---|
-| Everything is a Plugin | `HarnessPluginRuntime`、12 个内置插件与挂载目录中的外置包 | 外置包无需改核心；依赖未满足时为 `pending_dependencies` |
+| Everything is a Plugin | `HarnessPluginRuntime`、公共/领域/Domain Agent 内置插件与挂载目录中的外置包 | 外置包无需改核心；依赖未满足时为 `pending_dependencies` |
 | Profile / Bundle / Patch | `HarnessPackageManager` 的有序组合与 Provider 优先级覆盖 | Profile 在线切换默认锁定且全程审计 |
 | Cordis Service / Inject | 作用域服务注册与最近作用域覆盖 | `job:*`、`cluster:*` 优先，缺少时回退 global |
 | Emit / Serial / Parallel / Waterfall | 四类 typed event dispatch | 同一事件模式冲突会拒绝注册 |
@@ -65,6 +65,8 @@ flowchart LR
 | Jobs | 目标 single-flight、排队和 owner/job 状态 | 等待人工审批不占执行并发槽 |
 | LLM Adapter | 现有 OAuth/OpenAI-compatible DeepSeek 客户端 | 模型只能提出方案，不能直接写集群 |
 | Telemetry | Langfuse、工具回执、Skill Records、成效记录 | 密钥、token、kubeconfig 不进入事件或模型上下文 |
+| Callable Service Provider | 组合根把 Planner、Skill Router、K8s Executor、写后回读、恢复验证与 Agent Loop 绑定到稳定服务名 | 内置高权限 Provider 只允许 Harness 内部调用，外部服务 API 不暴露 mutation authority |
+| Plugin authoring | 前端表单/模型草拟 Manifest，并下载完整 Provider + Skill + tests + Docker/K8s 工程 | 生成工程默认只读且显式 `implemented: false`，团队接入真实厂商 API 后才可验收 |
 
 ## 已接入的插件
 
@@ -80,8 +82,18 @@ flowchart LR
 - `cisre.goal-round-driver`
 - `cisre.owner-scoped-jobs`
 - `cisre.telemetry`
+- `cisre.agent-trace`
+- `cisre.agent-loop`
+- `cisre.agent-orchestrator`
+- `cisre.agent.kubernetes`
+- `cisre.agent.database`
+- `cisre.agent.virtual-machine`
+- `cisre.agent.storage`
+- `cisre.agent.middleware`
+- `cisre.agent.cloud`
+- `cisre.agent.network`
 
-`GET /api/ops/capabilities` 会返回每个插件的状态、依赖、服务、事件、Profile、权限与上游运行时就绪状态。前端“平台能力 → 插件中心”展示插件/Profile、服务依赖图、团队接入、会话事件、分支恢复与权限审计，并支持校验和导入声明式插件。外置插件开发、目录和 API 见 [HARNESS_PLUGIN_DEVELOPMENT_ZH.md](./HARNESS_PLUGIN_DEVELOPMENT_ZH.md)，数据库/VM/存储团队接入见 [PLUGIN_TEAM_ONBOARDING_ZH.md](./PLUGIN_TEAM_ONBOARDING_ZH.md)。
+`GET /api/ops/capabilities` 会返回每个插件的状态、依赖、服务、事件、Profile、权限、可调用 Provider 与上游运行时就绪状态。前端“平台能力 → 插件中心”展示插件/Profile、服务依赖图、团队接入、会话事件、分支恢复与权限审计，并支持校验、导入声明式插件以及下载完整团队插件工程。完整对照见 [DEEPSEEK_HARNESS_PARITY_MATRIX_ZH.md](./DEEPSEEK_HARNESS_PARITY_MATRIX_ZH.md)，外置插件开发见 [HARNESS_PLUGIN_DEVELOPMENT_ZH.md](./HARNESS_PLUGIN_DEVELOPMENT_ZH.md)，数据库/VM/存储团队接入见 [PLUGIN_TEAM_ONBOARDING_ZH.md](./PLUGIN_TEAM_ONBOARDING_ZH.md)。
 
 ## 安全边界
 

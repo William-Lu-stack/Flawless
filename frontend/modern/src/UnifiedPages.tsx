@@ -662,6 +662,29 @@ function HarnessConsole({ capabilities, refreshCapabilities }: { capabilities: a
     try { setValidation({ loading: false, data: await apiPost("/api/harness/plugins/validate", { manifest: pluginSource, add_to_active_profile: addToProfile }) }); }
     catch (error: any) { setValidation({ loading: false, error: error.message }); }
   }
+  async function downloadPluginProject() {
+    setAction({ loading: true });
+    try {
+      const response = await fetch("/api/harness/plugins/scaffold", {
+        method: "POST",
+        headers: adminAuthHeaders({ "Content-Type": "application/json", Accept: "application/zip" }),
+        body: JSON.stringify({ manifest: pluginSource, add_to_active_profile: false }),
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || `${response.status} ${response.statusText}`);
+      }
+      const disposition = response.headers.get("content-disposition") || "";
+      const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || "cisre-plugin-project.zip";
+      const href = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement("a");
+      anchor.href = href;
+      anchor.download = filename;
+      anchor.click();
+      URL.revokeObjectURL(href);
+      setAction({ loading: false, data: { status: "scaffold_exported", filename } });
+    } catch (error: any) { setAction({ loading: false, error: error.message }); }
+  }
   async function installPlugin() {
     setAction({ loading: true });
     try {
@@ -729,7 +752,7 @@ function HarnessConsole({ capabilities, refreshCapabilities }: { capabilities: a
           <div className="harness-call-preview"><strong>这个插件何时会被调用？</strong><p>① 请求 <code>{pluginDraft.provides.split(/[\n,]/).filter(Boolean)[0] || "你声明的服务"}</code>；② scope 匹配 <code>{pluginDraft.scope || "global"}</code>；③ 依赖已满足；或收到 <code>{pluginDraft.eventName || "订阅事件"}</code>。</p><small><ShieldCheck size={12} />本向导只生成声明式插件：可读证据、可提案，不能直接写生产资源。</small></div>
         </div>}
         <div className="harness-manifest-editor"><div><strong>{composerMode === "create" ? "实时生成的 Manifest" : "插件 Manifest"}</strong><small>{composerMode === "create" ? "需要手写远程 Provider 时切换到 YAML / 高级模式。" : "支持声明式插件与隔离的远程只读 Provider。"}</small></div><textarea value={pluginSource} readOnly={composerMode === "create"} onChange={(event) => { setPluginSource(event.target.value); setValidation({ loading: false }); }} spellCheck={false} aria-label="插件 YAML" /></div>
-        <footer><label><input type="checkbox" checked={addToProfile} onChange={(event) => setAddToProfile(event.target.checked)} />加入当前 Profile 并热加载</label><span>{profiles.data?.package_write_enabled ? "运行时写入已开启" : "生产写入锁定：需设置 HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED=true"}</span><button className="ghost" disabled={validation.loading} onClick={validatePlugin}>{validation.loading ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />}校验</button><button className="primary" disabled={action.loading || !profiles.data?.package_write_enabled} onClick={installPlugin}>{action.loading ? <Loader2 className="spin" size={14} /> : <Upload size={14} />}安装并重载</button></footer>
+        <footer><label><input type="checkbox" checked={addToProfile} onChange={(event) => setAddToProfile(event.target.checked)} />加入当前 Profile 并热加载</label><span>{profiles.data?.package_write_enabled ? "运行时写入已开启" : "生产写入锁定：需设置 HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED=true"}</span><button className="ghost" disabled={validation.loading} onClick={validatePlugin}>{validation.loading ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />}校验</button><button className="ghost" disabled={action.loading} onClick={downloadPluginProject}><Download size={14} />下载完整插件项目</button><button className="primary" disabled={action.loading || !profiles.data?.package_write_enabled} onClick={installPlugin}>{action.loading ? <Loader2 className="spin" size={14} /> : <Upload size={14} />}安装并重载</button></footer>
         {validation.error && <div className="inline-error">{validation.error}</div>}
         {validation.data && <div className="harness-action-ok"><CheckCircle2 size={14} />{validation.data.package?.id} · {validation.data.package?.version} · 契约校验通过</div>}
       </div>}
