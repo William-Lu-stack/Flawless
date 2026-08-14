@@ -16,7 +16,7 @@
 
 Maintained by the **CISRE Contributors** community.
 
-Current release: **5.5.0**.
+Current release: **5.5.1**.
 
 本版本的总体架构、Harness 融合、Kubernetes 写后回读、拓扑性能和国产全栈适配合同见
 [`docs/CISRE_ARCHITECTURE_ZH.md`](docs/CISRE_ARCHITECTURE_ZH.md)。
@@ -24,6 +24,10 @@ Current release: **5.5.0**.
 [`docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md`](docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md)。
 数据库、VM、存储等团队的插件交付合同与接入步骤见
 [`docs/PLUGIN_TEAM_ONBOARDING_ZH.md`](docs/PLUGIN_TEAM_ONBOARDING_ZH.md)。
+
+Release 5.5.1 keeps the 5.5 plugin-center release intact and restores the
+environment-independent VM/virtualization provider contract used by team
+plugins and clean CI environments.
 
 Release 5.5.0 introduces the operator-facing **SRE initiate** experience and a
 production-safe plugin center inspired by the official DeepSeek Harness. Teams
