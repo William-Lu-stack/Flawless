@@ -1,0 +1,13 @@
+apiVersion: cisre.io/v1alpha1
+kind: HarnessBundle
+metadata:
+  name: fullstack-readonly
+  description: 全栈资源只读发现与风险分析组合层。
+spec:
+  plugins:
+    - example.database-risk-provider
+  patches:
+    - id: example.database-risk-provider
+      priority: 60
+      config:
+        adapter_contract: database/v1

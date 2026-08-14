@@ -9,11 +9,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 
 from backend.app.services.harness_plugins import CISRE_HARNESS_RUNTIME
+from backend.app.services.harness_events import HARNESS_EVENT_STORE
 
 
 HARNESS_VERSION = "CISREDurableHarness/v3"
@@ -57,11 +59,23 @@ def _event_type(stage: str, phase: str) -> str:
     return f"ops/{name or 'event'}"
 
 
-def new_ops_harness(plan: dict, *, created_at: str = "") -> dict:
+def new_ops_harness(
+    plan: dict,
+    *,
+    created_at: str = "",
+    session_id: str = "",
+    parent_session_id: str = "",
+) -> dict:
     created = created_at or _now()
+    resolved_session_id = str(
+        session_id or plan.get("_harness_session_id") or f"session-{uuid.uuid4().hex[:20]}"
+    )
+    resolved_parent_id = str(parent_session_id or plan.get("_parent_job_id") or "")
     plugin_runtime = CISRE_HARNESS_RUNTIME.diagnostics()
-    return {
+    state = {
         "version": HARNESS_VERSION,
+        "session_id": resolved_session_id,
+        "parent_session_id": resolved_parent_id,
         "mode": "diagnose_execute_verify",
         "objective": str(
             plan.get("title")
@@ -139,8 +153,24 @@ def new_ops_harness(plan: dict, *, created_at: str = "") -> dict:
             "typed_session_events": True,
             "waterfall_tool_guards": True,
             "reversible_plugin_lifecycle": True,
+            "durable_append_only_event_store": True,
+            "hash_chain_integrity": True,
+            "replay_fork_resume": True,
+            "child_session_drill_down": True,
         },
     }
+    HARNESS_EVENT_STORE.append(
+        resolved_session_id,
+        "session/created",
+        phase="evidence",
+        stage="created",
+        status="pending",
+        message="Operation Harness session created",
+        target=state["target"],
+        data={"objective": state["objective"], "harness_version": HARNESS_VERSION},
+        parent_session_id=resolved_parent_id,
+    )
+    return state
 
 
 def checkpoint_event(harness: dict, stage: str, message: str, values: dict | None = None) -> dict:
@@ -181,6 +211,28 @@ def checkpoint_event(harness: dict, stage: str, message: str, values: dict | Non
         },
     })
     del event_log[:-160]
+    HARNESS_EVENT_STORE.append(
+        str(state.get("session_id") or f"session-{state['resume_token']}"),
+        _event_type(stage, phase),
+        phase=phase,
+        stage=stage,
+        status=str(values.get("status") or "running"),
+        message=str(message or "")[:500],
+        actor=str(values.get("operator") or "system"),
+        plugin_id=str(values.get("plugin_id") or values.get("selected_skill_id") or ""),
+        tool=str(values.get("action") or values.get("change_type") or ""),
+        target=copy.deepcopy(state.get("target") or {}),
+        data={
+            key: copy.deepcopy(values.get(key))
+            for key in (
+                "approved", "change_status", "failure_class", "model_profile_id",
+                "planner_source", "selected_skill_id", "verification_recovered",
+                "resource_version", "child_job_id", "artifact_paths",
+            )
+            if values.get(key) is not None
+        },
+        parent_session_id=str(state.get("parent_session_id") or ""),
+    )
 
     terminal_status = str(values.get("status") or "")
     phase_done = (

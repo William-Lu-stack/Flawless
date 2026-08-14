@@ -219,7 +219,7 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.3.1")
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.4.0")
 APP_CODE_SIGNATURE = "cisre-durable-harness-v2-target-binding-closure-v2"
 BUILTIN_SKILL_POLICY_REVISION = "3.0.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
@@ -18912,7 +18912,12 @@ async def _enqueue_ops_job(plan_input: dict, actor: str, *, autonomous: bool, co
         "created_at": now,
         "updated_at": now,
         "plan": copy.deepcopy(plan),
-        "harness": new_ops_harness(plan, created_at=now),
+        "harness": new_ops_harness(
+            plan,
+            created_at=now,
+            session_id=job_id,
+            parent_session_id=str(plan.get("_parent_job_id") or ""),
+        ),
     }
     cancel_event = asyncio.Event()
     async with OPS_JOBS_LOCK:
@@ -20381,6 +20386,7 @@ from backend.app.api.features.algorithms import build_router as build_algorithms
 from backend.app.api.features.chat import build_router as build_chat_router
 from backend.app.api.features.inventory import build_router as build_inventory_router
 from backend.app.api.features.knowledge import build_router as build_knowledge_router
+from backend.app.api.features.harness import build_router as build_harness_router
 from backend.app.api.features.models import build_router as build_models_router
 from backend.app.api.features.observability import build_router as build_observability_router
 from backend.app.api.features.operations import build_router as build_operations_router
@@ -20403,6 +20409,8 @@ for _feature_router in (
     build_observability_router(_RUNTIME_HANDLERS),
 ):
     app.include_router(_feature_router)
+
+app.include_router(build_harness_router())
 
 
 app.include_router(build_reliability_router(ReliabilityDependencies(

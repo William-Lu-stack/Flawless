@@ -1,0 +1,30 @@
+apiVersion: cisre.io/v1alpha1
+kind: HarnessPlugin
+metadata:
+  name: example.database-risk-provider
+  version: 1.0.0
+  description: 示例数据库只读风险 Provider；无需修改 CISRE 核心代码。
+spec:
+  scope: global
+  priority: 20
+  provides:
+    - name: inventory.database-risk
+      version: 1.0.0
+  requires:
+    - name: session.events
+      constraint: ">=1.0"
+  events:
+    - name: inventory/discovered
+      mode: observe
+  permissions:
+    - service:provide
+    - inventory:read
+    - events:publish
+    - ui:contribute
+  runtime:
+    type: declarative
+  config:
+    adapter_contract: database/v1
+  ui:
+    group: database
+    title: 数据库风险 Provider

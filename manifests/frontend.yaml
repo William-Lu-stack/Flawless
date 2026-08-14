@@ -61,7 +61,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          image: ghcr.dockerproxy.net/your-org/cisre:5.3.1
+          image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
           imagePullPolicy: Always
           command:
             - python
@@ -99,6 +99,16 @@ spec:
               value: /var/lib/flawless/ops-skills
             - name: OPS_SKILL_STORE_PATH
               value: /var/lib/flawless/ops-skills.json
+            - name: HARNESS_PLUGIN_ROOT
+              value: /var/lib/flawless/harness
+            - name: HARNESS_PROFILE
+              value: production
+            - name: HARNESS_PROFILE_RUNTIME_WRITE_ENABLED
+              value: "false"
+            - name: HARNESS_EVENT_STORE_PATH
+              value: /var/lib/flawless/harness-events.jsonl
+            - name: HARNESS_EVENT_STORE_FALLBACK_PATH
+              value: /tmp/cisre/harness-events.jsonl
             - name: RELIABILITY_STORE_PATH
               value: /var/lib/flawless/reliability-state.json
             - name: RELIABILITY_STORE_FALLBACK_PATH

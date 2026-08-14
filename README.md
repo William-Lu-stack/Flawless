@@ -16,13 +16,16 @@
 
 Maintained by the **CISRE Contributors** community.
 
-Current release: **5.3.1**.
+Current release: **5.4.0**.
 
 本版本的总体架构、Harness 融合、Kubernetes 写后回读、拓扑性能和国产全栈适配合同见
 [`docs/CISRE_ARCHITECTURE_ZH.md`](docs/CISRE_ARCHITECTURE_ZH.md)。
+外置插件、Profile/Bundle/Patch、服务依赖、权限策略和事件回放开发手册见
+[`docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md`](docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md)。
 
-Release 5.3.1 binds every approved Kubernetes mutation to one canonical
-cluster ID, namespace, kind and name before execution, and uses that immutable
+Release 5.4.0 adds the capability-oriented Harness plugin runtime while retaining
+canonical mutation binding. The control plane freezes the approved cluster ID,
+namespace, kind and name before execution, and uses that immutable
 identity for the write, live read-back and recovery probes. A Workload change
 is successful only when the same object UID remains, its `resourceVersion` and
 `generation` advance, and the approved fields exist on the live object.

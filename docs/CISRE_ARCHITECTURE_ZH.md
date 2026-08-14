@@ -97,11 +97,14 @@ CISRE 没有把通用 Coding Agent 的 Shell 自治直接搬进生产集群，�
 | 前沿能力 | CISRE 落点 | SRE 限制 |
 |---|---|---|
 | 持久任务 / Todo / mode | `CISREDurableHarness/v3` 的 phase contracts、typed events、todos、checkpoint、resume token | 只能按证据→根因→变更→验证推进 |
-| Everything is a Plugin | `CISREPluginHarness/v1` 的作用域服务、四类事件、可逆 Effect 和依赖激活 | Planner、Skill、审批、执行、回读、验证都可独立替换且不绕过门禁 |
+| Everything is a Plugin | `CISREPluginHarness/v1` 的作用域服务、四类事件、可逆 Effect、外置 package 和依赖激活 | Planner、Skill、审批、执行、回读、验证都可独立替换且不绕过门禁 |
+| Profile / Bundle / Patch | `HarnessPackageManager` 的有序组合、配置覆盖与 Provider 切换 | 生产在线切换默认关闭，开启后每次操作进入审计流 |
+| Service definitions | 插件显式声明 provides/requires、版本约束、scope 和权限 | 依赖或权限不满足时 fail closed，不带病激活 |
 | DeepSeek Harness 兼容 | 官方架构同构插件层；上游 Python SDK/JSON-RPC 仅预留为可选 Planner | 上游运行时不持有 Kubernetes 写权限，Developer Preview 不替换现有执行面 |
 | Tool loop | 动态 Skill 与受控 action catalog | 模型不能创造未注册动作 |
 | Human interrupt/resume | 审批检查点、approval ledger、等待时释放执行槽 | 所有变更默认需要本人确认 |
-| Durable execution | Job Store、事件账本、attempt/receipt ledger | 副作用必须幂等且可回读 |
+| Durable execution | Job Store 快速投影 + JSONL 追加事件、哈希链、replay/fork/resume/child lineage | 副作用必须幂等且可回读；分支不继承写审批 |
+| Sandboxing / permission | 外置代码不进入 API 进程，声明式 Provider 按权限授予；Shell 仍在受控执行器边界 | 外置插件永远不能取得 K8s mutation、Ops execute 或 Secret read |
 | Context compaction | 有界事件、模型调用、回执与尝试窗口 | 原始证据保留在记录，模型上下文只装载相关片段 |
 | Loop evaluator | RecoveryVerifier + Skill success criteria | 只有实时恢复证据可以结束，不接受模型自报完成 |
 | Skills progressive loading | Skill Router 先选单一主 Skill，证据需要时再组合 | 防止一次调用大量 Skill、统计失真 |
@@ -113,7 +116,7 @@ CISRE 没有把通用 Coding Agent 的 Shell 自治直接搬进生产集群，�
 - LangGraph：带 checkpointer 的 interrupt/resume，以及副作用必须幂等的恢复规则。
 - Temporal：长任务在进程、网络或主机故障后从确定位置恢复的 durable execution 思想。
 - Anthropic：简单可组合 workflow、路由、evaluator-optimizer，以及每一步从环境读取 ground truth。
-- DeepSeek 官方 Agent 生态：OpenAI-compatible 模型适配、MCP、Skills、Hooks 与不同 Harness 的可插拔组合。
+- DeepSeek 官方 Harness：Everything is a Plugin、Cordis service/event/effect、Profile/Bundle/Patch 和 append-only SessionEvent。
 
 设计参考：
 
@@ -124,7 +127,8 @@ CISRE 没有把通用 Coding Agent 的 Shell 自治直接搬进生产集群，�
 - [Temporal Durable Execution](https://docs.temporal.io/)
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)
 - [Anthropic: Measuring AI Agent Autonomy in Practice](https://www.anthropic.com/research/trustworthy-agents)
-- [DeepSeek 官方 Agent 项目目录](https://github.com/deepseek-ai/awesome-deepseek-agent)
+- [DeepSeek Harness 官方仓库](https://github.com/deepseek-ai/deepseek-harness)
+- [DeepSeek Harness 官方架构](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/architecture.md)
 
 ## 拓扑与爆炸半径
 

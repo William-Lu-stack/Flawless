@@ -1,0 +1,12 @@
+apiVersion: cisre.io/v1alpha1
+kind: HarnessProfile
+metadata:
+  name: team-production
+  description: 团队生产 Profile；按顺序组合 Bundle，再应用本层 Patch。
+spec:
+  bundles:
+    - fullstack-readonly
+  patches:
+    - id: example.database-risk-provider
+      enabled: true
+      scope: global

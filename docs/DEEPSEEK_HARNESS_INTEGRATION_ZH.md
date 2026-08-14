@@ -8,7 +8,7 @@
 
 不把 CISRE 整体重写成官方 TypeScript/Node 运行时。采用“同构插件内核 + 可选上游规划适配器 + 原生产执行面”的方案：
 
-1. 将官方 Harness 的插件、作用域服务、事件模式、可逆 Effect、Session Event、上下文压缩、Goal/Job 等设计落入 CISRE。
+1. 将官方 Harness 的插件、作用域服务、事件模式、可逆 Effect、Session Event、Profile/Bundle/Patch、上下文压缩、Goal/Job 等设计落入 CISRE。
 2. DeepSeek 或任意 OpenAI 兼容模型继续负责根因假设、Skill 排序和结构化方案。
 3. Kubernetes 取证、人工审批、动作校验、Rancher/kubeconfig 执行、写后回读和持续恢复验证仍由 CISRE 掌握。
 4. 官方 Python SDK/JSON-RPC 以后可作为无写权限的 Planner 进程启用，但永远不能成为 Kubernetes mutation authority。
@@ -21,6 +21,8 @@
 flowchart LR
   UI["CISRE UI\nSRE 对话 / AI 巡检"] --> API["Ops API"]
   API --> H["CISREPluginHarness/v1"]
+  PROFILE["Profile → Bundle → Patch"] --> H
+  PKG["Mounted out-of-tree packages"] --> PROFILE
 
   subgraph PLUGINS["Everything is a Plugin"]
     EVT["Typed Session Events"]
@@ -37,6 +39,7 @@ flowchart LR
   end
 
   H --> EVT --> CMP --> PLAN --> SKILL --> G1 --> G2 --> EXEC --> RAW --> REC --> GOAL --> JOB
+  EVT --> STORE["Hash-chained JSONL\nReplay / Fork / Resume"]
   PLAN -. "optional planner only" .-> DSH["Official DeepSeek Harness\nPython SDK / JSON-RPC"]
   EXEC --> R["Rancher API"]
   EXEC --> K["Encrypted kubeconfig"]
@@ -48,11 +51,13 @@ flowchart LR
 
 | 官方 Harness 能力 | CISRE 落点 | 真实约束 |
 |---|---|---|
-| Everything is a Plugin | `HarnessPluginRuntime` 与 12 个内置插件 | 插件依赖未满足时为 `pending_dependencies`，不伪装 active |
+| Everything is a Plugin | `HarnessPluginRuntime`、12 个内置插件与挂载目录中的外置包 | 外置包无需改核心；依赖未满足时为 `pending_dependencies` |
+| Profile / Bundle / Patch | `HarnessPackageManager` 的有序组合与 Provider 优先级覆盖 | Profile 在线切换默认锁定且全程审计 |
 | Cordis Service / Inject | 作用域服务注册与最近作用域覆盖 | `job:*`、`cluster:*` 优先，缺少时回退 global |
 | Emit / Serial / Parallel / Waterfall | 四类 typed event dispatch | 同一事件模式冲突会拒绝注册 |
 | Reversible Effects | 插件卸载按 LIFO 回收服务、监听器和 Effect | Provider 移除后 Consumer 自动退回 pending |
-| Append-only Session Event | `CISREDurableHarness/v3.events` | 每条包含 seq、type、phase、status、timestamp 和 target |
+| Append-only Session Event | `HarnessEventStore` JSONL 事实流 + OpsJob 快速投影 | 跨重启持久化、哈希串联、脱敏、replay/fork/resume/child drill-down |
+| Plugin Permission | 外置包请求/授予/拒绝权限与签名摘要 | 外置包永远不能取得 K8s mutation、Ops execute 或 Secret read |
 | Tool Guard / Approval | `tools/pre-execute` 瀑布门禁 | 无当前人工审批回执即 fail-closed，不发送 Kubernetes 请求 |
 | Context Compaction | `CISREImportanceCompactor/v1` | 优先保留 ERROR/FATAL/WARNING、Pod 状态、securityContext、PVC/PV 和最近失败 |
 | Skill Registry | 现有动态 Skill Registry + executable handlers | 默认只选一个最高匹配 Skill；多 Skill 必须显式依赖和门禁证据 |
@@ -76,7 +81,7 @@ flowchart LR
 - `cisre.owner-scoped-jobs`
 - `cisre.telemetry`
 
-`GET /api/ops/capabilities` 会返回每个插件的状态、依赖、服务、事件和上游 SDK 就绪状态，前端“运行总览 → 运维工具”直接展示这些实时数据。
+`GET /api/ops/capabilities` 会返回每个插件的状态、依赖、服务、事件、Profile、权限与上游 SDK 就绪状态。前端“运行总览 → 运维工具”展示插件/Profile、服务依赖图、会话事件、分支恢复与权限审计。外置插件开发、目录和 API 见 [HARNESS_PLUGIN_DEVELOPMENT_ZH.md](./HARNESS_PLUGIN_DEVELOPMENT_ZH.md)。
 
 ## 安全边界
 

@@ -110,6 +110,8 @@ repository/
 │   │   ├── cluster_registry.py       # Rancher/Kubeconfig 集群纳管
 │   │   ├── ops_harness.py            # 持久状态机和唯一完成语义
 │   │   ├── harness_plugins.py        # 可插拔 Planner/Skill/Gate/Executor/Verifier
+│   │   ├── harness_packages.py       # 外置插件包、服务依赖、Profile/Bundle/Patch 与权限
+│   │   ├── harness_events.py         # 追加式事件、哈希链、回放、分支、恢复、子会话
 │   │   ├── ops_execution.py          # 执行编排与防并发重复
 │   │   ├── ops_skill_*.py            # Skill 注册、运行、统计
 │   │   ├── infrastructure_providers.py # 兼容库存/外部 Adapter 编排
@@ -321,6 +323,14 @@ CISRE 调用 Adapter 的请求：
 | `POST /api/ops/jobs` | 建立持久运维任务 | 所有域共用 |
 | `POST /api/ops/jobs/{id}/approve-step` | 逐项批准 | 旧批准不可复用于变化后的补丁 |
 | `POST /api/ops/jobs/{id}/cancel` | 人工中断 | 审计保留 |
+| `GET /api/harness/runtime` | 插件、服务、Profile、权限与事件存储实时状态 | 只读 |
+| `GET /api/harness/profiles` | Profile/Bundle/外置包目录 | 只读 |
+| `POST /api/harness/profiles/activate` | 组合层切换 | 默认关闭，显式开启且审计 |
+| `POST /api/harness/plugins/reload` | 重新发现挂载目录 | 不加载任意进程内代码 |
+| `POST /api/harness/services/{service}/invoke` | 调用签名 remote Provider 声明的只读操作 | 固定目标、操作白名单、超时/大小限制 |
+| `GET /api/harness/sessions/{id}/events` | 事件、哈希完整性与子会话 | 脱敏 |
+| `POST /api/harness/sessions/{id}/fork` | 从事件边界创建分支 | 不复用变更审批 |
+| `POST /api/harness/sessions/{id}/resume` | 从持久事件恢复投影 | 不自动批准写操作 |
 
 兼容规则：v1 中只能新增可选字段；不能重命名字段、改变默认值语义、放宽审批或重新解释 `completed/recovered`。破坏性变更并行新增 `/v2`，v1 至少保留一个完整发布线。
 

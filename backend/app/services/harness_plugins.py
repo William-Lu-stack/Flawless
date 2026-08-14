@@ -42,6 +42,8 @@ class PluginManifest:
     scope: str = "global"
     priority: int = 0
     source: str = "cisre"
+    permissions: tuple[str, ...] = ()
+    runtime_type: str = "builtin"
 
     def public(self) -> dict[str, Any]:
         return {
@@ -54,6 +56,8 @@ class PluginManifest:
             "scope": self.scope,
             "priority": self.priority,
             "source": self.source,
+            "permissions": list(self.permissions),
+            "runtime_type": self.runtime_type,
         }
 
 
@@ -384,6 +388,20 @@ class HarnessPluginRuntime:
                 "failed": sum(item["status"] == "failed" for item in plugins),
                 "services": sum(len(values) for values in self._services.values()),
                 "event_subscriptions": sum(len(values) for values in self._events.values()),
+            },
+            "service_bindings": {
+                name: [
+                    {
+                        "plugin_id": item.plugin_id,
+                        "scope": item.scope,
+                        "priority": item.priority,
+                        "selected_globally": bool(
+                            values and sorted(values, key=lambda value: (-value.priority, -value.sequence))[0] is item
+                        ),
+                    }
+                    for item in values
+                ]
+                for name, values in sorted(self._services.items())
             },
         }
 
@@ -798,12 +816,28 @@ def official_deepseek_harness_status() -> dict[str, Any]:
 
 def harness_capabilities_payload() -> dict[str, Any]:
     payload = CISRE_HARNESS_RUNTIME.diagnostics()
+    # Lazy imports avoid a bootstrap cycle: the package manager mounts into
+    # this runtime, while the event store is an independent durable service.
+    from backend.app.services.harness_events import HARNESS_EVENT_STORE
+    from backend.app.services.harness_packages import HARNESS_PACKAGE_MANAGER
+
     payload["upstream_adapter"] = official_deepseek_harness_status()
+    payload["composition"] = HARNESS_PACKAGE_MANAGER.diagnostics()
+    payload["event_store"] = HARNESS_EVENT_STORE.diagnostics()
     payload["contracts"] = {
         "append_only_session_events": True,
+        "hash_chained_durable_events": True,
+        "session_replay_fork_resume": True,
+        "child_session_drill_down": True,
         "scoped_dependency_injection": True,
         "typed_event_modes": ["observe", "serial", "parallel", "waterfall"],
         "reversible_plugin_effects": True,
+        "out_of_tree_declarative_plugins": True,
+        "profile_bundle_patch_composition": True,
+        "versioned_service_requirements": True,
+        "swappable_service_providers": True,
+        "plugin_permission_policy": True,
+        "unsigned_privileged_plugins_fail_closed": True,
         "progressive_context_loading": True,
         "monotonic_tool_guards": True,
         "approval_fail_closed": True,

@@ -43,7 +43,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: cmdb
-          image: ghcr.dockerproxy.net/your-org/cisre:5.3.1
+          image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
           imagePullPolicy: IfNotPresent
           command:
             - sh
