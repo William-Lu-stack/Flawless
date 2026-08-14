@@ -22,7 +22,7 @@ flowchart TB
     TOPOLOGY["CMDB + eBPF 拓扑算法"]
   end
 
-  subgraph HARNESS["CISREDurableHarness/v2"]
+  subgraph HARNESS["CISREDurableHarness/v3 + CISREPluginHarness/v1"]
     E["1 新鲜证据合同"] --> H["2 多假设诊断"]
     H --> S["3 单 Skill 优先 / 必要时组合"]
     S --> G["4 风险与爆炸半径门禁"]
@@ -96,7 +96,9 @@ CISRE 没有把通用 Coding Agent 的 Shell 自治直接搬进生产集群，�
 
 | 前沿能力 | CISRE 落点 | SRE 限制 |
 |---|---|---|
-| 持久任务 / Todo / mode | `CISREDurableHarness/v2` 的 phase contracts、todos、checkpoint、resume token | 只能按证据→根因→变更→验证推进 |
+| 持久任务 / Todo / mode | `CISREDurableHarness/v3` 的 phase contracts、typed events、todos、checkpoint、resume token | 只能按证据→根因→变更→验证推进 |
+| Everything is a Plugin | `CISREPluginHarness/v1` 的作用域服务、四类事件、可逆 Effect 和依赖激活 | Planner、Skill、审批、执行、回读、验证都可独立替换且不绕过门禁 |
+| DeepSeek Harness 兼容 | 官方架构同构插件层；上游 Python SDK/JSON-RPC 仅预留为可选 Planner | 上游运行时不持有 Kubernetes 写权限，Developer Preview 不替换现有执行面 |
 | Tool loop | 动态 Skill 与受控 action catalog | 模型不能创造未注册动作 |
 | Human interrupt/resume | 审批检查点、approval ledger、等待时释放执行槽 | 所有变更默认需要本人确认 |
 | Durable execution | Job Store、事件账本、attempt/receipt ledger | 副作用必须幂等且可回读 |
@@ -137,6 +139,9 @@ CISRE 没有把通用 Coding Agent 的 Shell 自治直接搬进生产集群，�
 - Canvas 标签纹理从 768×176 降到 384×88，并在销毁时释放 texture/material/geometry。
 
 ## 全栈资源扩展合同
+
+完整的代码目录、团队边界、风险域入口、Adapter 示例、API 请求响应和 AI/Vibe Coding 约束见
+[CISRE 代码架构、团队协作与扩展接入指南](TEAM_ARCHITECTURE_AND_EXTENSION_GUIDE_ZH.md)。
 
 三组稳定接口将云厂商和产品细节隔离在 Adapter 之外：
 

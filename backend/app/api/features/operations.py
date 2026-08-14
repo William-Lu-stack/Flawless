@@ -11,6 +11,8 @@ def build_router(runtime):
         ("POST", "/api/inspection/preview", "preview_ai_inspection_finding"),
         ("GET", "/api/infrastructure/resources", "list_infrastructure_resources"),
         ("GET", "/api/infrastructure/providers", "infrastructure_providers"),
+        ("GET", "/api/infrastructure/contracts", "infrastructure_adapter_contracts"),
+        ("GET", "/api/operations/domains", "operations_domains"),
         ("POST", "/api/infrastructure/resources/sync", "sync_infrastructure_resources"),
         ("POST", "/api/infrastructure/discover", "discover_infrastructure_resources"),
         ("POST", "/api/infrastructure/scan", "scan_infrastructure_resources"),

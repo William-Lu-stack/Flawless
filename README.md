@@ -16,12 +16,23 @@
 
 Maintained by the **CISRE Contributors** community.
 
-Current release: **5.3.0**.
+Current release: **5.3.1**.
 
 本版本的总体架构、Harness 融合、Kubernetes 写后回读、拓扑性能和国产全栈适配合同见
 [`docs/CISRE_ARCHITECTURE_ZH.md`](docs/CISRE_ARCHITECTURE_ZH.md)。
 
-Release 5.3.0 introduces the CISRE brand and `CISREDurableHarness/v2`, proves
+Release 5.3.1 binds every approved Kubernetes mutation to one canonical
+cluster ID, namespace, kind and name before execution, and uses that immutable
+identity for the write, live read-back and recovery probes. A Workload change
+is successful only when the same object UID remains, its `resourceVersion` and
+`generation` advance, and the approved fields exist on the live object.
+Recovery now follows only Pods created by the new revision, requires controller
+rollout convergence, stable restart counts, fresh current logs without the
+original failure signature, no new BackOff events, and optional endpoint or
+business probes when available. Historical `--previous` logs remain diagnostic
+evidence and can no longer keep a healthy replacement Pod spinning forever.
+
+Release 5.3.0 introduced the CISRE brand and `CISREDurableHarness/v2`, proved
 every Kubernetes Workload mutation with same-transport read-after-write field
 matching, defaults the optimized 3D topology to automatic orbit, and opens
 credential-free inventory/discovery contracts for Alibaba Cloud and other

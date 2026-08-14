@@ -10,8 +10,8 @@ fullnameOverride: k8s-agent
 namespaceOverride: k8s-agent
 
 image:
-  repository: ghcr.dockerproxy.net/your-org/flawless
-  tag: 5.3.0
+  repository: ghcr.dockerproxy.net/your-org/cisre
+  tag: 5.3.1
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

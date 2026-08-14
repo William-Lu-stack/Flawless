@@ -3,7 +3,7 @@ fullnameOverride: ""
 namespaceOverride: ""
 
 image:
-  repository: ghcr.io/your-org/flawless
+  repository: ghcr.io/your-org/cisre
   tag: latest
   pullPolicy: IfNotPresent
 

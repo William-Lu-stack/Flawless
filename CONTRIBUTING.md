@@ -1,6 +1,12 @@
 # Contributing
 
-Thanks for helping improve `flawless`.
+Thanks for helping improve CISRE.
+
+Before changing architecture or adding a provider, read
+[`docs/TEAM_ARCHITECTURE_AND_EXTENSION_GUIDE_ZH.md`](docs/TEAM_ARCHITECTURE_AND_EXTENSION_GUIDE_ZH.md)
+and the repository rules in [`AGENTS.md`](AGENTS.md). Database, VM, storage,
+middleware and cloud teams must also follow
+[`backend/app/adapters/README.md`](backend/app/adapters/README.md).
 
 ## Development Setup
 
@@ -32,6 +38,9 @@ cd frontend/modern && npm run build
 - Put credentials in environment variables, Kubernetes Secrets, or a secret manager.
 - Keep custom scoring or company-specific algorithms outside the public repository.
 - Add tests for any change that touches remediation, release gates, RBAC, or runtime state.
+- Keep infrastructure Adapters read-only; send approved mutations through the shared OpsJob executor.
+- Treat v1 API and Adapter contracts as additive-only. Publish a parallel v2 for breaking changes.
+- Re-read the real target after every mutation; an accepted API request is not recovery proof.
 
 ## Skills
 

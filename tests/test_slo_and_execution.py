@@ -1918,6 +1918,66 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
             {"spec": {"replicas": 2}},
         )
 
+    async def test_rancher_display_name_is_bound_to_opaque_id_before_approval(self):
+        plan = {
+            "cluster_id": "production-east",
+            "cluster": "production-east",
+            "source": "sre_chat",
+            "namespace": "prod",
+            "target": "Deployment/orders-api",
+        }
+        changes = [{
+            "type": "patch_workload",
+            "namespace": "prod",
+            "workload_type": "Deployment",
+            "workload_name": "orders-api",
+            "patch": {"spec": {"template": {"metadata": {"annotations": {"fix": "approved"}}}}},
+        }]
+        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[]), patch.object(
+            server, "_rancher_enabled", return_value=True,
+        ), patch.object(
+            server,
+            "_rancher_clusters",
+            AsyncMock(return_value=[{"id": "c-m-12345", "name": "production-east"}]),
+        ):
+            binding = await server._bind_ops_execution_target(plan, changes)
+        self.assertEqual(binding["cluster_id"], "c-m-12345")
+        self.assertEqual(binding["transport"], "rancher")
+        self.assertEqual(plan["cluster_id"], "c-m-12345")
+        self.assertEqual(changes[0]["cluster_id"], "c-m-12345")
+
+    async def test_workload_change_fails_when_generation_does_not_advance(self):
+        change = {
+            "type": "scale_out",
+            "namespace": "prod",
+            "workload_type": "Deployment",
+            "workload_name": "orders-api",
+            "replicas": 2,
+            "human_approved": True,
+            "operator_confirmed": True,
+        }
+        plan = {"cluster_id": "local", "namespace": "prod", "target": "Deployment/orders-api"}
+        before = {
+            "metadata": {"uid": "uid-1", "resourceVersion": "41", "generation": 3},
+            "spec": {"replicas": 1},
+        }
+        after = {
+            "metadata": {"uid": "uid-1", "resourceVersion": "42", "generation": 3},
+            "spec": {"replicas": 2},
+        }
+        with patch.object(server.CLUSTER_REGISTRY, "list", return_value=[]), patch.object(
+            server,
+            "_read_live_workload_after_change",
+            AsyncMock(side_effect=[(before, "local"), (after, "local")]),
+        ), patch.object(
+            server,
+            "_call_mcp_tool",
+            AsyncMock(return_value={"metadata": {"uid": "uid-1", "resourceVersion": "42"}}),
+        ):
+            result = await server._execute_change(change, plan)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("generation", result["result"]["mutation_postcondition"]["error"])
+
     async def test_workload_change_fails_when_api_accepts_but_live_object_does_not_change(self):
         change = {
             "type": "scale_out",
@@ -1983,6 +2043,74 @@ class ObservableExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rollout_complete", criteria["mandatory"])
         self.assertIn("rollout_complete", criteria["not_evaluated"])
         self.assertFalse(criteria["passed"])
+
+    def test_recovery_uses_current_logs_and_keeps_previous_only_for_diagnosis(self):
+        plan = {
+            "namespace": "monitoring",
+            "target": "Deployment/grafana",
+            "changes": [{
+                "type": "patch_workload_runtime_security",
+                "patch": {"spec": {"template": {"spec": {"securityContext": {"fsGroup": 10001}}}}},
+            }],
+            "evidence": {"pod": {"restart_count": 8}},
+        }
+        evidence = {
+            "pod": {"name": "grafana-new", "ready": True, "restart_count": 0},
+            "events": [],
+            "logs": {"grafana": {
+                "current": "logger=server level=info msg=HTTP Server Listen",
+                "previous": "GF_PATHS_DATA is not writable; unable to open database file",
+            }},
+            "workload": {
+                "metadata": {"generation": 4},
+                "spec": {
+                    "replicas": 1,
+                    "template": {"spec": {"securityContext": {"fsGroup": 10001}}},
+                },
+                "status": {
+                    "observedGeneration": 4,
+                    "updatedReplicas": 1,
+                    "readyReplicas": 1,
+                    "availableReplicas": 1,
+                    "unavailableReplicas": 0,
+                },
+            },
+        }
+        criteria = server._assess_recovery_criteria(plan, {"recovered": True}, evidence)
+        self.assertTrue(criteria["passed"], criteria)
+        write_check = next(
+            item for item in criteria["evaluations"]
+            if item["criterion"] == "write_errors_absent"
+        )
+        self.assertTrue(write_check["passed"])
+
+    async def test_recovery_does_not_accept_pre_mutation_healthy_pod(self):
+        plan = {
+            "namespace": "prod",
+            "target": "Deployment/orders-api",
+            "changes": [{
+                "type": "patch_workload",
+                "patch": {"spec": {"template": {"metadata": {"annotations": {"fix": "approved"}}}}},
+                "_mutation_started_at": "2026-08-14T10:00:00+00:00",
+                "_mutation_postcondition": {"verified": True, "generation": 4, "already_applied": False},
+            }],
+        }
+        pods = {"pods": [{
+            "name": "orders-old",
+            "namespace": "prod",
+            "workload_kind": "Deployment",
+            "workload_name": "orders-api",
+            "labels": {"pod-template-hash": "old"},
+            "created_at": "2026-08-14T09:00:00Z",
+            "phase": "Running",
+            "ready": True,
+            "containers": [{"name": "app", "ready": True, "state": "running"}],
+        }]}
+        with patch.object(server, "_call_mcp_tool", AsyncMock(return_value=pods)):
+            result = await server._probe_plan_recovery(plan, [{"status": "completed"}])
+        self.assertIsNone(result["recovered"])
+        self.assertEqual(result["status"], "progressing")
+        self.assertEqual(result["pre_mutation_pods_ignored"], ["orders-old"])
 
     async def _record(self, target, elapsed, remaining):
         target.append((elapsed, remaining))

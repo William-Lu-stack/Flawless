@@ -23,6 +23,8 @@ from pathlib import Path
 
 import httpx
 
+from backend.app.adapters import ADAPTER_REGISTRY, adapter_contract_payload
+
 
 RESOURCE_TYPE_CATALOG: list[dict[str, Any]] = [
     {
@@ -163,7 +165,7 @@ def redact_sensitive(value: Any) -> Any:
 
 
 def _normalize_resource(raw: dict[str, Any], *, default_type: str) -> dict[str, Any]:
-    rtype = str(raw.get("type") or raw.get("resource_type") or default_type).strip().lower()
+    rtype = str(raw.get("type") or raw.get("resource_type") or raw.get("domain") or default_type).strip().lower()
     if rtype in {"db", "mysql", "postgres", "postgresql", "oracle", "redis", "mongodb", "elasticsearch"}:
         subtype = rtype if rtype != "db" else str(raw.get("engine") or raw.get("provider") or "database").lower()
         rtype = "database"
@@ -278,6 +280,11 @@ def providers_payload() -> dict[str, Any]:
             "guarded_mutation": "OpsJob -> ApprovalGate -> INFRASTRUCTURE_ACTION_WEBHOOK_URL -> postcondition",
             "credential_rule": "API requests never carry cloud secrets; adapters resolve secret_env/secret-ref server-side.",
         },
+        "adapter_sdk": {
+            "contract": adapter_contract_payload(),
+            "in_process_adapters": ADAPTER_REGISTRY.list(),
+            "registered": len(ADAPTER_REGISTRY.list()),
+        },
     }
 
 
@@ -349,6 +356,37 @@ async def discover_adapter_resources(
     account_ref: str,
     persist: bool,
 ) -> dict[str, Any]:
+    registered = {item["id"]: item for item in ADAPTER_REGISTRY.list()}
+    if adapter_id in registered:
+        descriptor = registered[adapter_id]
+        discovered = await ADAPTER_REGISTRY.discover(adapter_id, {
+            "contract_version": adapter_contract_payload()["contract_version"],
+            "adapter_id": adapter_id,
+            "account_ref": account_ref,
+            "resource_types": resource_types or [descriptor["domain"]],
+            "regions": regions,
+            "read_only": True,
+        })
+        stamped = [{**item, "adapter_id": adapter_id} for item in discovered]
+        sync_result = None
+        if persist:
+            sync_result = sync_inventory(
+                stamped,
+                provider=str(descriptor.get("provider") or adapter_id),
+                source=f"in-process-adapter:{adapter_id}",
+            )
+        return {
+            "status": "ok",
+            "adapter_id": adapter_id,
+            "adapter_mode": "in_process_read_only",
+            "resource_count": len(stamped),
+            "resources": [
+                redact_sensitive(_normalize_resource(item, default_type=str(item.get("domain") or "external")))
+                for item in stamped
+            ],
+            "persisted": sync_result,
+        }
+
     raw_adapters = [item for item in _as_list(_json_env("INFRASTRUCTURE_ADAPTERS_JSON", "[]")) if isinstance(item, dict)]
     adapter = next((item for item in raw_adapters if str(item.get("id")) == adapter_id and item.get("enabled", True)), None)
     if not adapter:

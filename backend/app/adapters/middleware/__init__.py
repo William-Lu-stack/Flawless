@@ -1,0 +1,1 @@
+"""Middleware adapter extension boundary."""

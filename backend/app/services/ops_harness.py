@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-HARNESS_VERSION = "CISREDurableHarness/v2"
+from backend.app.services.harness_plugins import CISRE_HARNESS_RUNTIME
+
+
+HARNESS_VERSION = "CISREDurableHarness/v3"
 PHASES = ("evidence", "root_cause", "change", "verification")
 
 
@@ -37,8 +40,26 @@ def _phase_for_stage(stage: str) -> str:
     return "evidence"
 
 
+def _event_type(stage: str, phase: str) -> str:
+    name = str(stage or "").strip().lower().replace("_", "/")
+    if stage in {"recovered", "completed"}:
+        return "recovery/complete"
+    if "approval" in name:
+        return "tools/approval"
+    if "llm" in name:
+        return f"llm/{'response' if any(token in name for token in ('done', 'complete')) else 'request'}"
+    if "skill" in name:
+        return "skills/selected" if any(token in name for token in ("done", "complete")) else "skills/discover"
+    if phase == "change":
+        return "tools/result" if any(token in name for token in ("done", "complete")) else "tools/execute"
+    if phase == "verification":
+        return "recovery/check"
+    return f"ops/{name or 'event'}"
+
+
 def new_ops_harness(plan: dict, *, created_at: str = "") -> dict:
     created = created_at or _now()
+    plugin_runtime = CISRE_HARNESS_RUNTIME.diagnostics()
     return {
         "version": HARNESS_VERSION,
         "mode": "diagnose_execute_verify",
@@ -67,6 +88,15 @@ def new_ops_harness(plan: dict, *, created_at: str = "") -> dict:
         "tool_receipts": [],
         "model_calls": [],
         "events": [],
+        "plugin_runtime": {
+            "runtime": plugin_runtime.get("runtime"),
+            "active_plugins": [
+                item.get("id")
+                for item in plugin_runtime.get("plugins") or []
+                if item.get("status") == "active"
+            ],
+            "plugin_count": (plugin_runtime.get("summary") or {}).get("active", 0),
+        },
         "approval_ledger": [],
         "idempotency_ledger": {},
         "last_trajectory_digest": "",
@@ -104,6 +134,11 @@ def new_ops_harness(plan: dict, *, created_at: str = "") -> dict:
             "bounded_context_compaction": True,
             "strategy_budgeting": True,
             "model_independent_execution": True,
+            "everything_is_a_plugin": True,
+            "scoped_dependency_injection": True,
+            "typed_session_events": True,
+            "waterfall_tool_guards": True,
+            "reversible_plugin_lifecycle": True,
         },
     }
 
@@ -135,10 +170,15 @@ def checkpoint_event(harness: dict, stage: str, message: str, values: dict | Non
     event_log.append({
         "seq": state["checkpoint_seq"],
         "timestamp": now,
+        "type": _event_type(stage, phase),
         "stage": stage,
         "phase": phase,
         "message": str(message or "")[:500],
         "status": str(values.get("status") or "running"),
+        "data": {
+            "target": copy.deepcopy(state.get("target") or {}),
+            "status": str(values.get("status") or "running"),
+        },
     })
     del event_log[:-160]
 

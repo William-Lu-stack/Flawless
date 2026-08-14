@@ -43,6 +43,10 @@ import {
 } from "lucide-react";
 import { Topology2D } from "./Topology2D";
 import { OpsJobProgress, OpsPlanPanel } from "./components/OpsPlanPanel";
+import {
+  OperationsDomainSelector,
+  type OperationsDomainId,
+} from "./components/OperationsDomainSelector";
 import { useAsync } from "./hooks/useAsync";
 import {
   ApiState,
@@ -175,6 +179,7 @@ function App() {
   const [session, refreshSession] = useAsync<any>(() => apiGet(`/api/session?ts=${Date.now()}`), []);
   const [registry, refreshRegistry] = useAsync<any>(() => apiGet("/api/model-registry"), []);
   const [activeModelId, setActiveModelId] = useState(() => localStorage.getItem("cisre-active-model") || localStorage.getItem("flawless-active-model") || "");
+  const [operationsDomain, setOperationsDomain] = useState<OperationsDomainId>("");
   const [adminDialog, setAdminDialog] = useState(false);
   const [adminUser, setAdminUser] = useState("admin");
   const [adminPassword, setAdminPassword] = useState("");
@@ -359,8 +364,8 @@ function App() {
           </div>
         </header>
         <div className="page-stack">
-          {visited.has("chat") && <div className={cx("page-layer", page === "chat" && "active")}><ChatPage activeModelId={activeModelId} /></div>}
-          {visited.has("inspection") && <div className={cx("page-layer", page === "inspection" && "active")}><InspectionPage activeModelId={activeModelId} /></div>}
+          {visited.has("chat") && <div className={cx("page-layer", page === "chat" && "active")}><ChatPage activeModelId={activeModelId} operationsDomain={operationsDomain} onDomainChange={setOperationsDomain} /></div>}
+          {visited.has("inspection") && <div className={cx("page-layer", page === "inspection" && "active")}><InspectionPage activeModelId={activeModelId} operationsDomain={operationsDomain} onDomainChange={setOperationsDomain} /></div>}
           {visited.has("topology") && <div className={cx("page-layer", page === "topology" && "active")}><TopologyPage /></div>}
           {visited.has("skills") && <div className={cx("page-layer", page === "skills" && "active")}><OpsSkillsPage /></div>}
           {visited.has("platform") && <div className={cx("page-layer", page === "platform" && "active")}><PlatformPage tab={platformTab} activeModelId={activeModelId} onActivate={activateModel} refreshRegistry={refreshRegistry} registry={registry} /></div>}
@@ -424,7 +429,32 @@ function PlatformPage({
   );
 }
 
-function ChatPage({ activeModelId }: { activeModelId: string }) {
+function ChatPage({
+  activeModelId,
+  operationsDomain,
+  onDomainChange,
+}: {
+  activeModelId: string;
+  operationsDomain: OperationsDomainId;
+  onDomainChange: (domain: OperationsDomainId) => void;
+}) {
+  if (!operationsDomain) {
+    return <OperationsDomainSelector value={operationsDomain} onChange={onDomainChange} mode="operate" />;
+  }
+  return <div className="domain-workspace">
+    <OperationsDomainSelector value={operationsDomain} onChange={onDomainChange} compact mode="operate" />
+    {operationsDomain === "kubernetes"
+      ? <KubernetesChatPage activeModelId={activeModelId} />
+      : <InfrastructurePage
+          activeModelId={activeModelId}
+          initialResourceType={operationsDomain}
+          fixedResourceType
+          entryMode="operate"
+        />}
+  </div>;
+}
+
+function KubernetesChatPage({ activeModelId }: { activeModelId: string }) {
   const [input, setInput] = useState("");
   const [cluster, setCluster] = useState("all");
   const [namespace, setNamespace] = useState("all");
@@ -866,7 +896,32 @@ function chatPlanFromResponse(data: any) {
   };
 }
 
-function InspectionPage({ activeModelId }: { activeModelId: string }) {
+function InspectionPage({
+  activeModelId,
+  operationsDomain,
+  onDomainChange,
+}: {
+  activeModelId: string;
+  operationsDomain: OperationsDomainId;
+  onDomainChange: (domain: OperationsDomainId) => void;
+}) {
+  if (!operationsDomain) {
+    return <OperationsDomainSelector value={operationsDomain} onChange={onDomainChange} mode="inspect" />;
+  }
+  return <div className="domain-workspace">
+    <OperationsDomainSelector value={operationsDomain} onChange={onDomainChange} compact mode="inspect" />
+    {operationsDomain === "kubernetes"
+      ? <KubernetesInspectionPage activeModelId={activeModelId} />
+      : <InfrastructurePage
+          activeModelId={activeModelId}
+          initialResourceType={operationsDomain}
+          fixedResourceType
+          entryMode="inspect"
+        />}
+  </div>;
+}
+
+function KubernetesInspectionPage({ activeModelId }: { activeModelId: string }) {
   const [cluster, setCluster] = useState("all");
   const [namespace, setNamespace] = useState("all");
   const [autoOps, setAutoOps] = useState(false);

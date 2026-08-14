@@ -172,7 +172,7 @@ class OpsHarnessAndCoverageTests(unittest.TestCase):
             "verification": {"recovered": False, "unresolved": [{"pod": "api-new"}]},
         }
         state = record_attempt(state, plan, result)
-        self.assertEqual(state["version"], "CISREDurableHarness/v2")
+        self.assertEqual(state["version"], "CISREDurableHarness/v3")
         self.assertEqual(state["budgets"]["mutations_used"], 1)
         self.assertEqual(state["tool_receipts"][-1]["status"], "verified")
         self.assertTrue(state["idempotency_ledger"])

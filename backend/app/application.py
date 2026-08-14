@@ -79,6 +79,14 @@ from backend.app.services.cluster_registry import ClusterRegistry
 from cmdb.local_cmdb import _collect_cluster_topology
 from backend.app.services.ops_execution import StageTimeoutError, run_with_heartbeat
 from backend.app.services.ops_harness import checkpoint_event, new_ops_harness, record_attempt
+from backend.app.services.harness_plugins import (
+    HarnessPolicyDenied,
+    compact_planner_context,
+    guard_execution_request,
+    harness_capabilities_payload,
+)
+from backend.app.adapters import adapter_contract_payload
+from backend.app.adapters.domains import operations_domain_catalog
 from backend.app.services.log_evidence import triage_kubernetes_logs
 from backend.app.services.ops_skill_registry import OpsSkillRegistry, approved_script_catalog, skill_option_catalog
 from backend.app.services.ops_skill_runtime import (
@@ -211,8 +219,8 @@ KNOWLEDGE_CHUNK_CHARS = max(300, int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "900")))
 KNOWLEDGE_CHUNK_OVERLAP = max(0, int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "120")))
 KNOWLEDGE_LOCK = threading.RLock()
 PLATFORM_LAST_SELF_HEAL_AT = 0.0
-APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.3.0")
-APP_CODE_SIGNATURE = "cisre-durable-harness-v2-readback-v1"
+APP_BUILD_VERSION = os.getenv("APP_BUILD_VERSION", "5.3.1")
+APP_CODE_SIGNATURE = "cisre-durable-harness-v2-target-binding-closure-v2"
 BUILTIN_SKILL_POLICY_REVISION = "3.0.0"
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -3965,6 +3973,130 @@ def _ops_cluster_transport(plan: dict) -> str:
 
 def _ops_uses_rancher(plan: dict) -> bool:
     return _ops_cluster_transport(plan) == "rancher"
+
+
+def _looks_like_rancher_cluster_id(value: str) -> bool:
+    normalized = str(value or "").strip()
+    return bool(re.fullmatch(r"c-[a-z0-9][a-z0-9-]{2,127}", normalized))
+
+
+async def _resolve_ops_execution_binding(plan: dict, change: dict | None = None) -> dict:
+    """Resolve one immutable cluster/namespace/resource identity for a mutation.
+
+    UI plans can carry a Rancher display name while Kubernetes proxy endpoints
+    require Rancher's opaque cluster id.  Historically the executor preferred
+    ``plan.cluster_id`` while read-after-write preferred ``change.cluster_id``;
+    a mixed plan could therefore write and verify different targets.  Resolve
+    aliases before approval/preflight, then persist the exact binding on both
+    the plan and every change.
+    """
+    change = change or {}
+    namespace = str(change.get("namespace") or plan.get("namespace") or "default").strip()
+    workload_type = str(
+        change.get("workload_type")
+        or change.get("kind")
+        or _workload_identity_from_plan(plan)[1]
+        or "Deployment"
+    ).strip()
+    workload_name = str(
+        change.get("workload_name")
+        or change.get("name")
+        or _workload_identity_from_plan(plan)[2]
+        or ""
+    ).strip()
+    candidates = []
+    for value in (
+        change.get("cluster_id"),
+        plan.get("cluster_id"),
+        plan.get("rancher_cluster_id"),
+        plan.get("cluster"),
+    ):
+        candidate = str(value or "").strip()
+        if candidate and candidate.lower() not in {"all", "*", "所有"} and candidate not in candidates:
+            candidates.append(candidate)
+    requested = candidates[0] if candidates else "local"
+
+    managed = CLUSTER_REGISTRY.list()
+    managed_matches = [
+        item for item in managed
+        if requested in {str(item.get("id") or ""), str(item.get("name") or "")}
+    ]
+    if len(managed_matches) == 1:
+        resolved_cluster_id = str(managed_matches[0].get("id") or "")
+        transport = "kubeconfig"
+    elif requested in {"local", "local-cluster"}:
+        resolved_cluster_id = "local"
+        transport = "local"
+    elif _looks_like_rancher_cluster_id(requested) and "rancher" in str(plan.get("source") or "").lower():
+        # The UI may submit an already-canonical Rancher id while credentials
+        # are injected only in the worker process. Binding that exact id is
+        # safe; connectivity is proven by the mandatory pre-read below.
+        resolved_cluster_id = requested
+        transport = "rancher"
+    elif _rancher_enabled():
+        # Opaque Rancher ids are already canonical. Their existence and the
+        # exact Workload identity are still proven by the mandatory pre-read.
+        if _looks_like_rancher_cluster_id(requested):
+            resolved_cluster_id = requested
+        else:
+            clusters = await _rancher_clusters()
+            matches = [
+                item for item in clusters
+                if requested in {str(item.get("id") or ""), str(item.get("name") or "")}
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Rancher cluster {requested!r} cannot be resolved to one exact cluster id"
+                )
+            resolved_cluster_id = str(matches[0].get("id") or "")
+        transport = "rancher"
+    elif "kubeconfig" in str(plan.get("source") or "").lower():
+        raise RuntimeError(f"managed kubeconfig cluster {requested!r} is not registered")
+    elif requested not in {"local", "local-cluster"}:
+        raise RuntimeError(
+            f"cluster {requested!r} is not managed and Rancher is not configured"
+        )
+    else:
+        resolved_cluster_id = "local"
+        transport = "local"
+
+    if not namespace or not resolved_cluster_id:
+        raise RuntimeError("execution binding requires an exact cluster and namespace")
+    return {
+        "cluster_id": resolved_cluster_id,
+        "requested_cluster": requested,
+        "transport": transport,
+        "namespace": namespace,
+        "workload_type": workload_type,
+        "workload_name": workload_name,
+        "target": f"{workload_type}/{workload_name}" if workload_name else str(plan.get("target") or ""),
+    }
+
+
+async def _bind_ops_execution_target(plan: dict, changes: list[dict]) -> dict:
+    """Bind all Kubernetes changes in one plan to the same exact target cluster."""
+    bound: dict | None = None
+    for change in changes:
+        action = str(change.get("type") or "")
+        if _is_infrastructure_action(action) or action == "run_shell":
+            continue
+        binding = await _resolve_ops_execution_binding(plan, change)
+        if bound and binding["cluster_id"] != bound["cluster_id"]:
+            raise RuntimeError("one OpsJob cannot mutate multiple Kubernetes clusters")
+        bound = bound or binding
+        change["cluster_id"] = binding["cluster_id"]
+        change["namespace"] = binding["namespace"]
+    if bound:
+        plan.setdefault("cluster_display_name", plan.get("cluster") or bound["requested_cluster"])
+        plan["cluster_id"] = bound["cluster_id"]
+        plan["namespace"] = bound["namespace"]
+        plan["_execution_binding"] = copy.deepcopy(bound)
+    return bound or {
+        "cluster_id": str(plan.get("cluster_id") or ""),
+        "transport": "external",
+        "namespace": str(plan.get("namespace") or ""),
+        "target": str(plan.get("target") or ""),
+    }
 
 
 def _rancher_verify_ssl() -> bool:
@@ -9348,10 +9480,11 @@ async def _execute_change(change: dict, plan: dict) -> dict:
     namespace = change.get("namespace", plan.get("namespace", "default"))
     workload_name = change.get("workload_name", "")
     workload_type = change.get("workload_type", "Deployment")
-    cluster_id = plan.get("cluster_id") or change.get("cluster_id") or "local"
+    cluster_id = change.get("cluster_id") or plan.get("cluster_id") or "local"
     managed_cluster_ids = {item.get("id") for item in CLUSTER_REGISTRY.list()}
-    use_managed_cluster = cluster_id in managed_cluster_ids
-    use_rancher = _ops_uses_rancher(plan)
+    execution_transport = _ops_cluster_transport({**plan, "cluster_id": cluster_id})
+    use_managed_cluster = execution_transport == "kubeconfig" and cluster_id in managed_cluster_ids
+    use_rancher = execution_transport == "rancher"
     workload_change_types = {
         "restart", "patch_workload", "patch_workload_volume", "patch_workload_runtime_security",
         "patch", "scale_out", "rollback_workload",
@@ -9400,6 +9533,23 @@ async def _execute_change(change: dict, plan: dict) -> dict:
             "result": {"error": action_reason, "requires_high_risk_confirmation": "high risk" in action_reason},
         }
 
+    try:
+        harness_guard = await guard_execution_request(
+            change,
+            plan,
+            approved=operator_confirmed,
+        )
+    except HarnessPolicyDenied as exc:
+        return {
+            "change": _redact_sensitive(change),
+            "status": "blocked",
+            "result": {
+                "error": str(exc),
+                "requires_human_confirmation": True,
+                "harness_policy": "CISREPluginHarness/v1",
+            },
+        }
+
     mutation_before: dict = {}
     mutation_already_applied = False
     if ctype in workload_change_types and ctype != "replace_immutable_workload":
@@ -9433,6 +9583,9 @@ async def _execute_change(change: dict, plan: dict) -> dict:
                     "mutation_precondition_failed": True,
                 },
             }
+
+    if not mutation_already_applied and ctype in workload_change_types:
+        change["_mutation_started_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
         if mutation_already_applied:
@@ -9990,9 +10143,12 @@ async def _execute_change(change: dict, plan: dict) -> dict:
         before_metadata = mutation_before.get("metadata") or {}
         postcondition["before_resource_version"] = before_metadata.get("resourceVersion")
         postcondition["before_generation"] = before_metadata.get("generation")
+        postcondition["before_uid"] = before_metadata.get("uid")
         postcondition["already_applied"] = mutation_already_applied
         after_rv = str(postcondition.get("resource_version") or "")
         before_rv = str(before_metadata.get("resourceVersion") or "")
+        after_generation = int(postcondition.get("generation") or 0)
+        before_generation = int(before_metadata.get("generation") or 0)
         if (
             postcondition.get("verified") is True
             and not mutation_already_applied
@@ -10004,10 +10160,24 @@ async def _execute_change(change: dict, plan: dict) -> dict:
                 "verified": False,
                 "error": "审批 Patch 字段看似匹配，但 resourceVersion 未变化，无法证明本次写操作真实生效。",
             })
+        if (
+            postcondition.get("verified") is True
+            and not mutation_already_applied
+            and before_generation
+            and after_generation
+            and after_generation <= before_generation
+        ):
+            postcondition.update({
+                "verified": False,
+                "error": "审批 Patch 已返回，但 Workload generation 未前进，无法证明 Pod 模板变更触发了新一轮 reconcile。",
+            })
         result["mutation_postcondition"] = postcondition
+        change["_mutation_postcondition"] = copy.deepcopy(postcondition)
         if postcondition.get("verified") is not True:
             result["error"] = postcondition.get("error") or "Kubernetes workload mutation postcondition failed"
 
+    if isinstance(result, dict):
+        result["harness_guard_receipts"] = harness_guard.get("guard_receipts") or []
     outcome = {
         "change": _redact_sensitive(change),
         "status": "failed" if isinstance(result, dict) and result.get("error") else "completed",
@@ -10189,6 +10359,46 @@ def _current_rollout_pod_cohort(pods: list[dict]) -> tuple[list[dict], list[str]
         if pod.get("name")
     ]
     return selected, superseded
+
+
+def _parse_utc_timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _mutation_new_pod_boundary(plan: dict) -> datetime | None:
+    """Return the latest real template mutation time that must yield new Pods."""
+    boundaries: list[datetime] = []
+    for change in plan.get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+        postcondition = change.get("_mutation_postcondition") or {}
+        if postcondition.get("already_applied") is True:
+            continue
+        canonical_patch = change.get("_materialized_canonical_workload_patch") or change.get("patch") or {}
+        changes_template = bool(
+            (((canonical_patch.get("spec") or {}).get("template")) or {})
+        )
+        scales_out = str(change.get("type") or "") == "scale_out"
+        if not (changes_template or scales_out):
+            continue
+        started = _parse_utc_timestamp(str(change.get("_mutation_started_at") or ""))
+        if started:
+            boundaries.append(started)
+    return max(boundaries) if boundaries else None
+
+
+def _pod_created_after(pod: dict, boundary: datetime) -> bool:
+    created = _parse_utc_timestamp(str(pod.get("created_at") or ""))
+    # API timestamps have second precision on some Kubernetes versions. Allow
+    # a two-second clock/serialization tolerance, but never accept a clearly
+    # older Pod as proof of the current mutation.
+    return bool(created and created >= boundary - timedelta(seconds=2))
 
 
 async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
@@ -10539,6 +10749,32 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
     else:
         matched_for_health = active_matched or matched
 
+    mutation_boundary = _mutation_new_pod_boundary(plan)
+    pre_mutation_pods_ignored: list[str] = []
+    if mutation_boundary is not None:
+        post_mutation_pods = [
+            pod for pod in matched_for_health
+            if _pod_created_after(pod, mutation_boundary)
+        ]
+        pre_mutation_pods_ignored = [
+            str(pod.get("name") or "")
+            for pod in matched_for_health
+            if pod not in post_mutation_pods and pod.get("name")
+        ]
+        if not post_mutation_pods:
+            return {
+                "status": "progressing",
+                "recovered": None,
+                "message": "Workload Patch 已落地，但尚未观察到本次变更生成的新 Pod，继续等待 controller reconcile。",
+                "namespace": namespace,
+                "target": f"{workload_type}/{workload_name}",
+                "pods_matched_total": len(matched),
+                "pre_mutation_pods_ignored": pre_mutation_pods_ignored,
+                "mutation_started_at": mutation_boundary.isoformat(),
+                "errors": errors,
+            }
+        matched_for_health = post_mutation_pods
+
     unresolved = []
     for pod in matched_for_health:
         category, severity, reason = _classify_pod_issue(pod, [])
@@ -10576,6 +10812,9 @@ async def _probe_plan_recovery(plan: dict, results: list[dict]) -> dict:
         "pods_checked": len(matched_for_health),
         "pods_matched_total": len(matched),
         "superseded_pods_ignored": superseded_pods,
+        "pre_mutation_pods_ignored": pre_mutation_pods_ignored,
+        "mutation_started_at": mutation_boundary.isoformat() if mutation_boundary else "",
+        "new_pod_lineage_verified": bool(mutation_boundary is None or matched_for_health),
         "recovered_pods": recovered_pods,
         "unresolved": unresolved[:8],
         "terminal_unresolved": terminal_unresolved[:8],
@@ -10814,6 +11053,14 @@ async def _verify_workload_mutation_postcondition(
     result_metadata = raw_result.get("metadata") if isinstance(raw_result, dict) else {}
     expected_uid = str((result_metadata or {}).get("uid") or "")
     actual_uid = str(metadata.get("uid") or "")
+    precondition_uid = str(
+        ((change.get("_mutation_precondition") or {}).get("uid")) or ""
+    )
+    if precondition_uid and actual_uid and precondition_uid != actual_uid:
+        mismatches.insert(
+            0,
+            f"metadata.uid: pre-read found {precondition_uid}, read-back found {actual_uid}",
+        )
     if expected_uid and actual_uid and expected_uid != actual_uid:
         mismatches.insert(0, f"metadata.uid: API returned {expected_uid}, read-back found {actual_uid}")
     receipt = {
@@ -10857,7 +11104,13 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
     if workload_name and str(workload_type or "").lower() in {
         "deployment", "statefulset", "daemonset", "replicaset", "job", "cronjob",
     }:
-        mandatory.append("rollout_complete")
+        mandatory.extend([
+            "rollout_complete",
+            "restart_count_stable",
+            "events_no_new_backoff",
+            "current_logs_checked",
+            "runtime_failure_absent",
+        ])
     workload_change_applied, workload_change_proof = _live_workload_postcondition(
         plan,
         evidence.get("workload") or {},
@@ -10870,8 +11123,12 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
     )
     if _permission_recovery_stage(plan) in ROOT_PERMISSION_RECOVERY_STAGES:
         mandatory.append("root_security_context_applied")
-    normalized_requested = {item.strip().lower().replace(" ", "_") for item in requested}
-    requested = requested + [item for item in mandatory if item not in normalized_requested]
+    if any(
+        str(item.get("type") or "") == "patch_workload_runtime_security"
+        for item in (plan.get("changes") or [])
+        if isinstance(item, dict)
+    ):
+        mandatory.append("write_errors_absent")
     pod = evidence.get("pod") or {}
     events = evidence.get("events") or []
     logs = evidence.get("logs") or {}
@@ -10880,15 +11137,48 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
     services = [item for item in (evidence.get("services") or []) if isinstance(item, dict) and not item.get("error")]
     business_probes = [item for item in (evidence.get("business_probes") or []) if isinstance(item, dict)]
     sli = evidence.get("sli") if isinstance(evidence.get("sli"), dict) else {}
-    text = " ".join([
+    if services:
+        mandatory.append("endpoint_ready")
+    if business_probes:
+        mandatory.append("business_probe_ok")
+    if "error_rate_recovered" in sli:
+        mandatory.append("error_rate_recovered")
+    mandatory = list(dict.fromkeys(mandatory))
+    normalized_requested = {item.strip().lower().replace(" ", "_") for item in requested}
+    requested = requested + [item for item in mandatory if item not in normalized_requested]
+    historical_text = " ".join([
         _pod_state_text(pod),
         json.dumps(_redact_sensitive(events), ensure_ascii=False, default=str),
         json.dumps(_redact_sensitive(logs), ensure_ascii=False, default=str),
     ]).lower()
+    current_log_payload = {
+        name: {"current": content.get("current", "")}
+        for name, content in logs.items()
+        if isinstance(content, dict) and "current" in content
+    }
+    current_text = " ".join([
+        _pod_state_text(pod),
+        json.dumps(_redact_sensitive(events), ensure_ascii=False, default=str),
+        json.dumps(_redact_sensitive(current_log_payload), ensure_ascii=False, default=str),
+    ]).lower()
+    current_logs_checked = any(
+        "current" in content and not content.get("current_error")
+        for content in logs.values()
+        if isinstance(content, dict)
+    )
     baseline_pod = ((plan.get("evidence") or {}).get("pod") or {}) if isinstance(plan.get("evidence"), dict) else {}
     baseline_restarts = int(baseline_pod.get("restart_count") or 0)
     current_restarts = int(pod.get("restart_count") or 0)
-    write_error_absent = not any(term in text for term in (
+    restart_samples = plan.setdefault("_verification_restart_samples", {})
+    pod_key = str(pod.get("name") or "unknown")
+    previous_restart_sample = restart_samples.get(pod_key)
+    restart_count_stable = (
+        current_restarts <= int(previous_restart_sample)
+        if previous_restart_sample is not None
+        else current_restarts <= max(1, baseline_restarts)
+    )
+    restart_samples[pod_key] = current_restarts
+    write_error_absent = not any(term in current_text for term in (
         "permission denied", "operation not permitted", "read-only file system", "mkdir:",
         "unable to open database file", "can't open database file", "cannot open database file",
         "attempt to write a readonly database", "attempt to write a read-only database",
@@ -10898,7 +11188,7 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
         "failed to create temporary file", "data directory is not writable",
         " is not writable", "paths_data", "path_data",
     ))
-    write_probe_succeeded = any(term in text for term in (
+    write_probe_succeeded = any(term in current_text for term in (
         "file_create_ok",
         "file create ok",
         "write_probe_ok",
@@ -10912,6 +11202,11 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
     desired = int(spec.get("replicas") or 1)
     generation = int(metadata.get("generation") or 0)
     observed_generation = int(status.get("observedGeneration") or 0)
+    expected_generation = max([
+        int(((item.get("_mutation_postcondition") or {}).get("generation")) or 0)
+        for item in (plan.get("changes") or [])
+        if isinstance(item, dict)
+    ] or [0])
     normalized_workload_type = str(workload_type or "").lower()
     if normalized_workload_type == "job":
         completions = int(spec.get("completions") or 1)
@@ -10923,19 +11218,87 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
                 or (verification.get("recovered") is True and int(status.get("active") or 0) > 0)
             )
         )
+        rollout_proof = (
+            f"Job succeeded={int(status.get('succeeded') or 0)}/{completions}, "
+            f"failed={int(status.get('failed') or 0)}"
+        )
     elif normalized_workload_type == "cronjob":
         rollout_complete = bool(
             workload
             and verification.get("recovered") is True
             and not bool(status.get("lastScheduleTime") and status.get("active") is None and spec.get("suspend"))
         )
+        rollout_proof = "CronJob 当前运行实例健康且未被异常挂起"
+    elif normalized_workload_type == "deployment":
+        rollout_complete = bool(
+            workload
+            and (not expected_generation or generation >= expected_generation)
+            and generation > 0
+            and observed_generation >= generation
+            and int(status.get("updatedReplicas") or 0) >= desired
+            and int(status.get("readyReplicas") or 0) >= desired
+            and int(status.get("availableReplicas", status.get("readyReplicas") or 0) or 0) >= desired
+            and int(status.get("unavailableReplicas") or 0) == 0
+        )
+        rollout_proof = (
+            f"Deployment generation={generation}, observed={observed_generation}, expected>={expected_generation or generation}, "
+            f"updated={int(status.get('updatedReplicas') or 0)}, ready={int(status.get('readyReplicas') or 0)}, "
+            f"available={int(status.get('availableReplicas', status.get('readyReplicas') or 0) or 0)}/{desired}"
+        )
+    elif normalized_workload_type == "statefulset":
+        rollout_complete = bool(
+            workload
+            and (not expected_generation or generation >= expected_generation)
+            and generation > 0
+            and observed_generation >= generation
+            and int(status.get("updatedReplicas") or 0) >= desired
+            and int(status.get("readyReplicas") or 0) >= desired
+            and (
+                not status.get("updateRevision")
+                or status.get("currentRevision") == status.get("updateRevision")
+            )
+        )
+        rollout_proof = (
+            f"StatefulSet generation={generation}, observed={observed_generation}, "
+            f"updated={int(status.get('updatedReplicas') or 0)}, ready={int(status.get('readyReplicas') or 0)}/{desired}, "
+            f"revision={status.get('currentRevision') or '-'}->{status.get('updateRevision') or '-'}"
+        )
+    elif normalized_workload_type == "daemonset":
+        desired_daemons = int(status.get("desiredNumberScheduled") or 0)
+        rollout_complete = bool(
+            workload
+            and (not expected_generation or generation >= expected_generation)
+            and generation > 0
+            and observed_generation >= generation
+            and desired_daemons > 0
+            and int(status.get("updatedNumberScheduled") or 0) >= desired_daemons
+            and int(status.get("numberReady") or 0) >= desired_daemons
+            and int(status.get("numberUnavailable") or 0) == 0
+        )
+        rollout_proof = (
+            f"DaemonSet generation={generation}, observed={observed_generation}, "
+            f"updated={int(status.get('updatedNumberScheduled') or 0)}, "
+            f"ready={int(status.get('numberReady') or 0)}/{desired_daemons}"
+        )
     else:
         rollout_complete = bool(
             workload
+            and (not expected_generation or generation >= expected_generation)
             and (not generation or observed_generation >= generation)
-            and int(status.get("updatedReplicas") or status.get("currentReplicas") or desired) >= desired
+            and int(status.get("updatedReplicas") or status.get("currentReplicas") or 0) >= desired
             and int(status.get("readyReplicas") or status.get("numberReady") or 0) >= desired
         )
+        rollout_proof = (
+            f"{workload_type} generation={generation}, observed={observed_generation}, "
+            f"ready={int(status.get('readyReplicas') or status.get('numberReady') or 0)}/{desired}"
+        )
+    runtime_failure_terms = (
+        "crashloopbackoff", "back-off restarting", "failedmount", "failedattachvolume",
+        "errimagepull", "imagepullbackoff", "oomkilled", "failedcreatepodsandbox",
+        "createcontainerconfigerror", "runcontainererror", "exec format error",
+        "permission denied", "read-only file system", "unable to open database file",
+    )
+    runtime_failure_absent = not any(term in current_text for term in runtime_failure_terms)
     known: dict[str, tuple[bool | None, str]] = {
         "pod_ready": (
             verification.get("recovered") is True and bool(pod and (pod.get("ready") or _pod_completed_successfully(pod))),
@@ -10945,7 +11308,7 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             verification.get("recovered") is True and bool(pod and (pod.get("ready") or _pod_completed_successfully(pod))),
             "变更后新 Pod 已 Ready，或 Job Pod 已成功完成",
         ),
-        "rollout_complete": (rollout_complete if workload else None, "Workload observedGeneration 与可用副本已收敛"),
+        "rollout_complete": (rollout_complete if workload else None, rollout_proof),
         "declared_workload_change_applied": (
             workload_change_applied,
             workload_change_proof,
@@ -10954,9 +11317,20 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             root_contract_applied,
             root_contract_proof,
         ),
-        "restart_count_stable": (current_restarts <= max(1, baseline_restarts), f"restart_count={current_restarts}, baseline={baseline_restarts}"),
-        "events_no_new_backoff": (not any(term in text for term in ("backoff", "back-off restarting", "failedmount", "errimagepull")), "新 Pod Events 无 BackOff/FailedMount/ImagePull"),
-        "mount_events_absent": (not any(term in text for term in ("failedmount", "failedattachvolume", "mountvolume")), "新 Pod 无挂载失败事件"),
+        "restart_count_stable": (
+            restart_count_stable,
+            f"restart_count={current_restarts}, previous_sample={previous_restart_sample}, incident_baseline={baseline_restarts}",
+        ),
+        "current_logs_checked": (
+            current_logs_checked,
+            "已读取新 Pod 当前容器日志；previous 日志只用于根因追溯，不参与恢复失败判定",
+        ),
+        "runtime_failure_absent": (
+            runtime_failure_absent,
+            "新 Pod 当前状态、当前日志和 Events 无 CrashLoop/ImagePull/Mount/OOM/权限等故障签名",
+        ),
+        "events_no_new_backoff": (not any(term in current_text for term in ("backoff", "back-off restarting", "failedmount", "errimagepull")), "新 Pod Events 无 BackOff/FailedMount/ImagePull"),
+        "mount_events_absent": (not any(term in current_text for term in ("failedmount", "failedattachvolume", "mountvolume")), "新 Pod 无挂载失败事件"),
         "write_errors_absent": (
             write_error_absent,
             "新 Pod 日志无直接或应用层包装的路径写入错误",
@@ -10969,15 +11343,15 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             write_probe_succeeded,
             "新 Pod 日志包含明确的文件/数据库写探针成功标记",
         ),
-        "oom_absent": ("oomkilled" not in text and "out of memory" not in text, "新 Pod 无 OOM 证据"),
-        "probe_failures_absent": ("probe failed" not in text and "unhealthy" not in text, "新 Pod 无探针失败证据"),
-        "image_pulled": (not any(term in text for term in ("imagepullbackoff", "errimagepull", "pull access denied")), "新 Pod 无镜像拉取失败"),
+        "oom_absent": ("oomkilled" not in current_text and "out of memory" not in current_text, "新 Pod 无 OOM 证据"),
+        "probe_failures_absent": ("probe failed" not in current_text and "unhealthy" not in current_text, "新 Pod 无探针失败证据"),
+        "image_pulled": (not any(term in current_text for term in ("imagepullbackoff", "errimagepull", "pull access denied")), "新 Pod 无镜像拉取失败"),
         "pvc_bound": (
             all(str(item.get("pvc_phase") or "") == "Bound" for item in storage if isinstance(item, dict) and item.get("pvc"))
             if any(isinstance(item, dict) and item.get("pvc") for item in storage) else None,
             "关联 PVC 均为 Bound",
         ),
-        "config_ref_exists": (not any(term in text for term in ("configmap not found", "secret not found", "createcontainerconfigerror")), "新 Pod 无配置引用缺失"),
+        "config_ref_exists": (not any(term in current_text for term in ("configmap not found", "secret not found", "createcontainerconfigerror")), "新 Pod 无配置引用缺失"),
         "pod_scheduled": (bool(pod.get("node")) if pod else None, "Pod 已分配节点"),
         "endpoint_ready": (
             all(int(item.get("ready_endpoints") or 0) > 0 for item in services) if services else None,
@@ -10997,12 +11371,12 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             "错误率已回到 SLO 或变更前基线",
         ),
         "image_platform_matches_node": (
-            verification.get("recovered") is True and "exec format error" not in text,
+            verification.get("recovered") is True and "exec format error" not in current_text,
             "新 Pod 已运行且无镜像架构不匹配证据",
         ),
         "constraint_satisfied": (bool(pod.get("node")) if pod else None, "Pod 已满足调度约束并分配节点"),
-        "admission_allowed": (bool(pod) and not any(term in text for term in ("exceeded quota", "limitrange", "admission webhook denied")), "新 Pod 无准入/配额拒绝"),
-        "pod_sandbox_ready": (verification.get("recovered") is True and "failedcreatepodsandbox" not in text, "Pod sandbox 已建立"),
+        "admission_allowed": (bool(pod) and not any(term in current_text for term in ("exceeded quota", "limitrange", "admission webhook denied")), "新 Pod 无准入/配额拒绝"),
+        "pod_sandbox_ready": (verification.get("recovered") is True and "failedcreatepodsandbox" not in current_text, "Pod sandbox 已建立"),
     }
     evaluations = []
     failed: list[str] = []
@@ -11037,6 +11411,9 @@ def _assess_recovery_criteria(plan: dict, verification: dict, evidence: dict) ->
             "business_probes": len(business_probes),
             "workload_generation": generation,
             "observed_generation": observed_generation,
+            "expected_generation": expected_generation,
+            "current_logs_checked": current_logs_checked,
+            "historical_log_bytes": len(historical_text),
         },
     }
 
@@ -11068,11 +11445,11 @@ async def _verify_plan_recovery(
     initial_grace_seconds = max(0, int(os.getenv("OPS_VERIFY_INITIAL_GRACE_SECONDS", "15")))
     requested_stability_seconds = max(
         0,
-        int(os.getenv("OPS_RECOVERY_STABILITY_SECONDS", "0")),
+        int(os.getenv("OPS_RECOVERY_STABILITY_SECONDS", "10")),
     )
     stability_seconds = min(
         requested_stability_seconds,
-        max(0, int(os.getenv("OPS_RECOVERY_MAX_STABILITY_SECONDS", "15"))),
+        max(0, int(os.getenv("OPS_RECOVERY_MAX_STABILITY_SECONDS", "30"))),
     )
     recovery_evidence_timeout = max(
         5,
@@ -11278,6 +11655,19 @@ async def _verify_plan_recovery(
                         "stability_seconds": stability_seconds,
                         "stability_samples": stability_samples,
                     })
+            else:
+                last.update({
+                    "status": "verified",
+                    "recovered": True,
+                    "message": "新 Pod、Workload rollout、当前日志、Events 与恢复判据均已通过。",
+                    "stability_verified": True,
+                    "stability_seconds": 0,
+                    "stability_samples": [{
+                        "at_seconds": 0,
+                        "pods": [item.get("pod") for item in pod_evaluations],
+                        "passed": True,
+                    }],
+                })
         except Exception as exc:
             last.update({
                 "status": "unknown",
@@ -13178,6 +13568,13 @@ async def _evidence_based_replan(
                 evidence=deep,
                 plan=plan,
             ), top_k=3)
+            planner_context = compact_planner_context(
+                plan=_redact_sensitive(plan),
+                evidence=_redact_sensitive(deep),
+                failure=_redact_sensitive(failed_context),
+                attempted_actions=attempted_actions,
+                blocked_fingerprints=blocked_change_fingerprints,
+            )
             prompt = (
                 "你是 Kubernetes 故障修复规划器，当前模型可能是 deepseek-v4-flash。先从日志、Pod 状态 YAML、Events、"
                 "volumeMount/PVC/PV 和 securityContext 生成多个候选根因及置信度，再根据最高证据一致性动态匹配 Skill，"
@@ -13211,12 +13608,7 @@ async def _evidence_based_replan(
                 "container_name,hpa_name,pvc_name,storage,node_name,service_account,configmap_name,api_version,kind,name,replicas,manifest,patch,command,timeout_seconds,reason,rollback}]}。\n"
                 f"动作目录={json.dumps(action_catalog_payload(), ensure_ascii=False)}\n"
                 f"动态匹配 Skills={json.dumps(_redact_sensitive(matched_skill_context), ensure_ascii=False)[:12000]}\n"
-                f"已尝试动作={sorted(attempted_actions or set())}\n"
-                f"已失败策略指纹={sorted(blocked_change_fingerprints)}\n"
-                f"同一故障链历史={json.dumps(_redact_sensitive(plan.get('_prior_attempts') or []), ensure_ascii=False)[:6000]}\n"
-                f"上一轮失败与验证结果={json.dumps(_redact_sensitive(failed_context), ensure_ascii=False)[:7000]}\n"
-                f"目标与原计划={json.dumps(_redact_sensitive({k: v for k, v in plan.items() if not k.startswith('_')}), ensure_ascii=False)[:7000]}\n"
-                f"真实证据={json.dumps(_redact_sensitive(deep), ensure_ascii=False)[:15000]}"
+                f"Harness 压缩上下文={json.dumps(planner_context, ensure_ascii=False)}"
             )
             response = llm.invoke(prompt, response_format={"type": "json_object"})
             return _extract_json_object(getattr(response, "content", str(response)))
@@ -14819,6 +15211,50 @@ async def _execute_ops_plan_once(
         )
     permission_preflight = {"status": "skipped", "allowed": None, "checks": []}
     if changes:
+        try:
+            execution_binding = await _bind_ops_execution_target(plan, changes)
+        except Exception as exc:
+            binding_error = f"{type(exc).__name__}: {_redact_text(str(exc))}"
+            verification = {
+                "status": "blocked",
+                "recovered": False,
+                "message": "无法把本轮变更绑定到唯一的目标集群，未发送 Kubernetes 写请求。",
+                "proof": binding_error,
+                "blocked_reason": binding_error,
+                "operator_steps": [
+                    "刷新集群清单，并重新选择明确的 Rancher cluster ID 或已上传 kubeconfig 集群。",
+                    "确认计划中的 cluster_id、Namespace、Workload 类型和名称均指向同一目标后重新生成审批。",
+                ],
+            }
+            await emit(
+                "execution_target_blocked",
+                verification["message"],
+                binding_error=binding_error,
+                level="error",
+            )
+            return {
+                "status": "blocked",
+                "executed": False,
+                "steps": executed_steps,
+                "changes": changes,
+                "results": [],
+                "release_gate": release_gate,
+                "permission_preflight": permission_preflight,
+                "verification": verification,
+                "blocked_reason": binding_error,
+                "operator_steps": verification["operator_steps"],
+                "message": verification["message"],
+            }
+        await emit(
+            "execution_target_bound",
+            (
+                f"执行目标已锁定：{execution_binding.get('cluster_id')}/"
+                f"{execution_binding.get('namespace')}/{execution_binding.get('target')}；"
+                "后续写入、写后回读和恢复验证强制使用同一通道。"
+            ),
+            execution_binding=execution_binding,
+            level="success",
+        )
         await emit(
             "execution_preflight",
             "提交审批前检查 namespace 白名单和执行身份的 Kubernetes 最小写权限。",
@@ -17333,6 +17769,20 @@ async def infrastructure_providers():
     return infrastructure_providers_payload()
 
 
+async def infrastructure_adapter_contracts():
+    payload = infrastructure_providers_payload()
+    return {
+        **adapter_contract_payload(),
+        "registered_adapters": ((payload.get("adapter_sdk") or {}).get("in_process_adapters") or []),
+        "external_adapters": payload.get("adapters") or [],
+    }
+
+
+async def operations_domains():
+    summary = infrastructure_providers_payload().get("summary") or {}
+    return operations_domain_catalog(summary.get("by_type") or {})
+
+
 async def sync_infrastructure_resources(req: InfrastructureInventorySyncRequest):
     try:
         result = await asyncio.to_thread(
@@ -17472,7 +17922,8 @@ async def ops_capabilities():
     skills = OPS_SKILL_REGISTRY.list()
     return {
         "status": "ok",
-        "planner": "CISREDurableHarness/v2 + DeepSeekRootCauseSkillRouter/v1 + UnifiedExecutableOpsSkillRuntime/v1 + ApprovalGate + ReadAfterWriteVerifier + RecoveryVerifier",
+        "planner": "CISREDurableHarness/v3 + CISREPluginHarness/v1 + DeepSeekRootCauseSkillRouter/v1 + UnifiedExecutableOpsSkillRuntime/v1 + ApprovalGate + ReadAfterWriteVerifier + RecoveryVerifier",
+        "harness": harness_capabilities_payload(),
         "executable_skill_handlers": public_runtime_catalog(),
         "actions": action_catalog_payload(),
         "skill_options": skill_option_catalog(),

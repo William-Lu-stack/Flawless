@@ -1,6 +1,6 @@
 # CISRE 用户使用与部署手册
 
-这份文档只面向平台使用者、部署人员和现场运维人员。开发代码、模块负责人和扩展规则请看 [代码架构和维护扩展规则.md](代码架构和维护扩展规则.md)。
+这份文档只面向平台使用者、部署人员和现场运维人员。开发代码、模块负责人、数据库/VM/存储接入和 AI/Vibe Coding 兼容规则请看 [CISRE 代码架构、团队协作与扩展接入指南](TEAM_ARCHITECTURE_AND_EXTENSION_GUIDE_ZH.md)。
 
 ## 1. 产品是什么
 
@@ -12,6 +12,9 @@ CISRE 是面向 Kubernetes、Rancher 多集群、数据库、虚拟机、中间�
 ```
 
 平台不会直接执行 LLM 输出的任意 Shell。所有写操作都必须进入动作白名单、风险门禁、人工确认、最小权限执行和恢复验证流程。
+
+官方 DeepSeek Harness 的选型、能力映射和生产安全边界见
+[CISRE × 官方 DeepSeek Harness 适配设计](DEEPSEEK_HARNESS_INTEGRATION_ZH.md)。
 
 ## 2. 主要功能怎么用
 
