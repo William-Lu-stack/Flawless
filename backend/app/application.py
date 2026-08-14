@@ -2096,8 +2096,8 @@ async def rank_chat_risks(req: ChatRiskRankRequest):
 APP_KNOWLEDGE_DOCS = [
     {
         "id": "sre-chat",
-        "title": "SRE 对话",
-        "content": "SRE 对话是核心入口。用户描述现象后，系统会先判断是否为运维问题，再采集 Rancher/Kubernetes 上下文、Pod 日志、Events、Workload 模板、Service/Endpoint、PVC/PV、节点状态和 CMDB 拓扑，最终输出诊断结论、证据、可确认执行计划。非运维问题会切换到普通 LLM 回答。",
+        "title": "SRE Run",
+        "content": "SRE Run 是核心入口。用户描述现象后，系统会先判断是否为运维问题，再采集 Rancher/Kubernetes 上下文、Pod 日志、Events、Workload 模板、Service/Endpoint、PVC/PV、节点状态和 CMDB 拓扑，最终输出诊断结论、证据、可确认执行计划。非运维问题会切换到普通 LLM 回答。",
         "tags": ["chat", "sre", "stream", "diagnosis"],
     },
     {
@@ -3229,7 +3229,7 @@ def _algorithm_live_cases() -> dict:
                 "id": "live-blast-radius",
                 "title": "拓扑影响分析 / 爆炸半径",
                 "algorithm": "ChangeSensitiveBlastRadius",
-                "where_used": "拓扑影响分析、SRE 对话影响判断、自动运维前审批门禁",
+                "where_used": "拓扑影响分析、SRE Run 影响判断、自动运维前审批门禁",
                 "input": {"finding": top_finding.get("title"), "cluster": top_finding.get("cluster"), "namespace": top_finding.get("namespace")},
                 "output": {
                     "impact_level": blast.get("impact_level"),
@@ -11950,7 +11950,7 @@ def _manual_required_steps(plan: dict, verification: dict | None = None, reason:
     return [
         f"先不要重复执行同一动作；当前未恢复原因：{reason_text}",
         f"在 {namespace} 命名空间核对 {target} 的最新 Pod、previous logs、Events、PVC/PV、ConfigMap/Secret、Service/Endpoint 与 Node 调度状态。",
-        "如果日志仍显示 Permission denied、FailedMount、ImagePull、Exec format error、探针失败或 OOM，请把对应证据重新交给 SRE 对话，系统会生成下一轮差异化方案。",
+        "如果日志仍显示 Permission denied、FailedMount、ImagePull、Exec format error、探针失败或 OOM，请把对应证据重新交给 SRE Run，系统会生成下一轮差异化方案。",
         "如果证据指向存储后端目录、网络插件、云平台版本、镜像架构或外部系统权限，需管理员先按页面文字步骤处理底层资源，再回到平台点击重新验证。",
         "处理完成后重新运行同一目标的 AI 运维，让平台确认 Pod Ready、restart_count 稳定且同类事件不再出现。",
     ]
@@ -17146,7 +17146,7 @@ def _attach_operator_skills_to_plan(
 
 
 def _attach_operator_skills_to_chat(req: ChatRequest, data: dict) -> dict:
-    """SRE 对话返回前注入匹配到的运维 Skill。"""
+    """SRE Run 返回前注入匹配到的运维 Skill。"""
     if not isinstance(data, dict):
         return data
     raw = data.get("raw") or {}
@@ -17685,7 +17685,7 @@ async def match_ops_skills(req: OpsSkillMatchRequest):
     }, top_k=req.top_k)
 
 
-INFRASTRUCTURE_ACTION_PREFIXES = ("db_", "vm_", "middleware_", "storage_", "cloud_", "infra_")
+INFRASTRUCTURE_ACTION_PREFIXES = ("db_", "vm_", "middleware_", "storage_", "cloud_", "network_", "infra_")
 
 
 def _is_infrastructure_action(action: str) -> bool:

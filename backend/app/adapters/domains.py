@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any
 
 from .database import DATABASE_DOMAIN_SPEC
+from .network import NETWORK_DOMAIN_SPEC
 from .storage import STORAGE_DOMAIN_SPEC
 from .virtual_machine import VIRTUAL_MACHINE_DOMAIN_SPEC
 
@@ -49,6 +50,7 @@ DOMAIN_CATALOG = (
         "verification_contract": ["resource_healthy", "quota_safe", "business_probe_ok"],
         "implementation": "extension_contract",
     },
+    NETWORK_DOMAIN_SPEC,
 )
 
 

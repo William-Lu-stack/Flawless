@@ -1,4 +1,4 @@
-# SRE initiate Harness 插件开发与运行手册
+# CISRE Harness 插件开发与运行手册
 
 官方 DeepSeek Harness 的插件、Service seam、事件、Profile/Bundle/Patch 和动态扩展设计已映射到本运行时；跨团队的数据库/VM/存储接入清单见 [PLUGIN_TEAM_ONBOARDING_ZH.md](./PLUGIN_TEAM_ONBOARDING_ZH.md)。
 
@@ -14,7 +14,7 @@ CISRE 已把 DeepSeek Harness 的核心组合思想落到现有生产运维控�
 
 ## 2. 目录契约
 
-默认根目录由 `HARNESS_PLUGIN_ROOT` 指定，生产清单使用 `/var/lib/flawless/harness`，它位于 API 的 runtime-store PVC 中：
+默认根目录由 `HARNESS_PLUGIN_ROOT` 指定，生产清单使用 `/var/lib/cisre/harness`，它位于 API 的 runtime-store PVC 中：
 
 ```text
 harness/
@@ -39,6 +39,9 @@ metadata:
   name: team.database-inventory
   version: 1.2.0
 spec:
+  category: domain
+  domains: [database]
+  agents: [database]
   scope: global
   provides:
     - name: inventory.database
@@ -63,6 +66,8 @@ spec:
 - `waterfall`：中间件式单调门禁，可增加限制，不能绕过后续门禁。
 
 作用域可使用 `global`、`agent:<id>`、`job:<id>` 或 `cluster:<id>`。解析服务时更近的作用域优先，全局 Provider 仍保留为后备。
+
+插件必须同时完成分类：公共插件使用 `category: shared`、`domains: [common]`、`agents: [all]`；资源专属插件使用 `category: domain` 并声明 kubernetes、database、virtual-machine、storage、middleware、cloud 或 network。Domain Agent 自身使用 `category: domain-agent`。运行时把一个 Agent 组合为“公共插件 + 本域插件 + Skills”，不会把数据库插件误加载给网络 Agent。
 
 ## 4. Profile、Bundle 与 Patch
 
@@ -102,7 +107,7 @@ HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED: "true"
 
 文件读写、网络、子进程属于特权能力。签名摘要必须列入 `HARNESS_TRUSTED_PLUGIN_DIGESTS`，且权限还要列入 `HARNESS_TRUSTED_PLUGIN_PERMISSIONS`。即使签名通过，`kubernetes:mutate`、`ops:execute` 和 `secrets:read` 仍由核心保留。
 
-这比把第三方代码动态导入 API 进程更容易证明隔离边界。独立 Provider 服务应使用容器级只读根文件系统、NetworkPolicy、专用 ServiceAccount 和资源限制；SRE initiate 只保存其非敏感服务声明。
+这比把第三方代码动态导入 API 进程更容易证明隔离边界。独立 Provider 服务应使用容器级只读根文件系统、NetworkPolicy、专用 ServiceAccount 和资源限制；CISRE 只保存其非敏感服务声明。
 
 签名 remote Provider 可以声明只读 JSON 操作：
 
@@ -128,6 +133,10 @@ runtime:
 - `GET /api/harness/sessions/{id}/replay`：从事件重建投影；
 - `POST /api/harness/sessions/{id}/fork`：从指定事件创建分支；
 - `POST /api/harness/sessions/{id}/resume`：写入恢复点并返回最新投影。
+- `GET /api/harness/sessions/{id}/trace`：查看上下文、模型摘要、Skill、插件、工具、审批、变更和验证 Span；
+- `DELETE /api/harness/sessions/{id}`：对叶子分支写入审计墓碑；根会话、运行中会话和仍有子分支的会话不可删除。
+
+前端“平台能力 → 插件中心”提供两种开发入口：可视化表单生成声明式 Manifest，或输入目标让当前模型生成经过 Schema/权限校验的插件草案。模型只能生成声明与编排元数据，不能取得凭据、绕过审批或直接执行任意代码。插件详情会展示触发条件、服务依赖、安全边界和最近调用记录。
 
 生产 API 仍要求单副本，直到接入分布式执行租约与支持跨进程串行追加的事件后端。当前 JSONL 事实流与 OpsJob 快照互补：前者负责审计/回放，后者负责快速页面读取和现有故障恢复。
 

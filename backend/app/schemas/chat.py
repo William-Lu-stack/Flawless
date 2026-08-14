@@ -1,4 +1,4 @@
-"""SRE 对话接口的数据模型。"""
+"""SRE Run 接口的数据模型。"""
 
 from pydantic import BaseModel, Field
 

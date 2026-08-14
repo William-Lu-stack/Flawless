@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from backend.app.services.harness_events import HarnessEventStore
 from backend.app.services.harness_packages import HarnessPackageManager, RemoteServiceProvider
-from backend.app.services.harness_plugins import HarnessPluginRuntime, PluginManifest
+from backend.app.services.harness_plugins import BUILTIN_PLUGIN_MANIFESTS, HarnessPluginRuntime, PluginManifest
 
 
 def write_yaml(path: Path, value: str) -> None:
@@ -18,6 +18,24 @@ def write_yaml(path: Path, value: str) -> None:
 
 
 class HarnessPackageManagerTests(unittest.TestCase):
+    def test_plugin_contract_distinguishes_shared_and_domain_capabilities(self):
+        shared = PluginManifest(id="team.audit", category="shared", domains=("common",), agents=("all",)).public()
+        domain = PluginManifest(
+            id="team.database-evidence",
+            category="domain",
+            domains=("database",),
+            agents=("database",),
+        ).public()
+        builtins = {item.id: item.public() for item in BUILTIN_PLUGIN_MANIFESTS}
+
+        self.assertEqual(shared["category"], "shared")
+        self.assertEqual(shared["domains"], ["common"])
+        self.assertEqual(domain["agents"], ["database"])
+        self.assertEqual(builtins["cisre.agent.kubernetes"]["category"], "domain-agent")
+        self.assertEqual(builtins["cisre.kubernetes-executor"]["domains"], ["kubernetes"])
+        self.assertIn("cisre.agent.database", builtins)
+        self.assertIn("cisre.agent.network", builtins)
+
     def test_ui_install_validates_persists_and_mounts_without_core_change(self):
         source = """
             apiVersion: cisre.io/v1alpha1
@@ -315,6 +333,62 @@ class HarnessEventStoreTests(unittest.TestCase):
             rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([row["seq"] for row in rows], [1, 2])
             self.assertEqual(rows[1]["previous_hash"], rows[0]["hash"])
+
+    def test_branch_delete_is_audited_tombstone_and_root_is_protected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            store = HarnessEventStore(path)
+            store.append("root", "session/created", status="paused")
+            child = store.fork("root", actor="tester")
+
+            result = store.delete_branch(child["session_id"], actor="tester")
+
+            self.assertEqual(result["status"], "deleted")
+            self.assertTrue(result["audit_retained"])
+            self.assertEqual(store.children("root"), [])
+            self.assertIsNone(store.session(child["session_id"], include_deleted=False))
+            self.assertEqual(store.session(child["session_id"])["status"], "deleted")
+            self.assertEqual(store.events(child["session_id"])[-1]["type"], "session/deleted")
+            self.assertTrue(store.verify_chain(child["session_id"])["valid"])
+            with self.assertRaisesRegex(ValueError, "root sessions"):
+                store.delete_branch("root", actor="tester")
+
+    def test_running_or_parent_branch_cannot_be_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HarnessEventStore(Path(directory) / "events.jsonl")
+            store.append("root", "session/created", status="paused")
+            child = store.fork("root", actor="tester")["session_id"]
+            grandchild = store.fork(child, actor="tester")["session_id"]
+
+            with self.assertRaisesRegex(ValueError, "child sessions"):
+                store.delete_branch(child)
+            store.resume(grandchild)
+            with self.assertRaisesRegex(RuntimeError, "running branches"):
+                store.delete_branch(grandchild)
+
+    def test_agent_trace_projects_context_llm_skill_tool_and_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HarnessEventStore(Path(directory) / "events.jsonl")
+            store.append("job", "evidence/collected", stage="evidence_done", message="ERROR logs attached")
+            store.append("job", "diagnosis/planning", stage="llm_planning_done", data={"model_profile_id": "primary"})
+            store.append("job", "skills/selected", stage="skill_selected", plugin_id="skill-volume-recovery")
+            store.append("job", "tools/result", stage="change_done", tool="patch_workload", status="completed")
+            store.append("job", "recovery/complete", stage="recovered", status="completed")
+
+            trace = store.trace("job")
+
+            self.assertEqual(trace["trace_schema"], "cisre.agent-trace/v1")
+            self.assertEqual([span["kind"] for span in trace["spans"]], ["context", "think", "skill", "tool", "verify"])
+            self.assertEqual(trace["summary"]["model_calls"], 1)
+            self.assertEqual(trace["summary"]["tools"]["patch_workload"], 1)
+            self.assertEqual(trace["summary"]["turns"], 1)
+            self.assertEqual(trace["summary"]["calls"], 2)
+            self.assertGreaterEqual(trace["summary"]["duration_ms"], 0)
+            self.assertEqual(trace["spans"][0]["lane"], "Input")
+            self.assertEqual(trace["spans"][1]["lane"], "Model")
+            self.assertEqual(trace["spans"][3]["lane"], "Tools")
+            self.assertIn("offset_ms", trace["spans"][0])
+            self.assertTrue(trace["integrity"]["valid"])
 
 
 if __name__ == "__main__":

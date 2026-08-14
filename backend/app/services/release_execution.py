@@ -2,7 +2,7 @@
 
 本模块只负责把已审批发布转换成统一 OpsJob 计划，不直接访问 Kubernetes。
 真实变更仍由运维状态机和 MCP/Rancher 执行层完成，因此发布、AI 巡检和
-SRE 对话共用同一套门禁、进度、取消与恢复验证能力。
+SRE Run 共用同一套门禁、进度、取消与恢复验证能力。
 """
 
 from __future__ import annotations

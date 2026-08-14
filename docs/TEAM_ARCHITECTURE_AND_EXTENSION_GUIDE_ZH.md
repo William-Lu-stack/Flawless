@@ -1,6 +1,8 @@
 # CISRE 代码架构、团队协作与扩展接入指南
 
-本文是 CISRE 的团队开发基线。目标是让 Kubernetes、数据库、VM、存储、中间件和云平台团队能够并行开发，也让 AI/Vibe Coding 工具在不知道全部历史的情况下，通过稳定合同完成局部修改而不破坏生产闭环。
+本文是 CISRE 的团队开发基线。目标是让 Kubernetes、数据库、VM、存储、中间件、云平台和网络团队能够并行开发，也让 AI/Vibe Coding 工具在不知道全部历史的情况下，通过稳定合同完成局部修改而不破坏生产闭环。
+
+当前属于 Plugin-first 过渡架构：插件运行时和团队合同已具备，历史兼容组合根仍在逐步缩小。目标架构、可信内核边界和迁移阶段见 [`PLUGIN_FIRST_REFACTOR_ROADMAP_ZH.md`](./PLUGIN_FIRST_REFACTOR_ROADMAP_ZH.md)。
 
 ## 1. 当前能力边界
 
@@ -12,27 +14,30 @@
 | 企业存储 | 扩展合同就绪 | 同上 | 存储团队接阵列、CSI、NFS/SAN/Ceph API |
 | 中间件 | 扩展合同就绪 | 同上 | 中间件团队按产品实现 Adapter |
 | 云资源 | 扩展合同就绪 | 同上 | 云平台团队接工作负载身份、云监控和云管执行器 |
+| 网络 | 扩展合同就绪 | 同上 | 网络团队接交换/路由、负载均衡、DNS、ACL/安全策略和链路平台 |
 
 “合同就绪”不是“厂商已经连接”。UI 会显示资源数和 Adapter 状态，不会伪造健康数据。
 
 ## 2. 用户入口与统一闭环
 
-SRE 对话和 AI 巡检进入时，先选择要解决的基础设施风险域。选择 Kubernetes 后进入现有集群/Namespace/Workload 流程；选择数据库、VM、存储等域后进入对应资源工作台。顶部下拉可随时切换域。
+SRE Run 和 AI 巡检进入时，先选择要解决的基础设施风险域。选择 Kubernetes 后进入现有集群/Namespace/Workload 流程；选择数据库、VM、存储等域后进入对应资源工作台。顶部下拉可随时切换域。
 
 ```mermaid
 flowchart LR
-  ENTRY["SRE 对话 / AI 巡检"] --> DOMAIN{"选择风险域"}
+  ENTRY["SRE Run / AI 巡检"] --> DOMAIN{"选择风险域"}
   DOMAIN -->|Kubernetes| K8S["集群 → Namespace → Workload"]
   DOMAIN -->|数据库| DB["数据库实例 / 集群"]
   DOMAIN -->|VM| VM["主机 / 虚拟机"]
   DOMAIN -->|存储| ST["存储系统 / 池 / 卷"]
   DOMAIN -->|中间件 / 云| EXT["对应资源目录"]
+  DOMAIN -->|网络| NET["网络设备 / 链路 / 策略 / DNS / LB"]
 
   K8S --> EVIDENCE["新鲜证据合同"]
   DB --> EVIDENCE
   VM --> EVIDENCE
   ST --> EVIDENCE
   EXT --> EVIDENCE
+  NET --> EVIDENCE
   EVIDENCE --> ROOT["多假设根因判断"]
   ROOT --> SKILL["单一主 Skill 优先，必要时组合"]
   SKILL --> GATE["风险 + 爆炸半径 + 人工审批"]
@@ -51,7 +56,7 @@ flowchart LR
 flowchart TB
   subgraph WEB["CISRE Console · React/TypeScript"]
     SELECTOR["OperationsDomainSelector"]
-    CHAT["SRE 对话"]
+    CHAT["SRE Run"]
     INSPECT["AI 巡检"]
     TOPO["拓扑 / 爆炸半径"]
     LIB["Skill 库 / 运维成效"]
@@ -102,6 +107,7 @@ repository/
 ├── backend/app/
 │   ├── main.py                       # 兼容启动入口，不放业务逻辑
 │   ├── application.py                # 旧组合根；只迁出，不继续堆 Provider 分支
+│   ├── kernel/                       # 稳定 Port、版本合同与规模化就绪检查
 │   ├── api/
 │   │   ├── features/                 # 按能力声明路由
 │   │   ├── schemas/                  # Pydantic 请求/响应合同
@@ -126,9 +132,11 @@ repository/
 │       ├── virtual_machine/          # OS/虚拟化团队目录
 │       ├── storage/                  # 存储团队目录
 │       ├── middleware/               # 中间件团队目录
-│       └── cloud_service/            # 云平台团队目录
+│       ├── cloud_service/            # 云平台团队目录
+│       └── network/                  # 网络团队目录
 ├── agents/                            # 模型调用、诊断、算法；不持有写权限
 ├── mcp_servers/                       # Kubernetes 类型化读写工具与白名单
+├── plugins/                           # 各团队独立维护的公共/领域插件
 ├── frontend/modern/src/
 │   ├── main.tsx                       # 应用装配与顶级导航
 │   ├── UnifiedPages.tsx               # 共享能力页面
@@ -154,6 +162,8 @@ repository/
 5. 为接口和失败路径增加合同测试。
 
 禁止再向组合根加入某厂商的 SDK 调用、SQL、SSH、字段分支或大段业务算法。
+
+`kernel/` 是可信内核的稳定 ABI。领域插件只依赖 `cisre.kernel.ports/v1`，不得直接绑定文件存储、进程内锁或某个队列客户端。多副本部署前必须通过 `/api/harness/scalability`；事件、租约、队列和快照四项必须全部使用分布式实现。
 
 ## 5. Kubernetes 现有闭环（不可破坏）
 
@@ -200,6 +210,7 @@ GET /api/operations/domains
 | 存储 | 系统/池/卷/路径、容量、时延/IOPS、ACL、快照、复制、最近变更 | 路径/卷在线、容量安全、时延恢复、消费端挂载、业务探针 |
 | 中间件 | 集群健康、积压、客户端错误、容量、最近变更 | 集群健康、积压恢复、生产/消费业务探针 |
 | 云资源 | 状态、配额、网络策略、监控、最近变更 | 资源健康、配额安全、网络/业务探针 |
+| 网络 | 拓扑、接口/链路、丢包/时延、路由、DNS、LB、ACL/策略、最近变更 | 路径可达、链路质量、策略命中、DNS/LB 健康、业务连通 |
 
 ### 6.2 接入方式 A：CMDB/资产平台推送
 
@@ -344,6 +355,7 @@ CISRE 调用 Adapter 的请求：
 | 存储 | `adapters/storage/`、Storage Skill、测试/文档 | 删除/恢复/切换等高风险动作 |
 | 中间件 | `adapters/middleware/`、产品 Skill | 公共合同和跨域依赖语义 |
 | 云平台 | `adapters/cloud_service/`、云资源 Skill | 身份、配额、安全组和高风险动作 |
+| 网络 | `adapters/network/`、网络 Skill | 拓扑、链路、路由、DNS、LB、ACL 与受控网络动作 |
 | 前端 | 风险域工作台和领域组件 | 顶级路由、OpsJob 状态语义、审批交互 |
 | 平台核心 | Harness、合同、执行、验证、记录、版本 | — |
 

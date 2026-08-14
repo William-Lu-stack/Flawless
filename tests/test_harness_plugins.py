@@ -86,8 +86,12 @@ class HarnessPluginRuntimeTests(unittest.TestCase):
 
     def test_builtin_runtime_exposes_deepseek_harness_parity_contracts(self):
         payload = harness_capabilities_payload()
-        self.assertEqual(payload["summary"]["active"], payload["summary"]["total"])
         self.assertGreaterEqual(payload["summary"]["active"], 10)
+        agents = {item["domain"]: item for item in payload["agents"]}
+        self.assertEqual(agents["kubernetes"]["status"], "active")
+        for domain in {"database", "virtual-machine", "storage", "middleware", "cloud", "network"}:
+            self.assertEqual(agents[domain]["status"], "pending_dependencies")
+            self.assertTrue(agents[domain]["missing_dependencies"])
         self.assertTrue(payload["contracts"]["monotonic_tool_guards"])
         self.assertTrue(payload["contracts"]["official_runtime_cannot_mutate_kubernetes"])
 

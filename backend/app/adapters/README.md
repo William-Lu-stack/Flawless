@@ -1,6 +1,6 @@
 # CISRE 基础设施 Adapter SDK
 
-这里是 Kubernetes 之外的数据库、虚拟机、存储、中间件和云资源接入边界。各领域团队只在自己的目录中实现厂商差异，不把厂商 SDK、字段判断或凭据处理写进 `backend/app/application.py`。
+这里是 Kubernetes 之外的数据库、虚拟机、存储、中间件、云资源和网络接入边界。各领域团队只在自己的目录中实现厂商差异，不把厂商 SDK、字段判断或凭据处理写进 `backend/app/application.py`。
 
 ## 安全边界
 
@@ -30,7 +30,8 @@ backend/app/adapters/
 ├── virtual_machine/      # OS / 虚拟化平台组
 ├── storage/              # 存储平台组
 ├── middleware/           # 中间件平台组
-└── cloud_service/        # 云平台组
+├── cloud_service/        # 云平台组
+└── network/              # 网络平台组
 ```
 
 每个产品一个模块，例如 `database/mysql.py`、`storage/oceanstor.py`。不要把多个厂商实现堆在 `infrastructure_providers.py`。

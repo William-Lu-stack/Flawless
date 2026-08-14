@@ -258,7 +258,7 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark" aria-label="SRE initiate logo">
+          <div className="brand-mark" aria-label="CISRE logo">
             <svg viewBox="0 0 48 48" role="img" aria-hidden="true">
               <path d="M34.7 10.2A17 17 0 1 0 35.9 36" />
               <path d="M31.8 16.3a9.4 9.4 0 1 0 .8 14.7" />
@@ -267,7 +267,7 @@ function App() {
             </svg>
           </div>
           <div>
-            <strong>SRE initiate</strong>
+            <strong>CISRE</strong>
             <span>{build.data?.version || "Infrastructure Reliability"}</span>
           </div>
         </div>
@@ -331,16 +331,16 @@ function App() {
           </div>
           <button className="ghost tiny" onClick={refreshHealth}><RefreshCcw size={13} />刷新状态</button>
         </div>
-        <div className="author-watermark" title="SRE initiate control plane">
+        <div className="author-watermark" title="CISRE control plane">
           <span>Operate with</span>
-          <strong>SRE initiate</strong>
+          <strong>CISRE</strong>
         </div>
       </aside>
 
       <main className="main">
         <header className="topbar">
           <div className="topbar-title">
-            <span>SRE INITIATE · CONTROL PLANE</span>
+            <span>CISRE · CONTROL PLANE</span>
             <h1>{page === "platform" ? platformItems.find((x) => x.key === platformTab)?.label : navItems.find((x) => x.key === page)?.label}</h1>
           </div>
           <div className="top-actions">
@@ -831,7 +831,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
     <article className={cx("message", message.role, message.status === "streaming" && "streaming")}>
       <div className="avatar">{message.role === "assistant" ? <Bot size={16} /> : "我"}</div>
       <div className="bubble">
-        <div className="message-meta">{message.role === "assistant" ? "SRE initiate" : "你"} {message.status === "streaming" && <span>正在生成</span>}{message.status === "stopped" && <span>已中断</span>}</div>
+        <div className="message-meta">{message.role === "assistant" ? "CISRE" : "你"} {message.status === "streaming" && <span>正在生成</span>}{message.status === "stopped" && <span>已中断</span>}</div>
         {message.target && <div className="message-target"><CircleDot size={11} /><span>{message.target.cluster} / {message.target.namespace}</span><b>{message.target.workload_name ? `${message.target.workload_type}/${message.target.workload_name}` : `Pod/${message.target.pod_name}`}</b></div>}
         {message.role === "assistant" && activities.length > 0 && (
           <details className="agent-activity" open={message.status === "streaming"}>
@@ -2811,7 +2811,7 @@ function EffectivenessPage() {
         <Metric title="恢复 Pod" value={summary.pods_recovered || 0} tone="good" />
       </div>
       <Panel className="span-all">
-        <PanelTitle icon={CheckCircle2} title="SRE initiate 已解决的问题" subtitle="这里只展示恢复验证已通过的运维结果" action={<button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button>} />
+        <PanelTitle icon={CheckCircle2} title="CISRE 已解决的问题" subtitle="这里只展示恢复验证已通过的运维结果" action={<button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button>} />
         {state.loading && <div className="quiet-empty">正在读取已验证的恢复记录...</div>}
         {state.error && <div className="error-box">{state.error}</div>}
         <div className="resolved-problem-list">
@@ -2831,7 +2831,7 @@ function EffectivenessPage() {
         </div>
       </Panel>
       {selectedRecord && <Panel className="span-all">
-        <PanelTitle icon={FileUp} title={issueTitle(selectedRecord)} subtitle="SRE initiate 解决细节" action={<button className="ghost tiny" onClick={() => setSelectedRecord(null)}>关闭</button>} />
+        <PanelTitle icon={FileUp} title={issueTitle(selectedRecord)} subtitle="CISRE 解决细节" action={<button className="ghost tiny" onClick={() => setSelectedRecord(null)}>关闭</button>} />
         <div className="effectiveness-detail">
           <div><span>目标</span><strong>{selectedRecord.target || selectedRecord.model_id || "-"}</strong></div>
           <div><span>范围</span><strong>{selectedRecord.cluster || "-"} / {selectedRecord.namespace || "-"}</strong></div>

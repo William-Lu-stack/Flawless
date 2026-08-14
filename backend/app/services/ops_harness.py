@@ -205,9 +205,20 @@ def checkpoint_event(harness: dict, stage: str, message: str, values: dict | Non
         "phase": phase,
         "message": str(message or "")[:500],
         "status": str(values.get("status") or "running"),
+        "plugin_id": str(values.get("plugin_id") or values.get("selected_skill_id") or ""),
+        "tool": str(values.get("action") or values.get("change_type") or ""),
         "data": {
             "target": copy.deepcopy(state.get("target") or {}),
             "status": str(values.get("status") or "running"),
+            **{
+                key: copy.deepcopy(values.get(key))
+                for key in (
+                    "approved", "change_status", "failure_class", "model_profile_id",
+                    "planner_source", "selected_skill_id", "verification_recovered",
+                    "resource_version", "child_job_id", "artifact_paths",
+                )
+                if values.get(key) is not None
+            },
         },
     })
     del event_log[:-160]

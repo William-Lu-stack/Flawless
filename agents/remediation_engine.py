@@ -178,6 +178,22 @@ ACTION_CATALOG: dict[str, dict[str, Any]] = {
         "risk": "high", "auto_allowed": False, "rollback": "storage expansion is normally irreversible; confirm pool capacity and snapshot policy",
         "description": "Expand enterprise storage volume through an approved storage executor.",
     },
+    "network_apply_policy": {
+        "risk": "high", "auto_allowed": False, "rollback": "restore the pre-change ACL or security-policy snapshot",
+        "description": "Apply one bounded network policy change through an approved network executor.",
+    },
+    "network_switch_route": {
+        "risk": "high", "auto_allowed": False, "rollback": "restore the previous route, priority and next-hop snapshot",
+        "description": "Switch one approved route after path, redundancy and blast-radius evidence is complete.",
+    },
+    "network_update_load_balancer": {
+        "risk": "high", "auto_allowed": False, "rollback": "restore the previous listener, pool-member or DNS snapshot",
+        "description": "Update a bounded load-balancer or DNS setting through an approved executor.",
+    },
+    "network_restore_interface": {
+        "risk": "high", "auto_allowed": False, "rollback": "restore the previous interface, VLAN and aggregation snapshot",
+        "description": "Restore a proven faulty interface or link configuration through an approved executor.",
+    },
     "infra_run_approved_action": {
         "risk": "high", "auto_allowed": False, "rollback": "use the external executor returned rollback plan",
         "description": "Generic non-Kubernetes infrastructure action routed to an approved external executor.",
@@ -226,6 +242,10 @@ ACTION_OPERATOR_GUIDANCE: dict[str, dict[str, str]] = {
     "vm_snapshot": {"label": "创建虚拟机快照", "when_to_use": "高风险主机变更前需要可回退点。", "operator_note": "快照不是长期备份，需设置清理窗口。"},
     "middleware_rebalance": {"label": "中间件重平衡", "when_to_use": "Kafka/队列/缓存分片存在倾斜、积压或节点异常。", "operator_note": "必须确认客户端影响和回滚策略。"},
     "storage_expand_volume": {"label": "扩容企业存储卷", "when_to_use": "存储池容量、卷容量和业务使用率证据支持扩容。", "operator_note": "需要存储平台执行器和容量审批。"},
+    "network_apply_policy": {"label": "调整网络策略", "when_to_use": "路径和命中计数证明 ACL/安全策略是直接根因。", "operator_note": "高风险；只提交结构化策略差异，必须展示受影响网段、业务和回滚快照。"},
+    "network_switch_route": {"label": "切换网络路由", "when_to_use": "当前路径故障且备用路径、下一跳和收敛条件均已验证。", "operator_note": "高风险；必须评估双向路径、非对称路由和爆炸半径。"},
+    "network_update_load_balancer": {"label": "调整负载均衡 / DNS", "when_to_use": "健康检查、成员池或解析证据证明入口配置异常。", "operator_note": "高风险；需保留监听、成员、权重、TTL 和原配置快照。"},
+    "network_restore_interface": {"label": "恢复接口 / 链路", "when_to_use": "接口状态、错误计数、VLAN 或链路聚合证据确认配置异常。", "operator_note": "高风险；必须确认冗余链路和设备带外管理通道。"},
     "infra_run_approved_action": {"label": "执行基础设施批准动作", "when_to_use": "资源类型已接入外部执行器，但尚未细分到专用动作。", "operator_note": "必须由执行器返回审计号、结果和回滚提示。"},
 }
 

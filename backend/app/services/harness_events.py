@@ -172,7 +172,11 @@ class HarnessEventStore:
             ]
             return copy.deepcopy(values[: max(1, min(int(limit), 2000))])
 
-    def sessions(self, *, limit: int = 100) -> list[dict[str, Any]]:
+    @staticmethod
+    def _deleted(events: list[dict[str, Any]]) -> bool:
+        return any(str(item.get("type") or "") == "session/deleted" for item in events)
+
+    def sessions(self, *, limit: int = 100, include_deleted: bool = False) -> list[dict[str, Any]]:
         with self._lock:
             grouped: dict[str, list[dict[str, Any]]] = {}
             for event in self._memory:
@@ -180,6 +184,8 @@ class HarnessEventStore:
             output = []
             for session_id, events in grouped.items():
                 if not session_id or not events:
+                    continue
+                if self._deleted(events) and not include_deleted:
                     continue
                 last = events[-1]
                 first = events[0]
@@ -196,6 +202,157 @@ class HarnessEventStore:
                 })
             output.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
             return output[: max(1, min(int(limit), 500))]
+
+    def session(self, session_id: str, *, include_deleted: bool = True) -> dict[str, Any] | None:
+        values = self.sessions(limit=500, include_deleted=include_deleted)
+        return next((item for item in values if item.get("session_id") == session_id), None)
+
+    def events_for_plugin(self, plugin_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            values = [
+                item for item in reversed(self._memory)
+                if str(item.get("plugin_id") or "") == str(plugin_id or "")
+            ]
+            return copy.deepcopy(values[: max(1, min(int(limit), 500))])
+
+    @staticmethod
+    def _trace_kind(event: dict[str, Any]) -> str:
+        text = " ".join(str(event.get(key) or "") for key in ("type", "phase", "stage", "tool")).lower()
+        plugin_id = str(event.get("plugin_id") or "").lower()
+        if any(token in text for token in ("approval", "approved", "pre-execute")):
+            return "approval"
+        if any(token in text for token in ("recovery", "verify", "verification", "readback", "rollout")):
+            return "verify"
+        if any(token in text for token in ("bash", "shell", "execute", "change", "mutation", "patch", "tool")):
+            return "tool"
+        if "skill" in text or "skill" in plugin_id:
+            return "skill"
+        if any(token in text for token in ("plugin/", "service/", "provider/")):
+            return "plugin"
+        if any(token in text for token in ("llm", "diagnos", "root_cause", "planning", "reason")):
+            return "think"
+        if any(token in text for token in ("evidence", "collect", "context", "log", "event", "inventory")):
+            return "context"
+        if any(token in text for token in ("goal", "round", "agent", "job", "fork", "resume", "child")):
+            return "agent"
+        return "event"
+
+    @staticmethod
+    def _trace_plugin(event: dict[str, Any], kind: str) -> str:
+        explicit = str(event.get("plugin_id") or "")
+        if explicit:
+            return explicit
+        return {
+            "context": "cisre.context-compaction",
+            "think": "cisre.deepseek-planner",
+            "skill": "cisre.skill-router",
+            "plugin": "cisre.plugin-loader",
+            "approval": "cisre.approval-gate",
+            "tool": "cisre.kubernetes-executor",
+            "verify": "cisre.recovery-verifier",
+            "agent": "cisre.goal-round-driver",
+            "event": "cisre.session-events",
+        }[kind]
+
+    def trace(self, session_id: str, *, limit: int = 2000) -> dict[str, Any]:
+        """Project immutable events into a secret-safe Agent/LLM/tool trace.
+
+        This deliberately exposes structured decisions and receipts rather than
+        private chain-of-thought or raw prompts. Persisted event data has already
+        passed the same credential redaction used by the audit store.
+        """
+        events = self.events(session_id, limit=limit)
+        spans: list[dict[str, Any]] = []
+        category_counts: dict[str, int] = {}
+        plugin_counts: dict[str, int] = {}
+        tool_counts: dict[str, int] = {}
+        model_calls = 0
+        parsed_times: list[datetime] = []
+        for event in events:
+            try:
+                parsed_times.append(datetime.fromisoformat(str(event.get("timestamp") or "").replace("Z", "+00:00")))
+            except ValueError:
+                parsed_times.append(datetime.now(timezone.utc))
+        origin = parsed_times[0] if parsed_times else datetime.now(timezone.utc)
+        turn_count = 0
+        tool_call_count = 0
+        lanes = {
+            "context": "Input",
+            "think": "Model",
+            "tool": "Tools",
+            "approval": "Tools",
+            "verify": "Tools",
+            "skill": "Agent",
+            "plugin": "Agent",
+            "agent": "Agent",
+            "event": "Agent",
+        }
+        for index, event in enumerate(events):
+            kind = self._trace_kind(event)
+            plugin_id = self._trace_plugin(event, kind)
+            tool = str(event.get("tool") or "")
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            model_profile = str(data.get("model_profile_id") or "")
+            if kind == "think" or model_profile:
+                model_calls += 1
+            if kind == "tool" or tool:
+                tool_call_count += 1
+            event_type = str(event.get("type") or "").lower()
+            if event_type in {"agent/round-start", "goal/round", "session/created"}:
+                turn_count += 1
+            category_counts[kind] = category_counts.get(kind, 0) + 1
+            plugin_counts[plugin_id] = plugin_counts.get(plugin_id, 0) + 1
+            if tool:
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            offset_ms = max(0, int((parsed_times[index] - origin).total_seconds() * 1000))
+            next_gap_ms = (
+                int((parsed_times[index + 1] - parsed_times[index]).total_seconds() * 1000)
+                if index + 1 < len(parsed_times) else 12
+            )
+            explicit_duration = data.get("duration_ms") or data.get("latency_ms") or 0
+            try:
+                duration_ms = int(float(explicit_duration)) if explicit_duration else max(12, min(max(0, next_gap_ms), 30000))
+            except (TypeError, ValueError):
+                duration_ms = max(12, min(max(0, next_gap_ms), 30000))
+            spans.append({
+                "span_id": str(event.get("event_id") or ""),
+                "seq": event.get("seq"),
+                "timestamp": event.get("timestamp"),
+                "kind": kind,
+                "lane": lanes[kind],
+                "offset_ms": offset_ms,
+                "duration_ms": duration_ms,
+                "name": str(event.get("stage") or event.get("type") or kind),
+                "event_type": event.get("type"),
+                "phase": event.get("phase"),
+                "status": event.get("status"),
+                "summary": event.get("message"),
+                "plugin_id": plugin_id,
+                "tool": tool,
+                "model_profile_id": model_profile,
+                "actor": event.get("actor"),
+                "target": event.get("target") or {},
+                "attributes": data,
+                "reasoning_policy": "structured-summary-only" if kind == "think" else "not-applicable",
+            })
+        return {
+            "session_id": session_id,
+            "trace_schema": "cisre.agent-trace/v1",
+            "trace_id": f"cisre-{session_id}",
+            "spans": spans,
+            "summary": {
+                "span_count": len(spans),
+                "model_calls": model_calls,
+                "duration_ms": max(0, int((parsed_times[-1] - origin).total_seconds() * 1000)) if parsed_times else 0,
+                "turns": turn_count or (1 if spans else 0),
+                "calls": model_calls + tool_call_count,
+                "categories": category_counts,
+                "plugins": plugin_counts,
+                "tools": tool_counts,
+            },
+            "disclosure": "Shows structured model decisions and execution receipts; raw secrets, prompts and private chain-of-thought are not exposed.",
+            "integrity": self.verify_chain(session_id),
+        }
 
     def verify_chain(self, session_id: str) -> dict[str, Any]:
         events = self.events(session_id, limit=2000)
@@ -290,6 +447,53 @@ class HarnessEventStore:
     def children(self, session_id: str) -> list[dict[str, Any]]:
         return [item for item in self.sessions(limit=500) if item.get("parent_session_id") == session_id]
 
+    def delete_branch(self, session_id: str, *, actor: str = "operator") -> dict[str, Any]:
+        """Tombstone a paused/settled child branch without destroying its audit trail."""
+        summary = self.session(session_id, include_deleted=True)
+        if not summary:
+            raise KeyError(f"session not found: {session_id}")
+        if summary.get("status") == "deleted":
+            return {"status": "deleted", "session_id": session_id, "already_deleted": True}
+        parent_session_id = str(summary.get("parent_session_id") or "")
+        if not parent_session_id:
+            raise ValueError("root sessions are audit records and cannot be deleted")
+        if self.children(session_id):
+            raise ValueError("branch has child sessions; delete its leaf branches first")
+        if str(summary.get("status") or "").lower() in {"running", "executing", "in_progress"}:
+            raise RuntimeError("running branches must be interrupted or settled before deletion")
+
+        target = summary.get("target") or {}
+        event = self.append(
+            session_id,
+            "session/deleted",
+            phase=str(summary.get("phase") or "runtime"),
+            stage="deleted",
+            status="deleted",
+            message="Branch hidden from active session views; immutable events retained for audit",
+            actor=actor,
+            target=target,
+            data={"parent_session_id": parent_session_id, "retention": "append-only-tombstone"},
+            parent_session_id=parent_session_id,
+        )
+        self.append(
+            parent_session_id,
+            "session/child-deleted",
+            phase=str(summary.get("phase") or "runtime"),
+            stage="child_deleted",
+            status=str((self.session(parent_session_id) or {}).get("status") or "recorded"),
+            message=f"Child branch {session_id} deleted",
+            actor=actor,
+            target=target,
+            data={"child_session_id": session_id, "retention": "append-only-tombstone"},
+        )
+        return {
+            "status": "deleted",
+            "session_id": session_id,
+            "parent_session_id": parent_session_id,
+            "event": event,
+            "audit_retained": True,
+        }
+
     def diagnostics(self) -> dict[str, Any]:
         sessions = self.sessions(limit=500)
         return {
@@ -307,7 +511,10 @@ class HarnessEventStore:
             "replay": True,
             "fork": True,
             "resume": True,
+            "branch_delete": "append-only-tombstone",
             "child_drill_down": True,
+            "agent_trace_projection": True,
+            "llm_trace_projection": "structured-summary-only",
         }
 
 

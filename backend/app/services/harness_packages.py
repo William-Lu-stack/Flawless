@@ -315,6 +315,26 @@ class HarnessPackageManager:
         requested = tuple(sorted({str(item).strip() for item in spec.get("permissions") or [] if str(item).strip()}))
         granted, denied, trusted = self._permissions(requested, digest)
         endpoint = str(runtime.get("endpoint") or "").strip()
+        ui = spec.get("ui") if isinstance(spec.get("ui"), dict) else {}
+        configured_domains = spec.get("domains") or ui.get("domains") or [ui.get("group")]
+        domains = tuple(
+            dict.fromkeys(
+                str(item).strip().lower().replace("_", "-")[:80]
+                for item in configured_domains
+                if str(item or "").strip()
+            )
+        ) or ("common",)
+        configured_agents = spec.get("agents") or ["all" if domains == ("common",) else item for item in domains]
+        agents = tuple(
+            dict.fromkeys(
+                str(item).strip().lower().replace("_", "-")[:80]
+                for item in configured_agents
+                if str(item or "").strip()
+            )
+        ) or ("all",)
+        category = str(spec.get("category") or ("shared" if domains == ("common",) else "domain")).strip().lower()
+        if category not in {"shared", "domain", "domain-agent"}:
+            raise HarnessPackageError(f"unsupported plugin category: {category}")
         operations = tuple(sorted({
             str(item.get("id") or item.get("name") or "").strip()
             for item in runtime.get("operations") or []
@@ -336,6 +356,9 @@ class HarnessPackageManager:
             source="external-package",
             permissions=requested,
             runtime_type=runtime_type,
+            category=category,
+            domains=domains,
+            agents=agents,
         )
         return HarnessPackage(
             manifest=manifest,
@@ -351,7 +374,7 @@ class HarnessPackageManager:
             service_versions=provided,
             requirement_versions=required,
             event_modes=events,
-            ui=redact_event_value(spec.get("ui") if isinstance(spec.get("ui"), dict) else {}),
+            ui=redact_event_value(ui),
             trusted=trusted,
         )
 

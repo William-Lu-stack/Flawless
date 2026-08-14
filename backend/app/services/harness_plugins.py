@@ -43,6 +43,9 @@ class PluginManifest:
     source: str = "cisre"
     permissions: tuple[str, ...] = ()
     runtime_type: str = "builtin"
+    category: str = "shared"
+    domains: tuple[str, ...] = ("common",)
+    agents: tuple[str, ...] = ("all",)
 
     def public(self) -> dict[str, Any]:
         return {
@@ -57,6 +60,9 @@ class PluginManifest:
             "source": self.source,
             "permissions": list(self.permissions),
             "runtime_type": self.runtime_type,
+            "category": self.category,
+            "domains": list(self.domains),
+            "agents": list(self.agents),
         }
 
 
@@ -504,6 +510,9 @@ BUILTIN_PLUGIN_MANIFESTS = (
         provides=("tool.executor.kubernetes",),
         requires=("policy.execution-target",),
         events=("tools/execute", "tools/result"),
+        category="domain",
+        domains=("kubernetes",),
+        agents=("kubernetes",),
     ),
     PluginManifest(
         id="cisre.read-after-write",
@@ -511,6 +520,9 @@ BUILTIN_PLUGIN_MANIFESTS = (
         provides=("verifier.mutation",),
         requires=("tool.executor.kubernetes",),
         events=("mutation/readback",),
+        category="domain",
+        domains=("kubernetes",),
+        agents=("kubernetes",),
     ),
     PluginManifest(
         id="cisre.recovery-verifier",
@@ -518,6 +530,9 @@ BUILTIN_PLUGIN_MANIFESTS = (
         provides=("verifier.recovery",),
         requires=("verifier.mutation",),
         events=("recovery/check", "recovery/complete"),
+        category="domain",
+        domains=("kubernetes",),
+        agents=("kubernetes",),
     ),
     PluginManifest(
         id="cisre.goal-round-driver",
@@ -539,6 +554,97 @@ BUILTIN_PLUGIN_MANIFESTS = (
         provides=("telemetry.ops",),
         requires=("session.events",),
         events=("session/event", "tools/result", "recovery/complete"),
+    ),
+    PluginManifest(
+        id="cisre.agent-trace",
+        description="Secret-safe context, model decision, Skill, plugin, tool, approval and verification trace projection.",
+        provides=("telemetry.agent-trace", "telemetry.llm-trace"),
+        requires=("session.events", "telemetry.ops"),
+        events=("session/event", "llm/response", "tools/result", "recovery/complete"),
+    ),
+    PluginManifest(
+        id="cisre.agent-loop",
+        description="Bounded evidence-plan-act-verify loop with deterministic completion and stuck-trajectory switching.",
+        provides=("agent.loop",),
+        requires=("context.compactor", "planner.deepseek-compatible", "skill.router", "goal.driver"),
+        events=("agent/round-start", "agent/decision", "agent/round-end"),
+    ),
+    PluginManifest(
+        id="cisre.agent-orchestrator",
+        description="Owner-scoped sequential or parallel specialist delegation with cancellation and output bounds.",
+        provides=("agent.orchestration",),
+        requires=("agent.loop", "jobs.owner-scoped"),
+        events=("agent/delegate", "agent/join", "agent/cancel"),
+    ),
+    PluginManifest(
+        id="cisre.agent.kubernetes",
+        description="Kubernetes domain Agent composed from shared SRE capabilities and Kubernetes-only providers.",
+        provides=("agent.domain.kubernetes",),
+        requires=("agent.loop", "agent.orchestration", "tool.executor.kubernetes", "verifier.recovery"),
+        events=("agent/kubernetes/start", "agent/kubernetes/end"),
+        category="domain-agent",
+        domains=("kubernetes",),
+        agents=("kubernetes",),
+    ),
+    PluginManifest(
+        id="cisre.agent.database",
+        description="Database domain Agent activated when inventory, evidence and verification providers are installed.",
+        provides=("agent.domain.database",),
+        requires=("agent.loop", "agent.orchestration", "inventory.database", "evidence.database", "verification.database"),
+        events=("agent/database/start", "agent/database/end"),
+        category="domain-agent",
+        domains=("database",),
+        agents=("database",),
+    ),
+    PluginManifest(
+        id="cisre.agent.virtual-machine",
+        description="VM and host domain Agent activated by virtual-machine provider contracts.",
+        provides=("agent.domain.virtual-machine",),
+        requires=("agent.loop", "agent.orchestration", "inventory.virtual-machine", "evidence.virtual-machine", "verification.virtual-machine"),
+        events=("agent/virtual-machine/start", "agent/virtual-machine/end"),
+        category="domain-agent",
+        domains=("virtual-machine",),
+        agents=("virtual-machine",),
+    ),
+    PluginManifest(
+        id="cisre.agent.storage",
+        description="Storage domain Agent activated by storage inventory, evidence and verification providers.",
+        provides=("agent.domain.storage",),
+        requires=("agent.loop", "agent.orchestration", "inventory.storage", "evidence.storage", "verification.storage"),
+        events=("agent/storage/start", "agent/storage/end"),
+        category="domain-agent",
+        domains=("storage",),
+        agents=("storage",),
+    ),
+    PluginManifest(
+        id="cisre.agent.middleware",
+        description="Middleware domain Agent activated by middleware provider contracts.",
+        provides=("agent.domain.middleware",),
+        requires=("agent.loop", "agent.orchestration", "inventory.middleware", "evidence.middleware", "verification.middleware"),
+        events=("agent/middleware/start", "agent/middleware/end"),
+        category="domain-agent",
+        domains=("middleware",),
+        agents=("middleware",),
+    ),
+    PluginManifest(
+        id="cisre.agent.cloud",
+        description="Cloud resource domain Agent activated by cloud inventory, evidence and verification providers.",
+        provides=("agent.domain.cloud",),
+        requires=("agent.loop", "agent.orchestration", "inventory.cloud", "evidence.cloud", "verification.cloud"),
+        events=("agent/cloud/start", "agent/cloud/end"),
+        category="domain-agent",
+        domains=("cloud",),
+        agents=("cloud",),
+    ),
+    PluginManifest(
+        id="cisre.agent.network",
+        description="Network domain Agent activated by network inventory, evidence and verification providers.",
+        provides=("agent.domain.network",),
+        requires=("agent.loop", "agent.orchestration", "inventory.network", "evidence.network", "verification.network"),
+        events=("agent/network/start", "agent/network/end"),
+        category="domain-agent",
+        domains=("network",),
+        agents=("network",),
     ),
 )
 
@@ -822,14 +928,40 @@ def harness_capabilities_payload() -> dict[str, Any]:
     # this runtime, while the event store is an independent durable service.
     from backend.app.services.harness_events import HARNESS_EVENT_STORE
     from backend.app.services.harness_packages import HARNESS_PACKAGE_MANAGER
+    from backend.app.kernel import scalability_profile
 
     payload["upstream_adapter"] = official_deepseek_harness_status()
     payload["composition"] = HARNESS_PACKAGE_MANAGER.diagnostics()
     payload["event_store"] = HARNESS_EVENT_STORE.diagnostics()
+    payload["scalability"] = scalability_profile()
+    all_plugins = list(payload.get("plugins") or []) + list(payload["composition"].get("packages") or [])
+    shared_plugin_ids = sorted({
+        str(item.get("id") or "") for item in all_plugins
+        if item.get("category") == "shared" and item.get("id")
+    })
+    payload["agents"] = [
+        {
+            "id": str(item.get("id") or ""),
+            "domain": str((item.get("domains") or ["common"])[0]),
+            "status": item.get("status") or item.get("package_status") or "pending",
+            "description": item.get("description") or "",
+            "shared_plugins": shared_plugin_ids,
+            "domain_plugins": sorted({
+                str(candidate.get("id") or "") for candidate in all_plugins
+                if candidate.get("id")
+                and candidate.get("category") == "domain"
+                and str((item.get("domains") or ["common"])[0]) in (candidate.get("domains") or [])
+            }),
+            "missing_dependencies": item.get("missing_dependencies") or [],
+        }
+        for item in all_plugins
+        if item.get("category") == "domain-agent"
+    ]
     payload["contracts"] = {
         "append_only_session_events": True,
         "hash_chained_durable_events": True,
         "session_replay_fork_resume": True,
+        "session_branch_tombstone_delete": True,
         "child_session_drill_down": True,
         "scoped_dependency_injection": True,
         "typed_event_modes": ["observe", "serial", "parallel", "waterfall"],
@@ -847,7 +979,13 @@ def harness_capabilities_payload() -> dict[str, Any]:
         "goal_round_continuation": True,
         "official_runtime_cannot_mutate_kubernetes": True,
         "ui_manifest_validation_and_install": True,
+        "ui_visual_plugin_authoring": True,
+        "ui_plugin_invocation_and_security_details": True,
+        "shared_and_domain_plugin_classification": True,
+        "domain_agent_composition": True,
+        "stable_kernel_ports": True,
+        "backend_independent_scale_contract": True,
         "plaintext_plugin_secrets_rejected": True,
-        "team_provider_templates": ["database", "virtual_machine", "storage"],
+        "team_provider_templates": ["common", "kubernetes", "database", "virtual_machine", "storage", "middleware", "cloud", "network"],
     }
     return payload

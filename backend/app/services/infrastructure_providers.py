@@ -1,6 +1,6 @@
 """全栈基础设施资源适配器。
 
-这里定义 Kubernetes 之外的资源入口：数据库、虚拟机、中间件、存储和云资源。
+这里定义 Kubernetes 之外的资源入口：数据库、虚拟机、中间件、存储、云资源和网络。
 适配器只负责发现资源、采集低风险健康证据和生成标准化 finding；真实变更必须
 继续经过 OpsJob、动作目录、外部受控执行器、人工确认和审计。
 """
@@ -62,6 +62,13 @@ RESOURCE_TYPE_CATALOG: list[dict[str, Any]] = [
         "evidence": ["cloud_instance_status", "cloud_quota", "cloud_security_group", "cloud_billing_risk"],
         "typical_actions": ["cloud_scale_instance", "cloud_attach_disk", "cloud_adjust_security_group"],
     },
+    {
+        "id": "network",
+        "name": "网络",
+        "description": "交换/路由、链路、DNS、负载均衡、ACL 与安全策略等网络资源。",
+        "evidence": ["network_topology", "network_interface_state", "network_latency", "network_packet_loss", "network_routing", "network_dns", "network_load_balancer", "network_policy", "network_recent_changes"],
+        "typical_actions": ["network_apply_policy", "network_switch_route", "network_update_load_balancer", "network_restore_interface"],
+    },
 ]
 
 DOMESTIC_PROVIDER_CATALOG: list[dict[str, Any]] = [
@@ -92,6 +99,10 @@ DOMESTIC_PROVIDER_CATALOG: list[dict[str, Any]] = [
     {
         "id": "private-compute", "name": "私有云与虚拟化", "kind": "virtual_machine",
         "products": ["OpenStack", "深信服 HCI", "华为 FusionCompute", "VMware", "Harvester", "裸金属"],
+    },
+    {
+        "id": "domestic-network", "name": "国产网络与安全", "kind": "network",
+        "products": ["华为 CloudEngine", "新华三 Comware", "锐捷 RGOS", "深信服 AD/AF", "阿里云 CEN/SLB", "通用 SDN/OpenConfig"],
     },
 ]
 
@@ -234,6 +245,9 @@ def load_resources() -> list[dict[str, Any]]:
     for item in _as_list(_json_env("CLOUD_RESOURCE_TARGETS_JSON", "[]")):
         if isinstance(item, dict):
             resources.append(_normalize_resource(item, default_type="cloud_service"))
+    for item in _as_list(_json_env("NETWORK_TARGETS_JSON", "[]")):
+        if isinstance(item, dict):
+            resources.append(_normalize_resource(item, default_type="network"))
     for item in _runtime_inventory():
         resources.append(_normalize_resource(item, default_type=str(item.get("type") or "external")))
 
@@ -269,6 +283,7 @@ def providers_payload() -> dict[str, Any]:
             "middleware": "MIDDLEWARE_TARGETS_JSON",
             "storage": "STORAGE_TARGETS_JSON",
             "cloud_service": "CLOUD_RESOURCE_TARGETS_JSON",
+            "network": "NETWORK_TARGETS_JSON",
             "adapter_registry": "INFRASTRUCTURE_ADAPTERS_JSON",
             "runtime_inventory_store": str(_runtime_inventory_path()),
             "action_webhook": "INFRASTRUCTURE_ACTION_WEBHOOK_URL",
@@ -499,6 +514,12 @@ def _default_steps(resource: dict[str, Any], finding: dict[str, Any]) -> list[di
             {"title": "定位进程与系统层根因", "description": "确认是否为服务异常、磁盘满、文件句柄耗尽、内核错误、网络不可达或安全基线变更。", "probe": "vm_runtime_evidence"},
             {"title": "选择最小修复动作", "description": "优先选择重启故障服务、扩容磁盘或恢复配置；整机重启必须作为高风险动作二次确认。", "probe": "vm_change_guard"},
         ]
+    if resource["type"] == "network":
+        return [
+            {"title": "读取网络路径证据", "description": "检查拓扑、接口与链路状态、时延、丢包、路由、DNS、负载均衡成员和最近变更。", "probe": "network_path_evidence"},
+            {"title": "定位网络根因", "description": "区分物理/虚拟链路、路由收敛、DNS、负载均衡、ACL/安全策略和上游依赖故障。", "probe": "network_runtime_evidence"},
+            {"title": "评估爆炸半径和回退路径", "description": "计算受影响业务、冗余路径和回滚条件，只生成动作目录中的最小网络变更。", "probe": "network_change_guard"},
+        ]
     return [
         {"title": "读取资源健康证据", "description": "检查状态、指标、日志、依赖和最近变更。", "probe": "infra_health"},
         {"title": "判断影响范围", "description": "结合 CMDB、业务服务和上下游依赖评估爆炸半径。", "probe": "dependency_topology"},
@@ -533,6 +554,15 @@ def _candidate_changes(resource: dict[str, Any], finding: dict[str, Any]) -> lis
         if "connectivity" in category:
             return [{**base, "type": "vm_reboot", "risk": "high", "rollback": "无法原地回滚，执行前必须确认业务冗余和窗口。"}]
         return [{**base, "type": "vm_restart_service", "risk": "medium", "rollback": "恢复服务原启动参数或回退配置。"}]
+    if rtype == "network":
+        summary = str(finding.get("summary") or finding.get("title") or "").lower()
+        if "dns" in category or "dns" in summary:
+            return [{**base, "type": "network_update_load_balancer", "risk": "high", "rollback": "恢复变更前 DNS/负载均衡配置快照并重新验证解析与健康检查。"}]
+        if "route" in category or "routing" in category or "路由" in summary:
+            return [{**base, "type": "network_switch_route", "risk": "high", "rollback": "恢复变更前路由表、优先级和下一跳快照。"}]
+        if "interface" in category or "link" in category or "链路" in summary:
+            return [{**base, "type": "network_restore_interface", "risk": "high", "rollback": "恢复接口管理状态、VLAN/聚合和链路参数快照。"}]
+        return [{**base, "type": "network_apply_policy", "risk": "high", "rollback": "恢复变更前 ACL/安全策略快照并复核命中计数。"}]
     return [{**base, "type": "infra_run_approved_action", "risk": "high", "rollback": "按外部执行器返回的回滚计划处理。"}]
 
 

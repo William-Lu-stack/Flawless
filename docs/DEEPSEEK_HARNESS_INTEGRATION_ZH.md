@@ -19,7 +19,7 @@
 
 ```mermaid
 flowchart LR
-  UI["CISRE UI\nSRE 对话 / AI 巡检"] --> API["Ops API"]
+  UI["CISRE UI\nSRE Run / AI 巡检"] --> API["Ops API"]
   API --> H["CISREPluginHarness/v1"]
   PROFILE["Profile → Bundle → Patch"] --> H
   PKG["Mounted out-of-tree packages"] --> PROFILE

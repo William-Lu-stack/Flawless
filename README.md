@@ -1,750 +1,196 @@
-# CISRE
+# CISRE — 企业统一 SRE 平台
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](#quick-start)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)](#development)
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-ready-326CE5?logo=kubernetes&logoColor=white)](#kubernetes-deployment)
-[![Docker](https://img.shields.io/badge/Docker-CISRE-2496ED?logo=docker&logoColor=white)](#docker)
-[![Langfuse](https://img.shields.io/badge/Langfuse-optional-111827)](#langfuse)
-[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-red)](#license)
+CISRE（Cloud Infrastructure Site Reliability Engine）把基础设施的风险发现、证据采集、根因诊断、人工审批、受控变更、恢复验证和经验沉淀连接成一条可审计闭环。
 
-**Your infrastructure can explain itself, heal safely, and prove it recovered.**<br>
-**让基础设施自己解释故障、安全完成修复，并证明它真的恢复了。**
+当前版本：**5.5.1**。
 
-**CISRE** (Cloud Infrastructure Site Reliability Engine) is an AI-native reliability control plane for Kubernetes and cloud infrastructure. It connects alerts, evidence, topology, human approval, controlled remediation, and recovery verification in one auditable AgenticOps loop.
+## 一句话理解
 
-它不是另一个只会给建议的运维聊天框。CISRE 将“发现问题、收集证据、生成预演、人工授权、执行变更、恢复验证、经验沉淀”连接成一个可审计闭环。
-
-Maintained by the **CISRE Contributors** community.
-
-Current release: **5.5.1**.
-
-本版本的总体架构、Harness 融合、Kubernetes 写后回读、拓扑性能和国产全栈适配合同见
-[`docs/CISRE_ARCHITECTURE_ZH.md`](docs/CISRE_ARCHITECTURE_ZH.md)。
-外置插件、Profile/Bundle/Patch、服务依赖、权限策略和事件回放开发手册见
-[`docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md`](docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md)。
-数据库、VM、存储等团队的插件交付合同与接入步骤见
-[`docs/PLUGIN_TEAM_ONBOARDING_ZH.md`](docs/PLUGIN_TEAM_ONBOARDING_ZH.md)。
-
-Release 5.5.1 keeps the 5.5 plugin-center release intact and restores the
-environment-independent VM/virtualization provider contract used by team
-plugins and clean CI environments.
-
-Release 5.5.0 introduces the operator-facing **SRE initiate** experience and a
-production-safe plugin center inspired by the official DeepSeek Harness. Teams
-can validate and install declarative provider packages from the UI, declare
-versioned `provides`/`requires` services, compose them through Profiles, and
-ship database, VM or storage evidence/Skill providers without changing the
-control-plane core. Plaintext credentials are rejected and every real mutation
-still requires typed actions, human approval, read-after-write and recovery
-verification.
-
-Release 5.4.0 adds the capability-oriented Harness plugin runtime while retaining
-canonical mutation binding. The control plane freezes the approved cluster ID,
-namespace, kind and name before execution, and uses that immutable
-identity for the write, live read-back and recovery probes. A Workload change
-is successful only when the same object UID remains, its `resourceVersion` and
-`generation` advance, and the approved fields exist on the live object.
-Recovery now follows only Pods created by the new revision, requires controller
-rollout convergence, stable restart counts, fresh current logs without the
-original failure signature, no new BackOff events, and optional endpoint or
-business probes when available. Historical `--previous` logs remain diagnostic
-evidence and can no longer keep a healthy replacement Pod spinning forever.
-
-Release 5.3.0 introduced the CISRE brand and `CISREDurableHarness/v2`, proved
-every Kubernetes Workload mutation with same-transport read-after-write field
-matching, defaults the optimized 3D topology to automatic orbit, and opens
-credential-free inventory/discovery contracts for Alibaba Cloud and other
-domestic cloud, database, middleware, storage and virtualization providers.
-
-中文技术架构、工程实现、测试证据和项目工具材料见
-[`docs/PROJECT_TECHNICAL_MATERIALS_ZH.md`](docs/PROJECT_TECHNICAL_MATERIALS_ZH.md)。
-灰度发布的生产安装、配置和状态语义见
-[`docs/ARGO_ROLLOUTS_SRE_ZH.md`](docs/ARGO_ROLLOUTS_SRE_ZH.md)。
-
-Release 5.2.0 adds a persistent, model-independent SRE execution harness with
-phase checkpoints, tool receipts, repeated-trajectory detection and a
-deterministic completion evaluator. General API admission now queues instead
-of surfacing false operations-overload errors, while job control and approval
-remain responsive and actual Kubernetes mutations keep their target-aware
-single-flight lease. Beyla and Alloy now cover tainted Linux nodes, attach node
-and cluster labels, and expose expected-versus-ready collector coverage beside
-the real flow topology. Operations Effectiveness continues to show only
-verified resolutions with expandable evidence.
-The default view shows only incidents whose recovery contract passed, with a
-clear problem title, target, Skill, completion time and recovered Pod count.
-Opening a record reveals the root cause, strategy history, approved changes,
-patch details and recovery proof; diagnosis-only and failed attempts no longer
-obscure what CISRE actually solved.
-
-Release 5.0.8 deliberately uses the 5.0.4 code path as its base and changes only
-post-change recovery verification. Diagnosis, Skill routing and approval keep
-their 5.0.4 behavior. Verification now follows the newest controller revision,
-ignores a superseded CrashLoop Pod only after a replacement revision exists,
-reads the new Pod's current/previous logs and live Workload, requires rollout
-convergence, and closes after a bounded stability window. A broken newest Pod
-still fails verification and continues to the next approved recovery strategy.
-
-Release 5.0.3 advances directly from actionable Pod logs to root-cause diagnosis
-once the live Pod and owning Workload evidence are available. Broad storage,
-Service, node and topology probes are now collected only when the selected
-root-cause hypothesis or Skill requires them, so a slow optional Rancher API
-cannot leave an incident stuck in evidence collection.
-
-Release 5.0.2 made Pod-log evidence state-aware: containers that have not
-started are diagnosed from Pod status and Events instead of surfacing a bare
-Kubernetes log HTTP 400, while Workload-level diagnosis can continue with an
-evidence-rich sibling Pod and retain the full lineage. Beyla topology fusion
-now accepts standard and Alloy label names, plain or JSON-wrapped network-flow
-logs, and remains active when the configured CMDB is degraded. The console
-keeps SRE chat, AI inspection, topology impact, and the Skill library as its
-four core entries; runtime overview, resource events, effectiveness, and other
-administrative capabilities are nested under Platform Capabilities.
-
-Release 5.0.1 adds two explicit cluster-onboarding paths in the console:
-encrypted kubeconfig and Rancher URL/token. Existing `RANCHER_URL`,
-`RANCHER_TOKEN`, and TLS settings injected by ConfigMap/Secret remain the
-default after an image-only upgrade. A Web-provided Rancher profile is probed
-before it atomically becomes an encrypted runtime override; deleting that
-override restores the environment configuration without changing Kubernetes
-objects or credentials. Neither API ever returns a bearer token.
-
-Release 5.0.0 replaces the display-only Deployment canary with real Argo
-Rollouts progressive delivery.  The existing blast-radius algorithm now
-produces an enforceable replica-weight envelope; each batch runs a live
-Prometheus/SLO AnalysisRun, the approved ceiling pauses for a second human
-promotion, and hard SLI failures automatically return capacity to stableRS.
-Rollback also restores the source Deployment template, so both runtime and
-desired state are recovered.  Argo Rollouts v1.9.1 is pinned by digest to a
-verified mainland-accessible mirror.  The application executor was tested
-against a real K3s controller for canary pause, status-subresource promotion,
-automatic abort, capacity recovery, and desired-state restoration.
-
-The same release also closes a post-remediation evidence gap: after a
-Deployment rollout deletes the originally selected Pod, CISRE now resolves
-the replacement Pod through Workload ownership, records the old-to-new Pod
-lineage, and continues collecting current/previous logs for diagnosis and
-recovery verification.  This applies to both Rancher proxy and directly
-uploaded kubeconfig transports; RBAC, timeout, and network failures remain
-visible instead of being mistaken for Pod replacement.
-
-Release 3.2.17 closes the post-LLM diagnosis stall. The LLM response, action
-normalization, and Skill Router are now independently observable stages; the
-Router runs outside the asyncio event loop with its own hard timeout, and the
-deterministic no-LLM fallback is bounded as well. Missing timing fields no
-longer render as a false `0 秒 / 0 秒` deadline, and an orphaned persisted job is
-resumed from fresh evidence with all old approvals invalidated. This release is
-covered by a real DeepSeek response-path test and a real K3s workflow that
-patches a broken Deployment through two human approvals and verifies the new
-Pod recovered.
-
-Release 3.2.16 made the built-in Skill migration idempotent. Once a stale
-legacy definition has been materialized as a current standard Skill package,
-later restarts keep enforcing the shipped policy without emitting duplicate
-migration receipts or rewriting the package.
-
-Release 3.2.15 made built-in Skill policy upgrade-safe. On the first process
-start after an image upgrade, application-owned Skills now replace stale
-legacy JSON and directory-package policy with the shipped version while
-retaining the operator's enabled state. This prevents an older executable
-CrashLoop router from shadowing the current handoff-only definition and
-stalling after evidence refresh. Executable plans also emit explicit
-root-cause and diagnosis-complete events before approval. The release is
-covered by a real K3s workflow that creates a file/database permission failure,
-tries the non-root policy first, escalates through a second human approval to
-the complete root securityContext, patches the Deployment, and verifies the
-replacement Pod.
-
-Release 3.2.14 fixes the non-terminal CrashLoop diagnosis path. A generic
-CrashLoop Skill now performs resource discovery and scenario routing only; it
-cannot own a mutation or end an incident. Missing Skill evidence becomes an
-active Kubernetes refresh followed by immediate rerouting, and recently
-collected live evidence survives a transient retry failure instead of being
-replaced by an empty result. Direct write-path proof now deterministically
-promotes the volume-permission Skill, which can produce the complete
-`runAsUser/runAsGroup/fsGroup=0`, `runAsNonRoot=false` fallback behind a fresh
-human approval, then redeploy and verify the new Pod.
-
-Release 3.2.13 adapted the strongest reusable patterns from the STAROps official
-Skill catalog into vendor-neutral built-in Skills for progressive Kubernetes,
-node and database inspection, observability-pipeline diagnosis, verified
-PromQL/LogQL/TraceQL generation, and topology/eBPF data modeling. The runtime
-now loads one primary Skill body by default, admits secondary Skills only
-through an explicit cross-domain dependency and evidence gate, exposes a
-cheapest-first evidence plan, and keeps every mutation behind the existing
-human approval, rollback, and recovery-verification boundary.
-
-Release 3.2.12 added a priority Pod-log evidence channel that persists
-current/previous logs before optional CMDB, topology, storage, or node probes.
-Remote SRE-chat and inspection plans now choose Rancher from the target cluster
-identity rather than the UI source label, and the console shows the actual
-ERROR/WARNING excerpts or the exact log API/RBAC failure. The volume-permission
-Skill rejects a no-op non-root Patch when the live Workload already has the same
-UID/GID/fsGroup contract and can advance, behind a fresh human approval, to the
-complete root fallback (`runAsUser/runAsGroup/fsGroup=0`,
-`runAsNonRoot=false`) followed by rollout and new-Pod log verification.
-
-Release 3.2 adds persistent remediation lineage: every failed strategy, action,
-verification result, and replacement plan stays linked across operator-approved
-follow-up jobs. The effectiveness ledger is persisted on the runtime volume so
-model comparisons and recovery records survive Pod restarts.
-
-## The AgenticOps Loop
-
-`discover → diagnose → preview → approve → execute → verify → learn`
-
-- **Evidence first**: connect alerts, events, logs, metrics, topology, runbooks, and recent changes.
-- **Guarded action**: keep RBAC, policy, dry-run, human approval, and audit outside the model boundary.
-- **Verified recovery**: test the original symptom after execution instead of treating a successful command as success.
-
-## Why This Exists
-
-Modern cloud systems fail in ways that are hard to reason about from a single log line:
-
-- a Pod restart can hide a PVC, image, scheduling, network, quota, or rollout issue;
-- a small workload change can affect services, data pipelines, middleware, and downstream users;
-- repeated human firefighting leaves valuable operational knowledge outside the platform;
-- model output is useful only when it is constrained by evidence, policy, permissions, and rollback.
-
-CISRE is built as an SRE control plane. It uses a model as a planner and explainer, but the platform keeps the execution boundary: RBAC, action catalog, dry-run, approval, audit, and recovery verification.
-
-## Core Features
-
-- **SRE Chat**: ChatGPT-style operations console with cluster, namespace, workload, and risk context.
-- **Inspection Queue**: scheduled or manual scans across Rancher/Kubernetes scopes with severity ranking.
-- **Controlled Remediation**: evidence collection, change preview, human approval, execution, post-change verification, and evidence-driven replanning that remembers failed strategies across follow-up jobs.
-- **Topology Impact**: 2D/3D topology, CMDB-style dependencies, eBPF/data-flow adapters, blast-radius analysis.
-- **Release Governance**: SLO, error budget, canary/risk gate, emergency fix path, and release audit chain.
-- **Skills Library**: portable operation skills that encode expert knowledge and can be reused by other agents.
-- **Knowledge Base**: upload text, Markdown, PDF, Word, Excel, logs, YAML, and runbooks for operations RAG.
-- **Model Lab**: configure multiple OpenAI-compatible or OAuth-protected model gateways and compare outcomes.
-- **Measurable Outcomes**: persistent remediation lineage, changed-resource history, recovery evidence, and model effectiveness comparisons.
-- **Observability**: Prometheus metrics, Loki logs, Tempo traces, Grafana links, and optional Langfuse traces.
-- **Extensible Infrastructure**: adapters for Kubernetes, Rancher, databases, virtual machines, storage, and middleware.
-
-## Architecture
+模型负责理解、规划和解释；Skill 负责领域处置知识；插件负责提供可组合能力；Harness 负责状态、权限和编排；受控执行器负责真实变更；Verifier 负责证明目标已经恢复。
 
 ```text
-Frontend Console
-  ├─ SRE Chat / Inspection / Topology / Release / Skills / Models
-  │
-  ▼
-Control Plane API
-  ├─ Evidence pipeline
-  ├─ Remediation job state machine
-  ├─ Release gate and SLO budget
-  ├─ Knowledge and model registries
-  ├─ Observability store
-  └─ Integration health checks
-  │
-  ├─ MCP Kubernetes tools
-  ├─ A2A healing / incident / postmortem agents
-  ├─ Rancher / Prometheus / CMDB / eBPF flow adapters
-  ├─ Langfuse / Loki / Tempo / Grafana adapters
-  └─ Optional custom algorithm extension
+发现 → 取证 → 诊断 → Skill 路由 → 变更预览 → 人工审批
+    → 执行 → 同目标回读 → 稳定性验证 → Records / Skill 成效
+                         ↘ 未恢复：保留证据并换策略继续
 ```
 
-## Quick Start
+执行 API 返回成功、模型声称成功或旧实例仍然健康，都不等于故障恢复。只有真实目标的新证据满足恢复合同，任务才会闭环。
 
-The quick-start command performs prerequisite checks, creates `.env` when
-needed, builds the console, starts the API plus all local agents/MCP services,
-and waits for the complete core health check to pass.
+## 产品入口
 
-You need Git, plus either:
+- **SRE Run**：围绕真实资源进行取证、诊断、审批、执行和恢复验证。
+- **AI 巡检**：定时或手动发现风险，并复用与 SRE Run 相同的运维内核。
+- **拓扑影响**：展示资源依赖、流量和爆炸半径，辅助风险门禁。
+- **Skill 库**：维护问题触发条件、渐进取证、动作、回滚与成功判据。
+- **插件中心**：查看插件详情、调用条件、服务依赖、安全边界、最近调用；支持可视化或模型辅助创建插件。
+- **平台能力**：运行总览、资源事件、插件与 Profile、Agent Trace、运维成效。
+- **运维成效**：只统计已经通过恢复验证的问题；可展开根因、Skill、变更和恢复证据。
 
-- Docker Engine or Docker Desktop with Compose v2; or
-- Python 3.11+ and Node.js 20+ for the automatic native fallback.
+## 当前能力边界
 
-### Always-Latest One-Click Deployment
+| 领域 | 当前状态 | 接入方式 |
+|---|---|---|
+| Kubernetes | 完整闭环 | Rancher、上传/粘贴 kubeconfig、集群内 ServiceAccount |
+| 数据库 | 扩展合同就绪 | 领域插件 + 只读 Provider + 类型化动作执行器 |
+| VM / 主机 | 扩展合同就绪 | 领域插件 + 只读 Provider + 企业执行平台 |
+| 存储 | 扩展合同就绪 | 领域插件 + 阵列/CSI/存储平台 Provider |
+| 中间件 / 云资源 | 扩展合同就绪 | 按稳定 Adapter 和 Harness 服务合同接入 |
+| 网络 | 扩展合同就绪 | 交换/路由、负载均衡、DNS、ACL/安全策略与链路 Provider |
 
-Each operating-system installer pulls only the canonical `main` branch, safely
-fast-forwards an existing clean checkout, verifies that `HEAD` exactly matches
-`origin/main`, and starts CISRE with Docker.
+“合同就绪”表示接口、权限、审计和闭环语义已具备，不表示某个具体产品已经连接。页面不得伪造资源或健康数据。
 
-#### macOS (Docker Desktop)
+## Harness 与插件模型
 
-```bash
-curl -fsSL --retry 3 \
-  https://raw.githubusercontent.com/your-org/Flawless/main/scripts/install-macos.sh \
-  | bash -s -- --china
-```
+CISRE 吸收了官方 DeepSeek Harness 的组合思想，但保留独立的生产执行边界：
 
-#### Linux or WSL (Docker Engine)
+- Everything is a Plugin：新增领域能力优先交付插件，不修改核心编排。
+- Service Provider / Consumer：插件用 `provides` / `requires` 声明能力和依赖，由运行时解析。
+- Profile / Bundle / Patch：开发、测试、生产可组合不同 Provider，不在业务代码中堆环境判断。
+- 事件驱动：支持 observe、serial、parallel、waterfall；高风险门禁只能收紧，不能被插件绕过。
+- 可逆生命周期：加载、卸载、热重载和资源释放有确定顺序。
+- 事件溯源：会话事件追加写入、脱敏并哈希串联，支持 replay、fork、resume 和审计墓碑删除。
+- Agent Trace：展示上下文摘要、模型决策摘要、Skill、插件、工具、审批、变更与验证 Span；不展示原始凭据、完整私有思维链或未脱敏 Prompt。
+- Agent Loop / 编排：插件可声明最大步数、委派关系和所需服务，但真实副作用仍通过 CISRE 审批执行链。
 
-```bash
-curl -fsSL --retry 3 \
-  https://raw.githubusercontent.com/your-org/Flawless/main/scripts/install-linux.sh \
-  | bash -s -- --china
-```
+资源域按 Agent 组合：Kubernetes、数据库、VM/主机、存储、中间件、云资源和网络各有一个 Domain Agent。Agent 复用公共 Planner、上下文、审批、Trace、事件和任务插件，再加载本资源域的 Provider、执行器、Verifier 与 Skills。插件 Manifest 必须声明 `category`、`domains` 和 `agents`，便于运行时依赖解析与前端分类。
 
-#### Windows (PowerShell + Docker Desktop)
+当前版本是 Plugin-first 过渡架构，不应误解为所有历史代码都已抽离：插件运行时和跨团队合同已经可用，Kubernetes 闭环仍通过兼容服务实现，`backend/app/application.py` 仍在逐步缩小。目标不是重写全部系统，而是让后续领域功能做到“只提交插件和 Skill，核心零改动”。迁移边界和完成判据见 [Plugin-first 重构路线](docs/PLUGIN_FIRST_REFACTOR_ROADMAP_ZH.md)。
 
-Run in PowerShell, not Command Prompt:
-
-```powershell
-& ([scriptblock]::Create((irm `
-  "https://raw.githubusercontent.com/your-org/Flawless/main/scripts/install-windows.ps1"))) -China
-```
-
-Remove `--china` or `-China` when mainland China mirrors are not needed. The
-default install directory is `~/Flawless` on macOS/Linux and
-`$HOME\Flawless` on Windows.
-
-The portable macOS/Linux installer remains available when automatic Docker
-fallback is preferred:
-
-```bash
-curl -fsSL --retry 3 \
-  https://raw.githubusercontent.com/your-org/Flawless/main/scripts/install.sh | bash
-```
-
-The installer never resets or overwrites local changes. It stops and restarts
-an existing stack only when the verified revision actually changed.
-
-### Manual Clone
-
-```bash
-git clone https://github.com/your-org/Flawless.git
-cd Flawless
-./scripts/quickstart.sh
-```
-
-Open `http://127.0.0.1:8080` after the command reports `ready`.
-
-To prove that an existing checkout is current, both `Latest status: latest`
-and `Worktree: clean` must be shown:
-
-```bash
-./scripts/quickstart.sh version
-./scripts/quickstart.sh update
-./scripts/quickstart.sh doctor
-```
-
-`doctor` reports the exact commit, remote comparison, platform, Docker Compose,
-Docker daemon, Python, Node.js, npm, and active runtime without printing `.env`
-or credential values. Attach its output when reporting an installation failure.
-
-Useful controls:
-
-```bash
-./scripts/quickstart.sh status
-./scripts/quickstart.sh logs
-./scripts/quickstart.sh stop
-./scripts/quickstart.sh --china
-./scripts/quickstart.sh --port 18080 --open
-./scripts/quickstart.sh --mode native
-./scripts/quickstart.sh --mode docker
-```
-
-`auto` mode prefers Docker when its daemon is running and otherwise uses the
-native toolchain. Runtime data and logs stay under `.flawless/` in native mode
-or in the `flawless-data` Docker volume. Re-running the command is safe.
-
-### Model Configuration
-
-The console and baseline workflows start without a live model endpoint. To use
-AI chat, configure `.env` for an OpenAI-compatible local endpoint such as
-Ollama, then restart the stack:
-
-```env
-LLM_API_BASE=http://localhost:11434/v1
-LLM_API_KEY=
-LLM_MODEL=qwen2.5:7b
-LLM_AUTH_TYPE=none
-```
-
-In Docker mode, the quick-start script automatically maps `localhost` model
-URLs to `host.docker.internal`. For an OAuth client-credentials gateway:
-
-```env
-LLM_AUTH_TYPE=oauth_client_credentials
-OAUTH_TOKEN_URL=https://your-iam/realms/main/protocol/openid-connect/token
-OAUTH_CLIENT_ID=your-client
-OAUTH_CLIENT_SECRET=${INJECT_FROM_SECRET_MANAGER}
-LLM_API_BASE=https://your-llm-gateway/engines/default
-LLM_MODEL=your-model
-LLM_VERIFY_SSL=true
-```
-
-### Kubernetes Access
-
-The local console can start without Kubernetes credentials. In that state the
-UI, API, agents, MCP gateway, and dry-run planning are available, while cluster
-tools return a clear `Kubernetes access is not configured` response.
-
-Native mode automatically reads `KUBECONFIG` or `~/.kube/config`:
-
-```bash
-./scripts/quickstart.sh --mode native
-```
-
-Docker mode intentionally does not mount host cluster credentials by default.
-For a real cluster, use the Kubernetes/Helm deployment below so the workloads
-receive a scoped ServiceAccount, or explicitly provide a read-only kubeconfig
-mount appropriate for your local cluster.
-
-## Docker
-
-The one-click command uses [`compose.yaml`](compose.yaml) automatically when
-Docker is available. The Compose service builds one image, runs the complete
-local service group, persists runtime state, and publishes only the console on
-the loopback interface.
-
-Direct Compose usage is also supported:
-
-```bash
-cp .env.example .env
-docker compose up -d --build
-docker compose ps
-```
-
-Or build and run the all-in-one image without Compose:
-
-```bash
-docker build --target backend-runtime -t flawless:latest .
-docker run --rm \
-  --env-file .env \
-  --add-host host.docker.internal:host-gateway \
-  -p 127.0.0.1:8080:8080 \
-  -v flawless-data:/var/lib/flawless \
-  flawless:latest
-```
-
-Push to GHCR or an internal registry:
-
-```bash
-IMAGE=ghcr.io/your-org/flawless:latest ./scripts/build-push.sh
-```
-
-For air-gapped or China mainland networks, the `Dockerfile` and `scripts/build-push.sh` already expose mirror build args:
-
-```bash
-NODE_IMAGE=docker.m.daocloud.io/library/node:24-slim \
-PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.13-slim \
-NPM_REGISTRY=https://registry.npmmirror.com \
-PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
-IMAGE=your-registry/flawless:latest \
-./scripts/build-push.sh
-```
-
-## Kubernetes Deployment
-
-### Recommended: Helm
-
-The chart installs the control plane, six agent services, controlled cluster-wide
-RBAC, Generic NAS persistence, NodePort access, optional Ingress, and Secret hooks:
-
-```bash
-kubectl create namespace k8s-agent
-
-helm upgrade --install flawless ./charts/flawless \
-  --namespace k8s-agent \
-  --set image.repository='<internal-registry>/flawless' \
-  --set image.tag='<release-tag>' \
-  --set persistence.storageClass=standard
-```
-
-Use `rbac.mode=controlled` in production. `rbac.mode=cluster-admin` exists only
-for isolated validation environments and should require a security exception.
-
-Render and review before deployment:
-
-```bash
-helm lint ./charts/flawless --strict
-helm template flawless ./charts/flawless -n k8s-agent > rendered.yaml
-```
-
-### Raw Manifests
-
-#### 1. Create Namespace
-
-```bash
-kubectl create namespace k8s-agent
-```
-
-#### 2. Create Secrets
-
-Do not commit real secrets. Create them from your terminal or secret manager:
-
-```bash
-kubectl -n k8s-agent create secret generic k8s-agent-oauth \
-  --from-literal=OAUTH_CLIENT_ID='<client-id>' \
-  --from-literal=OAUTH_CLIENT_SECRET='<client-secret>' \
-  --from-literal=RANCHER_TOKEN='<optional-rancher-token>'
-```
-
-For Langfuse:
-
-```bash
-kubectl -n k8s-agent create secret generic k8s-agent-langfuse \
-  --from-literal=public-key='<pk-lf-...>' \
-  --from-literal=secret-key='<sk-lf-...>'
-```
-
-Administrator configuration is disabled by default. The password must never be
-stored in `values.yaml`, a ConfigMap, or the repository:
-
-```bash
-kubectl -n k8s-agent create secret generic flawless-console-auth \
-  --from-literal=CONSOLE_BASIC_AUTH_USERNAME='admin' \
-  --from-literal=CONSOLE_BASIC_AUTH_PASSWORD='<password-from-vault>'
-
-helm upgrade --install flawless ./charts/flawless \
-  -n k8s-agent \
-  --reuse-values \
-  --set admin.enabled=true
-```
-
-When admin mode is off, the console remains readable and operational approvals
-continue to work, but model, knowledge, and Skill writes are blocked. When it is
-on, those three write surfaces require the Secret-backed administrator identity.
-
-#### 3. Configure Runtime
-
-Edit `manifests/deployment.yaml`:
-
-- `LLM_AUTH_TYPE`
-- `OAUTH_TOKEN_URL`
-- `LLM_API_BASE` / `LLM_GATEWAY_BASE`
-- `LLM_MODEL`
-- `PROMETHEUS_URL`
-- `CMDB_URL`
-- `RANCHER_URL`
-- `RANCHER_CLUSTER_IDS`
-- `ALLOWED_NAMESPACES`
-- `OPS_MUTATION_ENABLED`
-- `AUTO_HEALING_ENABLED`
-
-#### 4. Apply Manifests
-
-```bash
-kubectl apply -f manifests/rbac.yaml
-kubectl apply -f manifests/deployment.yaml
-kubectl apply -f manifests/frontend.yaml
-```
-
-The default service exposes the console through NodePort `30080`:
-
-```bash
-kubectl get svc -n k8s-agent
-```
-
-For production, use your company Ingress/Gateway with TLS and identity middleware instead of exposing an unauthenticated public NodePort.
-
-## Model Configuration
-
-CISRE supports two common model access patterns.
-
-### OAuth Token URL + Base URL
-
-Use this when your gateway requires a dynamic bearer token:
-
-```json
-[
-  {
-    "id": "primary",
-    "provider": "oauth-gateway",
-    "model": "your-model",
-    "base_url": "https://your-gateway/engines/default",
-    "auth_type": "oauth_client_credentials",
-    "token_url": "https://your-iam/token",
-    "client_id": "your-client",
-    "client_secret": "${INJECT_FROM_SECRET_MANAGER}",
-    "role": "primary",
-    "max_tokens": 4096,
-    "verify_ssl": true
-  }
-]
-```
-
-### Base URL + API Key
-
-Use this for OpenAI-compatible providers:
-
-```json
-[
-  {
-    "id": "openai-compatible",
-    "provider": "openai-compatible",
-    "model": "your-model",
-    "base_url": "https://api.example.com/v1",
-    "auth_type": "api_key",
-    "api_key": "${INJECT_FROM_SECRET_MANAGER}",
-    "role": "candidate",
-    "max_tokens": 4096
-  }
-]
-```
-
-Set the JSON in `MODEL_PROFILES_JSON` or add models from the **Model Lab** page. Secrets should come from Kubernetes Secret or your enterprise secret platform.
-
-## Langfuse
-
-Langfuse is optional. When configured, the platform records model calls, latency, token usage, cost estimates, tool spans, quality scores, and trace IDs.
-
-Environment variables:
-
-```env
-LANGFUSE_ENABLED=true
-LANGFUSE_HOST=http://langfuse-web.langfuse.svc.cluster.local:3000
-LANGFUSE_PUBLIC_KEY=
-LANGFUSE_SECRET_KEY=
-```
-
-Deployment references:
-
-- Docker Compose: https://langfuse.com/self-hosting/deployment/docker-compose
-- Kubernetes Helm: https://langfuse.com/self-hosting/deployment/kubernetes-helm
-
-Self-hosted Langfuse credentials and storage settings must be managed in a separate, access-controlled deployment repository or Secret Manager.
-
-## Custom Algorithm Extension
-
-The public repository includes a runnable baseline algorithm module at `agents/aiops_algorithms.py`.
-
-If you have a custom scoring implementation, keep it outside the repository and load it at runtime:
-
-```bash
-export FLAWLESS_CUSTOM_ALGORITHM_PATH=.local/custom_algorithms/aiops_algorithms_custom.py
-uvicorn backend.app.main:app --host 0.0.0.0 --port 8080
-```
-
-Docker:
-
-```bash
-docker run --rm \
-  --env-file .env \
-  -e FLAWLESS_CUSTOM_ALGORITHM_PATH=/var/lib/flawless-custom/aiops_algorithms_custom.py \
-  -v "$PWD/.local/custom_algorithms:/var/lib/flawless-custom:ro" \
-  -p 8080:8080 \
-  flawless:latest \
-  python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8080
-```
-
-Kubernetes:
-
-```bash
-kubectl -n k8s-agent create secret generic flawless-custom-algorithms \
-  --from-file=aiops_algorithms_custom.py=.local/custom_algorithms/aiops_algorithms_custom.py
-kubectl rollout restart deploy/flawless -n k8s-agent
-kubectl rollout restart deploy/k8s-agent-api -n k8s-agent
-```
-
-If the secret is absent, the platform still runs with the open baseline.
-
-To explicitly test the open baseline path:
-
-```bash
-FLAWLESS_DISABLE_CUSTOM_ALGORITHMS=1 uvicorn backend.app.main:app --host 0.0.0.0 --port 8080
-```
-
-## Skills
-
-Skills are portable operational knowledge packages. They describe:
-
-- symptoms and trigger conditions;
-- required evidence;
-- allowed objects;
-- allowed actions;
-- recovery criteria;
-- rollback guidance;
-- optional references and runbooks.
-
-Skills are stored under `OPS_SKILL_ROOT` and can be created from the console. They are intentionally portable so they can be reused by other agents or moved between environments.
-
-Each Skill is persisted as an independent package directory, rather than being
-compiled into the application. This keeps the Skill repository separately
-versionable, reviewable, exportable, and reusable by other compatible agents.
-
-## Unified Resource API
-
-`GET /api/resources` exposes Kubernetes, databases, virtual machines,
-middleware, storage, and cloud resources through one stable contract:
+任何真实变更必须经过：
 
 ```text
-GET /api/resources?resource_type=pod&cluster=prod&namespace=orders&limit=200
+typed action → policy / blast radius → human approval → executor
+             → same-target readback → recovery verifier → record
 ```
 
-The response uses contract `flawless.resource.v1`, includes source and health
-summaries, and supports cursor pagination. New infrastructure teams should add
-an adapter and normalize into this contract instead of introducing a parallel
-resource API.
+外置插件不能直接取得 `kubernetes:mutate`、`ops:execute`、`secrets:read`，也不能把任意 Bash、SQL 或 HTTP mutation 注入 API 进程。
 
-## Safety Model
+## 插件中心怎么用
 
-The platform is designed around least privilege:
+进入 **平台能力 → 插件中心**：
 
-- no browser-side shell or arbitrary command execution;
-- no mutation unless server switches allow it;
-- high-risk actions require explicit operator confirmation;
-- action catalog limits what the model can request;
-- namespace/workload scope is controlled by RBAC and allowlists;
-- every change records preview, actor, diff, result, and verification status;
-- secrets are never committed and should be supplied through Kubernetes Secret or a secret manager.
+1. 点击插件卡片查看触发条件、提供/依赖服务、事件模式、权限边界和最近调用。
+2. 点击“新建插件”，选择数据库、VM、存储等领域模板，用表单生成 Manifest。
+3. 或在“AI 辅助开发”中描述目标，让当前兼容模型生成草案。
+4. 检查生成的 `provides`、`requires`、权限、Agent Loop 和安全边界。
+5. 先校验，再安装/热重载；生产页面写入默认关闭，需要平台配置显式开启。
 
-## Repository Layout
+模型生成的只是声明式草案，必须通过 Schema 和权限校验，不会自动获得凭据或执行权。
+
+## 领域团队最小交付物
+
+数据库、VM、存储、中间件、云资源或网络团队无需修改核心代码，应交付：
 
 ```text
-Flawless/
-├── agents/                  # SRE workflow agents and execution engines
-├── backend/app/             # Control plane API, schemas, services, domain logic
-├── mcp_servers/             # Kubernetes MCP tools
-├── cmdb/                    # Local CMDB/topology service
-├── cloud/                   # Cloud and infrastructure adapter contracts
-├── frontend/modern/         # React + TypeScript + Vite console
-├── charts/flawless/      # Production Helm chart
-├── manifests/               # Kubernetes manifests
-├── scripts/                 # Build and image helper scripts
-├── docs/                    # Architecture and maintainer documentation
-├── examples/                # Sample alerts
-└── tests/                   # Backend and workflow tests
+team-<domain>-sre-plugin/
+├── manifest.yaml                 # ID、SemVer、provides/requires、权限与事件
+├── provider/                     # 独立只读 discover/evidence/verify 服务
+├── skills/<incident>/SKILL.md    # 触发、证据、根因、动作、回滚、成功判据
+├── action-catalog.yaml           # 类型化动作；禁止任意 Shell/SQL
+├── contract-tests/               # 成功、超时、权限拒绝、回滚和验证
+└── README.md                     # 范围、限制、值班归属与兼容性
 ```
 
-## Development
+推荐开发顺序：
+
+1. 定义资源、证据和验证合同。
+2. 实现只读 Provider；无凭据、超时和上游 5xx 时 fail-closed。
+3. 编写一个问题一个 Skill，先匹配一个主 Skill，只有明确跨域依赖时再串行组合辅助 Skill。
+4. 把真实操作映射为受控动作 ID，不接受任意命令。
+5. 实现变更后的重新取证、业务探针和稳定窗口。
+6. 用故障注入或沙箱目标证明完整闭环，再申请生产启用。
+
+详见：
+
+- [插件开发与运行手册](docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md)
+- [插件团队接入手册](docs/PLUGIN_TEAM_ONBOARDING_ZH.md)
+- [代码架构、团队协作与扩展指南](docs/TEAM_ARCHITECTURE_AND_EXTENSION_GUIDE_ZH.md)
+- [Harness 适配设计](docs/DEEPSEEK_HARNESS_INTEGRATION_ZH.md)
+- [Plugin-first 重构路线](docs/PLUGIN_FIRST_REFACTOR_ROADMAP_ZH.md)
+- [企业平台评审材料](docs/CISRE_ENTERPRISE_OPS_PLATFORM.pptx)
+
+## 代码架构
+
+```text
+frontend/modern/src/              React/TypeScript 控制台
+backend/app/api/features/         API 路由边界
+backend/app/services/             编排、Harness、状态与通用服务
+backend/app/adapters/<domain>/    数据库/VM/存储/中间件/云只读适配
+plugins/                          团队维护的公共/领域插件与模板
+agents/                           模型推理；不持有写权限
+mcp_servers/                      Kubernetes 类型化工具与执行边界
+manifests/ charts/ deploy/        Kubernetes 发布与可选组件
+tests/                            合同、回归和闭环测试
+docs/                             架构、插件、部署与团队手册
+```
+
+不要向 `backend/app/application.py` 继续堆厂商 SDK 或新业务分支。新能力应先定义合同，再落入 `services/` 或 `adapters/<domain>/`，通过 `api/features/` 暴露，并补充失败、超时与脱敏测试。
+
+## 核心稳定与规模化
+
+核心通过 `cisre.kernel.ports/v1` 固定四个可替换端口：追加式 Event Journal、带 fencing token 的分布式 Lease、持久 Job Queue、支持 CAS 的 Snapshot Store。Agent、插件和 Skill 只依赖这些合同，不依赖 PostgreSQL、Redis、Kafka 等具体实现。
+
+```http
+GET /api/harness/scalability
+```
+
+当前默认文件/进程内后端适合单副本；页面会明确显示 `Single replica`，不会把它误报为分布式就绪。业务量上升前，按同一 Port 换成事务事件存储、分布式租约、持久队列和事务快照，再水平扩展无状态 API/Worker。多副本却仍使用本地后端时，就绪检查会返回明确违规项。
+
+规模化不改变以下稳定语义：每个变更有幂等键、同一目标只有带最新 fencing token 的 Worker 能提交、队列有界且用背压代替虚假的“运维过载”、事件可重放、读模型可重建、插件协议按版本兼容。
+
+## 本地开发
+
+后端：
 
 ```bash
-python -m compileall -q backend agents mcp_servers cmdb cloud a2a openwebui
-python -m unittest discover -s tests -v
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pytest tests
+python scripts/run_local_stack.py --host 127.0.0.1 --api-port 8080
+```
+
+前端：
+
+```bash
+cd frontend/modern
+npm ci
+npm run dev
+npm run build
+```
+
+提交前至少执行：
+
+```bash
+python -m pytest tests
 cd frontend/modern && npm run build
 ```
 
-Run the security gate locally:
+## Kubernetes 配置原则
+
+- 集群可从 Rancher 配置或页面粘贴/上传 kubeconfig 纳管。
+- 凭据必须通过 Kubernetes Secret、工作负载身份或企业凭据服务注入。
+- ConfigMap 只放非敏感配置；源码、Fixture、日志、事件和提交历史不得出现 Token、密码、私钥、内网地址或 kubeconfig。
+- 生产开启插件页面写入前，先配置持久卷、权限策略、签名摘要、网络白名单和回滚方案。
+- 所有 mutation 继续使用逐项人工审批，不允许模型、浏览器或外置插件直接执行任意命令。
+
+## 团队协作
+
+建议使用短生命周期分支和 Merge Request：
 
 ```bash
-python -m pip install pip-audit
-pip-audit -r requirements.lock --no-deps --disable-pip
+git checkout -b feature/<team>-<capability>
+git add <changed-files>
+git commit -m "feat(<domain>): add <capability> plugin"
+git push -u origin feature/<team>-<capability>
 ```
 
-## GitHub
+Merge Request 应附：合同变化、权限清单、失败路径、回滚方式、测试结果、闭环证据和文档更新。破坏性协议变化必须新增并行 v2，不能静默改变 v1 语义。
 
-The public engineering baseline lives at
-[`your-org/Flawless`](https://github.com/your-org/Flawless). Custom algorithm
-extensions, credentials, production topology, and company data are loaded at
-runtime and are intentionally excluded from the public repository.
+## 安全红线
 
-## Roadmap
-
-CISRE is designed to grow from a Kubernetes SRE console into an AgenticOps operating system for modern infrastructure.
-
-- **Kubernetes Autopilot**: cover the full lifecycle from alert, evidence, root-cause analysis, remediation preview, approval, execution, rollback, and recovery verification.
-- **Rancher Multi-Cluster Fleet**: make every cluster, namespace, workload, event, metric, and operation record searchable and governable from one control plane.
-- **Full-Stack Infrastructure Operations**: extend the same evidence-to-action loop to databases, virtual machines, storage, middleware, ingress, service mesh, and hybrid-cloud resources.
-- **Runtime Data-Flow Intelligence**: fuse Kubernetes inventory, CMDB, Prometheus, Loki, Tempo, and eBPF flow data into a living dependency graph that explains impact, blast radius, and traffic direction.
-- **Release Governance Control Plane**: turn SLO, error budget, canary scope, image risk, YAML policy, topology risk, and emergency repair paths into a programmable release gate.
-- **Operations Skills Network**: let engineers package hard-won troubleshooting experience as portable Skills, so the platform becomes stronger every time an incident is solved.
-- **Model Benchmark Arena**: evaluate different models by remediation success rate, MTTR reduction, safety score, evidence quality, token cost, and rollback correctness.
-- **Digital Twin for Change Risk**: simulate changes against topology, historical incidents, dependency paths, and SLO budgets before production is touched.
-- **100k-Node Scale Architecture**: move heavy discovery to event-driven collectors, sharded caches, async job queues, streaming evidence pipelines, and pluggable stores.
-- **Enterprise Trust Layer**: ship production Helm charts, air-gapped packages, OIDC/SSO, RBAC presets, audit retention, policy-as-code, secret-manager integration, and compliance reports.
-- **Cloud & Edge Expansion**: add first-class adapters for Alibaba Cloud, Generic Cloud, Tencent Cloud, AWS, Azure, private cloud, edge clusters, and cross-region disaster recovery.
-- **Self-Healing Platform Runtime**: let the platform inspect and repair its own agents, collectors, queues, stores, and integrations under strict approval and audit boundaries.
-
-## License
-
-This project is released under the standardized
-[PolyForm Noncommercial License 1.0.0](LICENSE).
-
-You may use, study, modify, and redistribute the source code for non-commercial purposes. Commercial use, hosted commercial services, resale, enterprise product bundling, and paid support services require prior written authorization from the project maintainers.
-
-This is a standardized source-available non-commercial license, not an
-OSI-approved open-source license. Commercial authorization requests can be sent
-to the repository owner through GitHub.
+- 不在代码、文档、Fixture、日志或 Git 历史中保存凭据、内网 URL/IP、个人数据。
+- 不让模型输出直接成为执行指令；必须归一化为类型化动作。
+- 不让插件绕过审批、目标冻结、写后回读和恢复验证。
+- 不把外置动态代码的 VM 当作安全边界；高权限 Provider 必须独立进程/容器隔离。
+- 不以 HTTP 2xx、命令退出码 0 或模型结论冒充恢复成功。

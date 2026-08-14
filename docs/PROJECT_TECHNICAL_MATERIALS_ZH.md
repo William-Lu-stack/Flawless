@@ -27,7 +27,7 @@ Flawless 是面向 Kubernetes、Rancher 和扩展基础设施的 AI 原生 SRE �
 
 - 通过 Rancher Token 纳管多集群。
 - 通过 Web 上传或粘贴 kubeconfig 直接纳管 Kubernetes 集群，并支持删除。
-- SRE 对话和 AI 巡检复用同一套核心诊断、Skill 路由、审批、执行和验证能力。
+- SRE Run 和 AI 巡检复用同一套核心诊断、Skill 路由、审批、执行和验证能力。
 - 优先读取 ERROR、FATAL、PANIC、WARNING、previous/current logs，再按需补充 Pod YAML、Events、Workload、PVC/PV、节点、拓扑和 CMDB 证据。
 - 动态匹配一个最高效用主 Skill；只有存在明确跨域依赖和证据门禁时才串行追加辅助 Skill。
 - 支持 Deployment、StatefulSet、DaemonSet、Job、CronJob、独立 Pod，以及 ConfigMap、Secret、PV、PVC、Service、HPA、PDB 等资源变更。
@@ -55,7 +55,7 @@ Flawless 是面向 Kubernetes、Rancher 和扩展基础设施的 AI 原生 SRE �
 
 ```mermaid
 flowchart TD
-    UI["React 运维控制台<br/>SRE 对话 / 巡检 / 拓扑 / Skills / 发布治理"]
+    UI["React 运维控制台<br/>SRE Run / 巡检 / 拓扑 / Skills / 发布治理"]
     API["FastAPI 控制面<br/>任务状态机 / 审批 / 审计 / 资源 API"]
     EVIDENCE["证据流水线<br/>Logs / Pod YAML / Events / Workload / PVC-PV / Node"]
     PLAN["诊断与规划<br/>LangGraph SRE Flow + LLM + EvidenceRunbookEngine"]
@@ -91,13 +91,13 @@ flowchart TD
 ### 3.2 控制面 API
 
 - 技术栈：Python、FastAPI、Pydantic、Uvicorn、httpx。
-- 提供集群纳管、资源目录、SRE 对话、AI 巡检、运维任务、审批、Skills、模型配置、知识库、发布治理、拓扑和观测接口。
+- 提供集群纳管、资源目录、SRE Run、AI 巡检、运维任务、审批、Skills、模型配置、知识库、发布治理、拓扑和观测接口。
 - 运维任务以同一事故 lineage 串联多轮方案，保存已尝试动作、Skill、变更指纹和失败验证结果。
 - API 副本当前要求保持 1；在引入分布式执行租约前，不把进程内协程映射声明为多副本安全。
 
 ### 3.3 Agent 与规划层
 
-- `agents/sre_graph.py`：SRE 对话诊断图和模型降级逻辑。
+- `agents/sre_graph.py`：SRE Run 诊断图和模型降级逻辑。
 - `agents/remediation_engine.py`：EvidenceRunbookEngine，根据 Kubernetes 证据产生候选根因、取证步骤、动作和恢复判据。
 - `backend/app/services/ops_skill_registry.py`：Skill 包加载、语义/证据/历史成效联合评分和生命周期统计。
 - `backend/app/services/ops_skill_runtime.py`：把已选中的内置可执行 Skill 物化为具体变更。
@@ -329,7 +329,7 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 - 双入口纳管兼容性：页面可选择 Rancher URL/Token 或 kubeconfig；已有 ConfigMap/Secret Rancher 配置在仅替换镜像时保持默认生效，页面新配置验证成功后才加密覆盖，删除覆盖后自动回退。
 - 状态感知日志证据：容器尚未启动时不再把 Kubernetes log HTTP 400 当作终点，保留 waiting reason/message，并在 Workload 范围内补采证据优先级最高的异常 Pod current/previous 日志。
 - eBPF/Beyla 拓扑：兼容 `namespace/pod/container` 与 `namespace_name/pod_name/container_name` 标签、纯文本与 JSON 包装 flow 日志；CMDB 降级时仍融合真实观测边。
-- 信息架构：核心入口收敛为 SRE 对话、AI 巡检、拓扑影响、Skill 库；运行总览、资源事件和运维成效归入平台能力。
+- 信息架构：核心入口收敛为 SRE Run、AI 巡检、拓扑影响、Skill 库；运行总览、资源事件和运维成效归入平台能力。
 
 ## 9. 项目过程中使用的工具
 
@@ -378,7 +378,7 @@ tests/                   单元、状态机和真实 Kubernetes E2E
 ### 10.1 推荐演示脚本
 
 1. 打开一个因 securityContext 不匹配而 CrashLoop 的 Deployment。
-2. 在 SRE 对话或巡检中发起深度分析。
+2. 在 SRE Run 或巡检中发起深度分析。
 3. 展示 ERROR/WARNING、Pod YAML、Workload 和存储证据。
 4. 展示 LLM 已返回、Skill Router 已完成和主 Skill。
 5. 核对第一轮非 root Patch 并人工批准。

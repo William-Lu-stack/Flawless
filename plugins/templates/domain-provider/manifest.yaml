@@ -1,0 +1,28 @@
+apiVersion: cisre.io/v1alpha1
+kind: HarnessPlugin
+metadata:
+  name: team.network-observer
+  version: 0.1.0
+spec:
+  category: domain
+  domains: [network]
+  agents: [network]
+  scope: global
+  provides:
+    - {name: inventory.network, version: 1.0.0}
+    - {name: evidence.network, version: 1.0.0}
+    - {name: verification.network, version: 1.0.0}
+  requires:
+    - {name: session.events, constraint: ">=1.0,<2"}
+  events:
+    - {name: inventory/discovered, mode: observe}
+    - {name: evidence/collected, mode: observe}
+    - {name: recovery/verified, mode: observe}
+  permissions: [service:provide, inventory:read, evidence:read, events:publish]
+  runtime:
+    type: remote
+    endpoint: http://network-provider.cisre.svc.cluster.local:9000/invoke
+    operations:
+      - {id: discover, read_only: true}
+      - {id: collect_evidence, read_only: true}
+      - {id: verify, read_only: true}

@@ -7,7 +7,7 @@
 ```mermaid
 flowchart TB
   subgraph UX["体验层 · CISRE Console"]
-    CHAT["SRE 对话"]
+    CHAT["SRE Run"]
     INSPECT["AI 巡检"]
     TOPO["3D 拓扑 / 爆炸半径"]
     SKILLS["Skill 库 / 成效 Records"]

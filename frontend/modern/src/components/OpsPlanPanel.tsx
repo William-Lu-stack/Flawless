@@ -147,6 +147,27 @@ function eventIcon(event: any, active: boolean) {
   return <Clock3 size={12} />;
 }
 
+function traceKind(event: any) {
+  const text = `${event?.type || ""} ${event?.stage || ""} ${event?.phase || ""} ${event?.tool || ""}`.toLowerCase();
+  if (/approval|approved|pre-execute/.test(text)) return "APPROVAL";
+  if (/recovery|verify|verification|readback|rollout/.test(text)) return "VERIFY";
+  if (/bash|shell|execute|change|mutation|patch|tool/.test(text)) return "TOOL";
+  if (/skill/.test(text) || String(event?.plugin_id || "").includes("skill")) return "SKILL";
+  if (/llm|diagnos|root_cause|planning|reason/.test(text)) return "THINK";
+  if (/evidence|collect|context|log|event|inventory/.test(text)) return "CONTEXT";
+  if (/goal|round|agent|job|fork|resume|child/.test(text)) return "AGENT";
+  return "EVENT";
+}
+
+function tracePlugin(event: any) {
+  if (event?.plugin_id) return String(event.plugin_id);
+  return ({
+    CONTEXT: "cisre.context-compaction", THINK: "cisre.deepseek-planner", SKILL: "cisre.skill-router",
+    APPROVAL: "cisre.approval-gate", TOOL: "cisre.kubernetes-executor", VERIFY: "cisre.recovery-verifier",
+    AGENT: "cisre.goal-round-driver", EVENT: "cisre.session-events",
+  } as Record<string, string>)[traceKind(event)];
+}
+
 function phaseIndex(stage: unknown) {
   const value = String(stage || "");
   if (["queued", "starting", "attempt", "release_gate", "collecting_priority_logs", "pod_logs_collected", "pod_logs_unavailable", "collecting_evidence", "collecting_evidence_done"].includes(value)) return 0;
@@ -185,6 +206,8 @@ function changeLabel(change: any) {
     vm_reboot: "重启虚拟机", vm_expand_disk: "扩容虚拟机磁盘",
     vm_run_approved_script: "执行批准主机脚本", vm_snapshot: "创建虚拟机快照",
     middleware_rebalance: "中间件重平衡", storage_expand_volume: "扩容企业存储卷",
+    network_apply_policy: "调整网络策略", network_switch_route: "切换网络路由",
+    network_update_load_balancer: "调整负载均衡 / DNS", network_restore_interface: "恢复接口 / 链路",
     infra_run_approved_action: "基础设施批准动作",
   };
   return labels[String(change?.type || "")] || change?.type || "基础设施变更";
@@ -513,7 +536,7 @@ export function OpsJobProgress({
         <p>{pendingApproval.reason || "等待操作员确认本步骤。"}</p>
         <div className="ops-step-rollback"><span>回滚方式</span><b>{pendingApproval.rollback || "恢复变更前配置"}</b></div>
         {(pendingApproval.patch || pendingApproval.manifest) && <details open><summary>查看本步骤配置差异</summary><pre>{compactJson(pendingApproval.patch || pendingApproval.manifest, 5000)}</pre></details>}
-        {pendingApproval.command && <details open><summary>待执行完整命令</summary><pre>{compactJson(pendingApproval.command, 20000)}</pre><small>目标：{pendingApproval.node_name ? `Node/${pendingApproval.node_name}` : pendingApproval.pod_name ? `Pod/${pendingApproval.pod_name}${pendingApproval.container_name ? `/${pendingApproval.container_name}` : ""}` : "SRE initiate runtime"} · 超时 {pendingApproval.timeout_seconds || 120}s</small></details>}
+        {pendingApproval.command && <details open><summary>待执行完整命令</summary><pre>{compactJson(pendingApproval.command, 20000)}</pre><small>目标：{pendingApproval.node_name ? `Node/${pendingApproval.node_name}` : pendingApproval.pod_name ? `Pod/${pendingApproval.pod_name}${pendingApproval.container_name ? `/${pendingApproval.container_name}` : ""}` : "CISRE runtime"} · 超时 {pendingApproval.timeout_seconds || 120}s</small></details>}
         <small>审批凭据 {String(pendingApproval.approval_id || "").slice(-12)} · 变更指纹 {pendingApproval.change_fingerprint}</small>
         <label><input type="checkbox" checked={stepApprovalChecked} onChange={(event) => setStepApprovalChecked(event.target.checked)} />我已核对本步骤的目标、差异、风险和回滚方式</label>
         <button className="primary" onClick={approveStep} disabled={!stepApprovalChecked || stepApprovalBusy}><ShieldCheck size={14} />{stepApprovalBusy ? "正在提交确认..." : `确认执行第 ${pendingApproval.change_index} 步`}</button>
@@ -550,6 +573,7 @@ export function OpsJobProgress({
               <div>
                 <header><strong>{stageLabel(event.stage)}</strong><small>{formatTime(event.timestamp)}</small></header>
                 <p>{event.message || "-"}</p>
+                <div className="ops-event-trace"><b>{traceKind(event)}</b><code>{tracePlugin(event)}</code>{(event.tool || event.data?.model_profile_id) && <code>{event.tool || `model:${event.data.model_profile_id}`}</code>}</div>
                 {renderEventDetails(event)}
               </div>
             </div>

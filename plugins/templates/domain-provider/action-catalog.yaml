@@ -1,0 +1,15 @@
+apiVersion: cisre.io/v1alpha1
+kind: DomainActionCatalog
+metadata:
+  name: team.network-actions
+  version: 0.1.0
+spec:
+  domain: network
+  executorRef: network-approved-executor
+  actions:
+    - id: network_switch_route
+      risk: high
+      requiresHumanApproval: true
+      requiredEvidence: [network_topology, network_routing, network_recent_changes]
+      rollback: restore_previous_route_snapshot
+      verify: [network_path_reachable, business_probe_ok]

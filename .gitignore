@@ -38,6 +38,7 @@ public/
 *.zip
 *.tar
 *.tar.gz
+*.pptx.inspect.ndjson
 
 manifests/secrets.yaml
 manifests/langfuse-local.yaml

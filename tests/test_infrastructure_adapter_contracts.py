@@ -18,6 +18,8 @@ from backend.app.adapters.registry import InfrastructureAdapterRegistry
 from backend.app.adapters import ADAPTER_REGISTRY
 from backend.app.api.features.operations import build_router as build_operations_router
 from backend.app.services.infrastructure_providers import discover_adapter_resources
+from backend.app.services.infrastructure_providers import RESOURCE_TYPE_CATALOG
+from agents.remediation_engine import ACTION_CATALOG
 
 
 class _DatabaseAdapter:
@@ -95,7 +97,7 @@ class InfrastructureAdapterContractTests(unittest.TestCase):
         self.assertEqual(ids[0], "kubernetes")
         self.assertEqual(
             set(ids),
-            {"kubernetes", "database", "virtual_machine", "storage", "middleware", "cloud_service"},
+            {"kubernetes", "database", "virtual_machine", "storage", "middleware", "cloud_service", "network"},
         )
         database = next(item for item in payload["domains"] if item["id"] == "database")
         self.assertEqual(database["status"], "configured")
@@ -112,6 +114,23 @@ class InfrastructureAdapterContractTests(unittest.TestCase):
         self.assertEqual(domains["contract_version"], "cisre.operations.domain-catalog/v1")
         contracts = asyncio.run(server.infrastructure_adapter_contracts())
         self.assertEqual(contracts["contract_version"], ADAPTER_CONTRACT_VERSION)
+
+    def test_network_domain_exposes_typed_operations_not_arbitrary_commands(self):
+        network = next(item for item in RESOURCE_TYPE_CATALOG if item["id"] == "network")
+        self.assertIn("network_topology", network["evidence"])
+        self.assertEqual(
+            set(network["typical_actions"]),
+            {
+                "network_apply_policy",
+                "network_switch_route",
+                "network_update_load_balancer",
+                "network_restore_interface",
+            },
+        )
+        for action in network["typical_actions"]:
+            self.assertIn(action, ACTION_CATALOG)
+            self.assertEqual(ACTION_CATALOG[action]["risk"], "high")
+            self.assertFalse(ACTION_CATALOG[action]["auto_allowed"])
 
     def test_registered_adapter_is_reachable_through_discovery_service(self):
         adapter = _DatabaseAdapter()

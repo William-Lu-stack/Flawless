@@ -1,14 +1,14 @@
-# SRE initiate 插件团队接入手册
+# CISRE 插件团队接入手册
 
-本文给数据库、VM/主机、存储、中间件和云平台团队使用。目标不是让各团队修改 SRE initiate 核心，而是独立交付一个 Provider 插件、一组 Skills 和一个受控执行适配器。
+本文给数据库、VM/主机、存储、中间件、云平台和网络团队使用。目标不是让各团队修改 CISRE 核心，而是独立交付一个 Provider 插件、一组 Skills 和一个受控执行适配器。
 
 ## 1. 与官方 DeepSeek Harness 的对应关系
 
-SRE initiate 采用官方 DeepSeek Harness 的关键组合原则：Everything is a Plugin、Service Definition / Provider / Consumer 能力 seam、`provides` / `requires` 依赖注入、事件驱动、可逆生命周期、Profile / Bundle / Patch、热重载和仅追加会话事实流。
+CISRE 采用官方 DeepSeek Harness 的关键组合原则：Everything is a Plugin、Service Definition / Provider / Consumer 能力 seam、`provides` / `requires` 依赖注入、事件驱动、可逆生命周期、Profile / Bundle / Patch、热重载和仅追加会话事实流。
 
 生产 SRE 场景额外收紧了两条边界：
 
-- 官方动态包使用 JavaScript VM，但官方也明确说明 VM 不是安全边界；SRE initiate 不把外置代码动态导入 API 进程，只接受声明式插件或隔离的远程只读 Provider。
+- 官方动态包使用 JavaScript VM，但官方也明确说明 VM 不是安全边界；CISRE 不把外置代码动态导入 API 进程，只接受声明式插件或隔离的远程只读 Provider。
 - 插件没有 Kubernetes、数据库或主机的直接写权限。真实变更必须经过 typed action、策略、逐项人工审批、受控执行器、同目标回读和恢复验证。
 
 因此，团队开发体验保持“加插件、不改核心”，而生产执行权不会随插件一起扩散。
@@ -33,7 +33,7 @@ team-<domain>-sre-plugin/
 
 每项能力都按三个角色设计：
 
-| 角色 | 团队负责 | SRE initiate 负责 |
+| 角色 | 团队负责 | CISRE 负责 |
 |---|---|---|
 | Service Definition | 稳定数据合同和 SemVer | 依赖解析与兼容门禁 |
 | Provider | 厂商 API、指标和领域知识 | 生命周期、作用域、超时、审计 |
@@ -51,6 +51,9 @@ metadata:
   version: 1.0.0
   description: Database inventory, evidence and verification provider.
 spec:
+  category: domain
+  domains: [database]
+  agents: [database]
   scope: global
   priority: 50
   provides:
@@ -107,7 +110,7 @@ runtime:
 - 类型化动作：`db_kill_session`、`db_apply_parameter_profile`、`db_failover`、`db_expand_storage` 等审批动作 ID；
 - 验证：连接率回落、阻塞链消失、复制延迟回归、空间高水位解除、业务探针恢复且稳定窗口通过。
 
-动作参数只能引用审批后的 profile、session ID 或资源 ID，不能传任意 SQL。数据库组的执行服务接收 `INFRASTRUCTURE_ACTION_WEBHOOK_URL` 发来的已审批合同，返回 `audit_id`、脱敏 evidence 和 rollback_hint；SRE initiate 随后再次调用数据库 Provider 验证。
+动作参数只能引用审批后的 profile、session ID 或资源 ID，不能传任意 SQL。数据库组的执行服务接收 `INFRASTRUCTURE_ACTION_WEBHOOK_URL` 发来的已审批合同，返回 `audit_id`、脱敏 evidence 和 rollback_hint；CISRE 随后再次调用数据库 Provider 验证。
 
 ## 6. VM/主机组怎么做
 
@@ -133,6 +136,8 @@ VM 插件不能接收任意 Shell。真实执行由堡垒机、Ansible/AWX、Sal
 6. `success_criteria`、稳定窗口和未恢复时的换路策略。
 
 路由默认先选一个最高匹配主 Skill；只有主 Skill 明确缺少另一个领域能力时，才串行组合辅助 Skill。调用次数按一次实际执行链记录，而不是按 UI 刷新或候选匹配次数累计。
+
+网络团队按相同合同接入：Provider 至少提供拓扑、接口/链路状态、丢包/时延、路由、DNS、负载均衡、ACL/安全策略和最近变更证据；动作使用 `network_apply_policy`、`network_switch_route`、`network_update_load_balancer` 等类型化 ID，禁止任意设备命令；验证必须重新读取路径、策略命中、链路质量和业务连通性。
 
 ## 8. 本地与联调验收
 

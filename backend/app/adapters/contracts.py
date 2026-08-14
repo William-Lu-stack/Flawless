@@ -18,7 +18,7 @@ RESOURCE_CONTRACT_VERSION = "cisre.infrastructure.resource/v1"
 EVIDENCE_CONTRACT_VERSION = "cisre.infrastructure.evidence/v1"
 VERIFICATION_CONTRACT_VERSION = "cisre.infrastructure.verification/v1"
 SUPPORTED_DOMAINS = {
-    "database", "virtual_machine", "storage", "middleware", "cloud_service",
+    "database", "virtual_machine", "storage", "middleware", "cloud_service", "network",
 }
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,95}$")
 _SENSITIVE_FIELD_PATTERN = re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)")
