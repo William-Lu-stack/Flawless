@@ -316,10 +316,83 @@ export function InfrastructurePage({
   </div>;
 }
 
+const HARNESS_PLUGIN_TEMPLATES = {
+  database: `apiVersion: cisre.io/v1alpha1
+kind: HarnessPlugin
+metadata:
+  name: team.database-provider
+  version: 1.0.0
+  description: Database inventory, evidence and recovery verification provider.
+spec:
+  scope: global
+  priority: 50
+  provides:
+    - {name: inventory.database, version: 1.0.0}
+    - {name: evidence.database, version: 1.0.0}
+    - {name: verification.database, version: 1.0.0}
+  requires:
+    - {name: session.events, constraint: ">=1.0,<2"}
+  events:
+    - {name: inventory/discovered, mode: observe}
+  permissions: [service:provide, inventory:read, evidence:read, events:publish, ops:propose, ui:contribute]
+  runtime: {type: declarative}
+  config: {adapter_contract: database/v1}
+  ui: {group: database, title: Database SRE Provider}
+`,
+  virtual_machine: `apiVersion: cisre.io/v1alpha1
+kind: HarnessPlugin
+metadata:
+  name: team.vm-provider
+  version: 1.0.0
+  description: VM inventory, evidence and recovery verification provider.
+spec:
+  scope: global
+  priority: 50
+  provides:
+    - {name: inventory.virtual-machine, version: 1.0.0}
+    - {name: evidence.virtual-machine, version: 1.0.0}
+    - {name: verification.virtual-machine, version: 1.0.0}
+  requires:
+    - {name: session.events, constraint: ">=1.0,<2"}
+  events:
+    - {name: inventory/discovered, mode: observe}
+  permissions: [service:provide, inventory:read, evidence:read, events:publish, ops:propose, ui:contribute]
+  runtime: {type: declarative}
+  config: {adapter_contract: virtual-machine/v1}
+  ui: {group: virtual-machine, title: VM SRE Provider}
+`,
+  storage: `apiVersion: cisre.io/v1alpha1
+kind: HarnessPlugin
+metadata:
+  name: team.storage-provider
+  version: 1.0.0
+  description: Storage inventory, evidence and recovery verification provider.
+spec:
+  scope: global
+  priority: 50
+  provides:
+    - {name: inventory.storage, version: 1.0.0}
+    - {name: evidence.storage, version: 1.0.0}
+    - {name: verification.storage, version: 1.0.0}
+  requires:
+    - {name: session.events, constraint: ">=1.0,<2"}
+  events:
+    - {name: inventory/discovered, mode: observe}
+  permissions: [service:provide, inventory:read, evidence:read, events:publish, ops:propose, ui:contribute]
+  runtime: {type: declarative}
+  config: {adapter_contract: storage/v1}
+  ui: {group: storage, title: Storage SRE Provider}
+`,
+};
+
 function HarnessConsole({ capabilities, refreshCapabilities }: { capabilities: any; refreshCapabilities: () => void }) {
-  const [view, setView] = useState<"runtime" | "services" | "sessions" | "security">("runtime");
+  const [view, setView] = useState<"runtime" | "services" | "author" | "sessions" | "security">("runtime");
   const [selectedProfile, setSelectedProfile] = useState("");
   const [selectedSession, setSelectedSession] = useState("");
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [pluginSource, setPluginSource] = useState(() => HARNESS_PLUGIN_TEMPLATES.database);
+  const [addToProfile, setAddToProfile] = useState(true);
+  const [validation, setValidation] = useState<ApiState<any>>({ loading: false });
   const [action, setAction] = useState<ApiState<any>>({ loading: false });
   const [profiles, refreshProfiles] = useAsync<any>(() => apiGet("/api/harness/profiles"), []);
   const [sessions, refreshSessions] = useAsync<any>(() => apiGet("/api/harness/sessions?limit=80"), []);
@@ -357,12 +430,27 @@ function HarnessConsole({ capabilities, refreshCapabilities }: { capabilities: a
       if (data.session_id) setSelectedSession(data.session_id);
     } catch (error: any) { setAction({ loading: false, error: error.message }); }
   }
+  async function validatePlugin() {
+    setValidation({ loading: true });
+    try { setValidation({ loading: false, data: await apiPost("/api/harness/plugins/validate", { manifest: pluginSource, add_to_active_profile: addToProfile }) }); }
+    catch (error: any) { setValidation({ loading: false, error: error.message }); }
+  }
+  async function installPlugin() {
+    setAction({ loading: true });
+    try {
+      const data = await apiPost<any>("/api/harness/plugins/install", { manifest: pluginSource, add_to_active_profile: addToProfile });
+      setAction({ loading: false, data });
+      setValidation({ loading: false, data: { status: "installed", package: data.package } });
+      setComposerOpen(false);
+      refreshAll();
+    } catch (error: any) { setAction({ loading: false, error: error.message }); }
+  }
 
   return <div className="capability-stack harness-console">
     <div className="surface harness-surface">
-      <SectionHead icon={BrainCircuit} title="CISRE Harness Runtime" meta={`${harness.summary?.active || 0}/${harness.summary?.total || 0} plugins active`} action={<button className="ghost" onClick={refreshAll}><RefreshCcw size={14} />刷新运行时</button>} />
+      <SectionHead icon={BrainCircuit} title="SRE initiate 插件中心" meta={`${harness.summary?.active || 0}/${harness.summary?.total || 0} plugins active`} action={<div className="harness-head-actions"><button className="primary" onClick={() => setComposerOpen(true)}><Upload size={14} />导入插件</button><button className="ghost" onClick={refreshAll}><RefreshCcw size={14} />刷新运行时</button></div>} />
       <div className="harness-runtime-strip">
-        <div><span>Runtime</span><strong>{harness.runtime || "CISREPluginHarness/v1"}</strong></div>
+        <div><span>Runtime</span><strong>{String(harness.runtime || "SREInitiatePluginHarness/v1").replace("CISRE", "SRE initiate ")}</strong></div>
         <div><span>Active profile</span><strong>{composition.active_profile || "production"}</strong></div>
         <div><span>Durable sessions</span><strong>{harness.event_store?.sessions || 0} · {harness.event_store?.events || 0} events</strong></div>
         <div><span>Safety boundary</span><strong>Typed action · Approval · Readback</strong></div>
@@ -370,11 +458,21 @@ function HarnessConsole({ capabilities, refreshCapabilities }: { capabilities: a
       <div className="harness-view-tabs">
         <button className={view === "runtime" ? "active" : ""} onClick={() => setView("runtime")}><Layers3 size={14} />插件与 Profile</button>
         <button className={view === "services" ? "active" : ""} onClick={() => setView("services")}><Workflow size={14} />服务依赖图</button>
+        <button className={view === "author" ? "active" : ""} onClick={() => setView("author")}><TerminalSquare size={14} />团队接入</button>
         <button className={view === "sessions" ? "active" : ""} onClick={() => setView("sessions")}><GitBranch size={14} />事件与分支</button>
         <button className={view === "security" ? "active" : ""} onClick={() => setView("security")}><ShieldCheck size={14} />权限与审计</button>
       </div>
       {action.error && <div className="inline-error">{action.error}</div>}
       {action.data && <div className="harness-action-ok"><CheckCircle2 size={14} />运行时操作已写入审计事件流</div>}
+
+      {composerOpen && <div className="harness-composer">
+        <header><div><span>PLUGIN MANIFEST</span><strong>导入外置 SRE 插件</strong><small>先校验服务依赖与权限，再原子写入 runtime-store；明文凭据会被拒绝。</small></div><button className="ghost tiny" onClick={() => setComposerOpen(false)}><X size={13} />关闭</button></header>
+        <div className="harness-template-switch"><span>契约模板</span><button onClick={() => setPluginSource(HARNESS_PLUGIN_TEMPLATES.database)}><Database size={13} />数据库</button><button onClick={() => setPluginSource(HARNESS_PLUGIN_TEMPLATES.virtual_machine)}><ServerCog size={13} />VM / 主机</button><button onClick={() => setPluginSource(HARNESS_PLUGIN_TEMPLATES.storage)}><HardDrive size={13} />存储</button></div>
+        <textarea value={pluginSource} onChange={(event) => { setPluginSource(event.target.value); setValidation({ loading: false }); }} spellCheck={false} aria-label="插件 YAML" />
+        <footer><label><input type="checkbox" checked={addToProfile} onChange={(event) => setAddToProfile(event.target.checked)} />加入当前 Profile 并热加载</label><span>{profiles.data?.package_write_enabled ? "运行时写入已开启" : "生产写入锁定：需设置 HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED=true"}</span><button className="ghost" disabled={validation.loading} onClick={validatePlugin}>{validation.loading ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />}校验</button><button className="primary" disabled={action.loading || !profiles.data?.package_write_enabled} onClick={installPlugin}>{action.loading ? <Loader2 className="spin" size={14} /> : <Upload size={14} />}安装并重载</button></footer>
+        {validation.error && <div className="inline-error">{validation.error}</div>}
+        {validation.data && <div className="harness-action-ok"><CheckCircle2 size={14} />{validation.data.package?.id} · {validation.data.package?.version} · 契约校验通过</div>}
+      </div>}
 
       {view === "runtime" && <div className="harness-runtime-grid">
         <div className="harness-profile-panel"><small>PROFILE / BUNDLE / PATCH</small><h3>组合运行环境</h3><p>按环境整体替换模型、证据、Skill 或资源 Provider；插件更新无需修改控制面核心代码。</p><label>Profile<select value={selectedProfile} onChange={(event) => setSelectedProfile(event.target.value)}>{profileRows.map((item: any) => <option key={item.id} value={item.id}>{item.id}{item.active ? " · active" : ""}</option>)}</select></label><div><button className="primary" disabled={action.loading || !profiles.data?.runtime_write_enabled} onClick={() => runAction(() => apiPost("/api/harness/profiles/activate", { profile: selectedProfile }))}>应用 Profile</button><button className="ghost" disabled={action.loading} onClick={() => runAction(() => apiPost("/api/harness/plugins/reload", {}))}>热重载插件</button></div>{!profiles.data?.runtime_write_enabled && <small className="harness-lock-note">生产默认锁定；设置 HARNESS_PROFILE_RUNTIME_WRITE_ENABLED=true 后可由操作员切换。</small>}</div>
@@ -384,11 +482,27 @@ function HarnessConsole({ capabilities, refreshCapabilities }: { capabilities: a
 
       {view === "services" && <div className="harness-service-map"><div className="harness-map-legend"><span><i className="provider" />Provider</span><span><i className="consumer" />Consumer dependency</span><b>{services.length} service seams</b></div>{services.length ? services.map(([service, providers]: [string, any]) => { const consumers = pluginRows.filter((plugin: any) => list(plugin.requires).includes(service)); return <div className="harness-service-row" key={service}><div className="harness-service-node"><Network size={14} /><strong>{service}</strong></div><div className="harness-provider-stack">{list(providers).map((provider: any) => <span key={`${provider.plugin_id}-${provider.scope}`} className={provider.active === false ? "muted" : ""}>{provider.plugin_id}<small>{provider.scope || "global"} · p{provider.priority || 0}</small></span>)}</div><ChevronRight size={14} /><div className="harness-consumer-stack">{consumers.length ? consumers.map((consumer: any) => <span key={consumer.id}>{consumer.id}</span>) : <small>无下游依赖</small>}</div></div>; }) : <Empty text="当前没有可展示的服务绑定" />}</div>}
 
+      {view === "author" && <div className="harness-author-grid">
+        <article><span>01</span><Database size={21} /><strong>资源与证据 Provider</strong><p>数据库组或 VM 组只实现本领域的 inventory、evidence、health 与 verify 服务，不依赖 SRE 核心实现。</p><code>provides: inventory.database</code><code>requires: session.events</code></article>
+        <article><span>02</span><BrainCircuit size={21} /><strong>Skill 与动作提案</strong><p>把诊断步骤、候选根因、最小变更、回滚和恢复判据写成 Skill；插件只能提案，不能越过审批直接执行。</p><code>permission: ops:propose</code><code>action: typed contract</code></article>
+        <article><span>03</span><ShieldCheck size={21} /><strong>企业执行适配器</strong><p>真实写操作交给隔离 Provider、DBA/虚拟化执行器或企业脚本平台；SRE initiate 统一做审批、审计和写后回读。</p><code>approval → execute → readback</code><code>plaintext secrets: denied</code></article>
+        <article><span>04</span><CheckCircle2 size={21} /><strong>验收与可量化成效</strong><p>提供幂等探测、超时、错误码和业务恢复判据；只有真实资源恢复后才记为插件解决的问题。</p><code>ready + stable + symptom absent</code><code>record: plugin / skill / outcome</code></article>
+        <section><strong>团队交付最小集合</strong><div><b>1</b><span>插件 manifest：ID、SemVer、provides/requires、scope、permissions</span></div><div><b>2</b><span>只读 Provider：资源清单、证据采集、健康检查、恢复验证</span></div><div><b>3</b><span>Skill 包：触发信号、取证、根因、变更提案、回滚、验证合同</span></div><div><b>4</b><span>执行契约：类型化参数、幂等键、审批风险、回读结果；凭据只用 Secret 引用</span></div><div><b>5</b><span>契约测试：依赖缺失 fail-closed、权限拒绝、超时、回滚和恢复闭环</span></div></section>
+      </div>}
+
       {view === "sessions" && <div className="harness-session-grid"><aside>{sessionRows.map((session: any) => <button key={session.session_id} className={selectedSession === session.session_id ? "active" : ""} onClick={() => setSelectedSession(session.session_id)}><span><strong>{session.session_id}</strong><small>{session.phase || "runtime"} · {session.event_count} events</small></span><StatusPill status={session.status || "recorded"} /></button>)}</aside><section><div className="harness-session-toolbar"><div><strong>{selectedSession || "选择一个会话"}</strong><small>{sessionEvents.data?.integrity?.valid === false ? "哈希链校验失败" : `Append-only hash chain verified · ${list(sessionEvents.data?.children).length} child sessions`}</small></div><button className="ghost" disabled={!selectedSession || action.loading} onClick={branchSession}><GitBranch size={13} />从当前位置分支</button><button className="primary" disabled={!selectedSession || action.loading} onClick={() => runAction(() => apiPost(`/api/harness/sessions/${encodeURIComponent(selectedSession)}/resume`, {}))}><Workflow size={13} />恢复会话</button></div>{list(sessionEvents.data?.children).length > 0 && <div className="harness-child-sessions">{list(sessionEvents.data?.children).map((child: any) => <button key={child.session_id} onClick={() => setSelectedSession(child.session_id)}><GitBranch size={11} />{child.session_id}<small>{child.status}</small></button>)}</div>}<div className="harness-event-timeline">{list(sessionEvents.data?.events).map((event: any) => <div key={event.event_id}><i /><span><strong>{event.type}</strong><small>#{event.seq} · {event.plugin_id || event.tool || event.stage || "runtime"} · {timeText(event.timestamp)}</small><p>{event.message || event.status}</p>{list(event.data?.artifact_paths).length > 0 && <footer>{list(event.data.artifact_paths).map((path: any) => <code key={path}>{path}</code>)}</footer>}</span><StatusPill status={event.status || "recorded"} /></div>)}</div></section></div>}
 
       {view === "security" && <div className="harness-security-grid"><div><ShieldCheck size={22} /><strong>外置代码不进入 API 进程</strong><p>第三方插件只能使用声明式或隔离远程 Provider；未签名插件无法请求文件、子进程、凭据和 K8s 写权限。</p></div><div><GitBranch size={22} /><strong>操作可追溯、可分支</strong><p>会话事件追加写入并串联哈希，支持 replay、fork、resume 和子会话下钻。</p></div><div><CheckCircle2 size={22} /><strong>单调安全门禁</strong><p>任何插件都不能跳过 typed action、风险策略、逐项人工审批、同目标回读和恢复验证。</p></div><div className="harness-permission-table"><strong>允许的外置权限</strong>{list(composition.security?.safe_external_permissions).map((item: any) => <code key={item}>{item}</code>)}<strong>始终由核心保留</strong>{["kubernetes:mutate", "ops:execute", "secrets:read"].map((item) => <code className="denied" key={item}>{item}</code>)}</div></div>}
     </div>
     <div className="surface"><SectionHead icon={TerminalSquare} title="受控运维能力" meta={capabilities?.planner} /><div className="capability-grid">{list(capabilities?.actions).map((item: any) => <div className="capability-card" key={item.action || item.id}><span>{item.risk || "controlled"}</span><strong>{item.action || item.id || item.name}</strong><p>{item.description || item.summary || "证据、预演、审批、执行、写后回读与恢复验证"}</p></div>)}</div></div>
+  </div>;
+}
+
+export function PluginCenterPage() {
+  const [capabilities, refreshCapabilities] = useAsync<any>(() => apiGet("/api/ops/capabilities"), []);
+  return <div className="unified-page plugin-center-page">
+    {capabilities.error && <div className="inline-error">{capabilities.error}</div>}
+    {capabilities.loading && !capabilities.data ? <div className="surface"><Empty text="正在装载插件运行时与服务依赖图" /></div> : <HarnessConsole capabilities={capabilities.data} refreshCapabilities={refreshCapabilities} />}
   </div>;
 }
 
@@ -418,7 +532,7 @@ export function OperationsPage() {
   return <div className="unified-page">
     <div className="page-commandbar"><div className="segmented"><button className={tab === "scan" ? "active" : ""} onClick={() => setTab("scan")}>扫描诊断</button><button className={tab === "incidents" ? "active" : ""} onClick={() => setTab("incidents")}>事件</button><button className={tab === "alerts" ? "active" : ""} onClick={() => setTab("alerts")}>告警</button><button className={tab === "postmortems" ? "active" : ""} onClick={() => setTab("postmortems")}>复盘</button><button className={tab === "capabilities" ? "active" : ""} onClick={() => setTab("capabilities")}>运维工具</button></div><button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button></div>
     {tab === "capabilities" && <HarnessConsole capabilities={capabilities.data} refreshCapabilities={refreshCapabilities} />}
-    {tab === "scan" ? <div className="operations-scan-grid"><div className="surface"><SectionHead icon={Search} title="证据扫描" meta="仅在发现真实信号后触发 AI 诊断" /><div className="ops-scan-form"><label>集群<select value={cluster} onChange={(event) => { setCluster(event.target.value); setNamespace("all"); }}><option value="all">所有集群</option>{clusters.map((item: any) => <option key={item.id} value={item.id}>{item.name || item.id}</option>)}</select></label><label>Namespace<select value={namespace} onChange={(event) => setNamespace(event.target.value)}><option value="all">所有 Namespace</option>{namespaces.map((item) => <option key={item} value={item}>{item}</option>)}</select></label><label>异常类型<select value={intent} onChange={(event) => setIntent(event.target.value)}><option value="crashloop">CrashLoop / 镜像 / OOM</option><option value="pending">Pending / 调度</option><option value="highcpu">高 CPU</option></select></label><label>严重级别<select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="auto">自动识别</option><option value="P1">P1</option><option value="P2">P2</option><option value="P3">P3</option></select></label><button className="primary" onClick={runScan} disabled={scan.loading}>{scan.loading ? <Loader2 className="spin" size={15} /> : <Search size={15} />}扫描并诊断</button></div></div><div className="surface"><SectionHead icon={BrainCircuit} title="诊断结果" meta={scan.data?.status || "waiting"} />{scan.error && <div className="inline-error">{scan.error}</div>}{scan.data ? <div className="scan-result"><StatusPill status={scan.data.status || "ok"} /><h3>{scan.data.reason || scan.data.scan?.findings?.[0]?.issue?.reason || "扫描完成"}</h3><p>{scan.data.results?.[0]?.answer || scan.data.answer || `检查 ${scan.data.evidence?.pods_checked ?? list(scan.data.scan?.findings).length} 个 Pod，发现 ${list(scan.data.scan?.findings).length} 条匹配信号。`}</p><div className="compact-list">{list(scan.data.scan?.findings).map((item: any) => <div className="compact-row" key={`${item.cluster}-${item.namespace}-${item.name}`}><span className="resource-icon risk"><Boxes size={14} /></span><div><strong>{item.name}</strong><small>{item.cluster}/{item.namespace} · {item.issue?.reason || item.phase}</small></div><StatusPill status={scan.data.scan?.severity || "warning"} /></div>)}</div></div> : <Empty text="选择范围和异常类型后开始扫描" />}</div></div> : tab === "capabilities" ? <div className="capability-stack"><div className="surface harness-surface"><SectionHead icon={BrainCircuit} title="DeepSeek Harness 内核" meta={`${capabilities.data?.harness?.summary?.active || 0}/${capabilities.data?.harness?.summary?.total || 0} plugins active`} /><div className="harness-runtime-strip"><div><span>Runtime</span><strong>{capabilities.data?.harness?.runtime || "CISREPluginHarness/v1"}</strong></div><div><span>架构</span><strong>Everything is a Plugin</strong></div><div><span>事件模式</span><strong>Waterfall · Serial · Parallel</strong></div><div><span>生产边界</span><strong>审批后执行 · 写后回读</strong></div></div><div className="harness-plugin-list">{list(capabilities.data?.harness?.plugins).map((plugin: any) => <div key={plugin.id} className={plugin.status === "active" ? "active" : "pending"}><i /><span><strong>{plugin.id}</strong><small>{plugin.description}</small></span><b>{plugin.status}</b></div>)}</div></div><div className="surface"><SectionHead icon={TerminalSquare} title="受控运维能力" meta={capabilities.data?.planner} /><div className="capability-grid">{list(capabilities.data?.actions).map((item: any) => <div className="capability-card" key={item.action || item.id}><span>{item.risk || "controlled"}</span><strong>{item.action || item.id || item.name}</strong><p>{item.description || item.summary || "通过证据、预演、审批和恢复验证执行"}</p></div>)}</div></div></div> : <div className="surface"><SectionHead icon={tab === "incidents" ? BellRing : tab === "alerts" ? AlertTriangle : FileClock} title={tab === "incidents" ? "事件时间线" : tab === "alerts" ? "告警记录" : "复盘报告"} meta={`${rows.length} records`} />{rows.length ? <div className="timeline-list">{rows.slice().reverse().map((item: any, index: number) => <div className="timeline-item" key={item.incident_id || item.id || index}><i /><div><div><strong>{item.title || item.alert_name || item.name || "记录"}</strong><StatusPill status={item.status || item.severity || "recorded"} /></div><p>{item.summary || item.description || item.root_cause || item.report || "已进入审计时间线"}</p><small>{item.cluster || ""} {item.namespace || ""} · {timeText(item.created_at || item.timestamp)}</small></div></div>)}</div> : <Empty text="暂无记录；新的告警与处置会自动进入这里" />}</div>}
+    {tab === "scan" ? <div className="operations-scan-grid"><div className="surface"><SectionHead icon={Search} title="证据扫描" meta="仅在发现真实信号后触发 AI 诊断" /><div className="ops-scan-form"><label>集群<select value={cluster} onChange={(event) => { setCluster(event.target.value); setNamespace("all"); }}><option value="all">所有集群</option>{clusters.map((item: any) => <option key={item.id} value={item.id}>{item.name || item.id}</option>)}</select></label><label>Namespace<select value={namespace} onChange={(event) => setNamespace(event.target.value)}><option value="all">所有 Namespace</option>{namespaces.map((item) => <option key={item} value={item}>{item}</option>)}</select></label><label>异常类型<select value={intent} onChange={(event) => setIntent(event.target.value)}><option value="crashloop">CrashLoop / 镜像 / OOM</option><option value="pending">Pending / 调度</option><option value="highcpu">高 CPU</option></select></label><label>严重级别<select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="auto">自动识别</option><option value="P1">P1</option><option value="P2">P2</option><option value="P3">P3</option></select></label><button className="primary" onClick={runScan} disabled={scan.loading}>{scan.loading ? <Loader2 className="spin" size={15} /> : <Search size={15} />}扫描并诊断</button></div></div><div className="surface"><SectionHead icon={BrainCircuit} title="诊断结果" meta={scan.data?.status || "waiting"} />{scan.error && <div className="inline-error">{scan.error}</div>}{scan.data ? <div className="scan-result"><StatusPill status={scan.data.status || "ok"} /><h3>{scan.data.reason || scan.data.scan?.findings?.[0]?.issue?.reason || "扫描完成"}</h3><p>{scan.data.results?.[0]?.answer || scan.data.answer || `检查 ${scan.data.evidence?.pods_checked ?? list(scan.data.scan?.findings).length} 个 Pod，发现 ${list(scan.data.scan?.findings).length} 条匹配信号。`}</p><div className="compact-list">{list(scan.data.scan?.findings).map((item: any) => <div className="compact-row" key={`${item.cluster}-${item.namespace}-${item.name}`}><span className="resource-icon risk"><Boxes size={14} /></span><div><strong>{item.name}</strong><small>{item.cluster}/{item.namespace} · {item.issue?.reason || item.phase}</small></div><StatusPill status={scan.data.scan?.severity || "warning"} /></div>)}</div></div> : <Empty text="选择范围和异常类型后开始扫描" />}</div></div> : tab === "capabilities" ? <div className="capability-stack"><div className="surface harness-surface"><SectionHead icon={BrainCircuit} title="DeepSeek Harness 内核" meta={`${capabilities.data?.harness?.summary?.active || 0}/${capabilities.data?.harness?.summary?.total || 0} plugins active`} /><div className="harness-runtime-strip"><div><span>Runtime</span><strong>{String(capabilities.data?.harness?.runtime || "SREInitiatePluginHarness/v1").replace("CISRE", "SRE initiate ")}</strong></div><div><span>架构</span><strong>Everything is a Plugin</strong></div><div><span>事件模式</span><strong>Waterfall · Serial · Parallel</strong></div><div><span>生产边界</span><strong>审批后执行 · 写后回读</strong></div></div><div className="harness-plugin-list">{list(capabilities.data?.harness?.plugins).map((plugin: any) => <div key={plugin.id} className={plugin.status === "active" ? "active" : "pending"}><i /><span><strong>{plugin.id}</strong><small>{plugin.description}</small></span><b>{plugin.status}</b></div>)}</div></div><div className="surface"><SectionHead icon={TerminalSquare} title="受控运维能力" meta={capabilities.data?.planner} /><div className="capability-grid">{list(capabilities.data?.actions).map((item: any) => <div className="capability-card" key={item.action || item.id}><span>{item.risk || "controlled"}</span><strong>{item.action || item.id || item.name}</strong><p>{item.description || item.summary || "通过证据、预演、审批和恢复验证执行"}</p></div>)}</div></div></div> : <div className="surface"><SectionHead icon={tab === "incidents" ? BellRing : tab === "alerts" ? AlertTriangle : FileClock} title={tab === "incidents" ? "事件时间线" : tab === "alerts" ? "告警记录" : "复盘报告"} meta={`${rows.length} records`} />{rows.length ? <div className="timeline-list">{rows.slice().reverse().map((item: any, index: number) => <div className="timeline-item" key={item.incident_id || item.id || index}><i /><div><div><strong>{item.title || item.alert_name || item.name || "记录"}</strong><StatusPill status={item.status || item.severity || "recorded"} /></div><p>{item.summary || item.description || item.root_cause || item.report || "已进入审计时间线"}</p><small>{item.cluster || ""} {item.namespace || ""} · {timeText(item.created_at || item.timestamp)}</small></div></div>)}</div> : <Empty text="暂无记录；新的告警与处置会自动进入这里" />}</div>}
   </div>;
 }
 
@@ -491,7 +605,7 @@ const fallbackActionOptions: SkillChoice[] = [
   { id: "apply_manifest", label: "应用 Kubernetes YAML", description: "创建或更新任意 Kubernetes API 资源。", risk: "high", when_to_use: "AI 已基于真实对象生成完整 YAML。", operator_note: "展示完整 YAML 与差异后逐步确认。" },
   { id: "patch_resource", label: "修改 Kubernetes 资源", description: "Patch Workload、ConfigMap、Secret、PV/PVC 等资源。", risk: "high", when_to_use: "已锁定 apiVersion、kind、namespace、name 和最小 Patch。", operator_note: "必须保存原对象快照。" },
   { id: "delete_resource", label: "删除 Kubernetes 资源", description: "删除一个明确目标资源。", risk: "high", when_to_use: "证据证明删除必要且影响可控。", operator_note: "必须显示恢复快照并逐步确认。" },
-  { id: "run_shell", label: "执行平台 Shell", description: "在 CISRE 运行环境执行完整命令。", risk: "high", when_to_use: "Skill 明确要求平台侧命令。", operator_note: "逐步确认、超时、输出审计。" },
+  { id: "run_shell", label: "执行平台 Shell", description: "在 SRE initiate 运行环境执行完整命令。", risk: "high", when_to_use: "Skill 明确要求平台侧命令。", operator_note: "逐步确认、超时、输出审计。" },
   { id: "exec_pod", label: "执行 Pod 命令", description: "进入指定 Pod/container 执行命令。", risk: "high", when_to_use: "必须在容器内取证或处置。", operator_note: "显示完整命令与目标后逐步确认。" },
   { id: "exec_node", label: "执行节点命令", description: "通过受控节点执行器运行命令。", risk: "high", when_to_use: "必须在指定 Kubernetes 节点处置。", operator_note: "特权高风险，逐步确认并审计。" },
   { id: "patch_workload", label: "修改 Workload 配置", description: "修正镜像、探针、资源、副本、环境变量或安全上下文。", risk: "medium", when_to_use: "证据确认 Deployment、StatefulSet 或 DaemonSet 模板配置有误。", operator_note: "执行前展示差异，可恢复原模板回滚。" },
@@ -668,7 +782,7 @@ export function OpsSkillsPage() {
         },
       });
       setForm(createEmptySkillForm());
-      setMessage("Skill 已保存，会参与 SRE 对话和 AI 巡检的自动匹配。");
+      setMessage("Skill 已保存，会参与 SRE Run 和 AI 巡检的自动匹配。");
       refreshSkills();
     } catch (error: any) {
       setMessage(error.message);
@@ -894,7 +1008,7 @@ export function SignalsPage() {
     <section className="unified-grid signals-grid">
       <div className="surface span-two"><SectionHead icon={Activity} title="信号源" meta="Metrics · Logs · Traces · LLM" /><div className="integration-strip">{sources.map((item: any) => <div key={item.id}><span className="resource-icon"><Database size={15} /></span><div><strong>{item.name}</strong><small>{item.capability}</small></div><StatusPill status={item.status} /></div>)}</div></div>
       <div className="surface"><SectionHead icon={Gauge} title="模型调用分布" /><div className="mini-bars">{list(analytics.by_model).slice(0, 7).map((item: any) => <div key={item.name}><span>{item.name}</span><i><b style={{ width: `${Math.min(100, Number(item.calls || 0) * 10)}%` }} /></i><strong>{item.calls || 0}</strong></div>)}</div></div>
-      <div className="surface span-three langfuse-lens"><SectionHead icon={GitBranch} title="Langfuse 黑盒拆解" meta={`${summary.langfuse_traces || 0} traces · ${langfuse.active ? "active" : langfuse.configured ? "configured" : "not configured"}`} /><div className="langfuse-chain">{["User", "Session", "Trace", "Generation", "Tool Call", "Score"].map((item) => <div key={item}><span>{item}</span><small>{item === "User" ? "Operator / Alert" : item === "Session" ? "Incident / Inspection" : item === "Trace" ? "SRE Workflow" : item === "Generation" ? "LLM Tokens" : item === "Tool Call" ? "MCP / Healing" : "Quality Eval"}</small></div>)}</div><div className="quality-strip">{list(analytics.quality_scores).length ? list(analytics.quality_scores).map((item: any) => <div key={item.name}><span>{item.name}</span><i><b style={{ width: `${Math.round(Number(item.avg || 0) * 100)}%` }} /></i><strong>{Math.round(Number(item.avg || 0) * 100)}</strong></div>) : <Empty text="运行 SRE 对话或巡检后展示 Langfuse 质量评分" />}</div></div>
+      <div className="surface span-three langfuse-lens"><SectionHead icon={GitBranch} title="Langfuse 黑盒拆解" meta={`${summary.langfuse_traces || 0} traces · ${langfuse.active ? "active" : langfuse.configured ? "configured" : "not configured"}`} /><div className="langfuse-chain">{["User", "Session", "Trace", "Generation", "Tool Call", "Score"].map((item) => <div key={item}><span>{item}</span><small>{item === "User" ? "Operator / Alert" : item === "Session" ? "Incident / Inspection" : item === "Trace" ? "SRE Workflow" : item === "Generation" ? "LLM Tokens" : item === "Tool Call" ? "MCP / Healing" : "Quality Eval"}</small></div>)}</div><div className="quality-strip">{list(analytics.quality_scores).length ? list(analytics.quality_scores).map((item: any) => <div key={item.name}><span>{item.name}</span><i><b style={{ width: `${Math.round(Number(item.avg || 0) * 100)}%` }} /></i><strong>{Math.round(Number(item.avg || 0) * 100)}</strong></div>) : <Empty text="运行 SRE Run 或巡检后展示 Langfuse 质量评分" />}</div></div>
       <div className="surface span-two"><SectionHead icon={LineChart} title="每日 Token 用量" meta={`${weekly.observed_days || 0} observed days`} /><div className="usage-chart">{list(analytics.daily_usage).length ? list(analytics.daily_usage).map((item: any) => <div key={item.date}><div><i style={{ height: `${Math.max(4, Number(item.tokens || 0) / maxDailyTokens * 100)}%` }} /></div><strong>{compactNumber(item.tokens)}</strong><span>{item.date?.slice(5)}</span></div>) : <Empty text="产生 LLM 调用后展示每日 Token 曲线" />}</div></div>
       <div className="surface"><SectionHead icon={BrainCircuit} title="一周用量预测" /><div className="weekly-forecast"><div><span>不开自动巡检</span><strong>{compactNumber(weekly.weekly_tokens_without_auto_inspection)}</strong></div><div><span>开启自动巡检</span><strong>{compactNumber(weekly.weekly_tokens_with_auto_inspection)}</strong></div><p>每 {weekly.inspection_interval_minutes || 30} 分钟巡检，预计增加 {compactNumber(weekly.auto_inspection_extra_tokens)} Token / 周</p></div></div>
       <div className="surface"><SectionHead icon={Workflow} title="LLM 数据流" /><div className="flow-list">{list(analytics.data_flows).map((item: any, index: number) => <div key={item.name}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.name}</strong><small>{item.count} calls</small></div>)}</div></div>
@@ -1098,10 +1212,10 @@ export function AssistantDock({ page }: { page: string }) {
     } finally { setLoading(false); }
   }
   return <>
-    <button className="assistant-launcher" onClick={() => setOpen(true)} title="打开 CISRE 助手"><Bot size={19} /><span>助手</span><kbd>⌘K</kbd></button>
+    <button className="assistant-launcher" onClick={() => setOpen(true)} title="打开 SRE initiate 助手"><Bot size={19} /><span>助手</span><kbd>⌘K</kbd></button>
     <aside className={`assistant-drawer ${open ? "open" : ""}`} aria-hidden={!open}>
       <header>
-        <div><span className="assistant-mark"><Bot size={18} /></span><div><strong>CISRE 助手</strong><small>当前页面：{page}</small></div></div>
+        <div><span className="assistant-mark"><Bot size={18} /></span><div><strong>SRE initiate 助手</strong><small>当前页面：{page}</small></div></div>
         <div className="assistant-header-actions">
           <button onClick={() => setMessages([])} title="清空对话"><RefreshCcw size={15} /></button>
           <button onClick={() => setOpen(false)} title="关闭"><X size={18} /></button>
@@ -1116,7 +1230,7 @@ export function AssistantDock({ page }: { page: string }) {
       </div>
       <div className="assistant-messages" ref={scroller}>
         {messages.length ? messages.map((item, index) => <div className={`assistant-message ${item.role}`} key={`${item.at}-${index}`}>
-          <span>{item.role === "assistant" ? "CISRE" : "你"}{item.page ? ` · ${item.page}` : ""}{item.domain ? ` · ${item.domain === "ops" ? "运维知识" : "产品知识"}` : ""}</span>
+          <span>{item.role === "assistant" ? "SRE initiate" : "你"}{item.page ? ` · ${item.page}` : ""}{item.domain ? ` · ${item.domain === "ops" ? "运维知识" : "产品知识"}` : ""}</span>
           <p>{item.text}</p>
           {item.role === "assistant" && typeof item.sourceCount === "number" && <small>{item.sourceCount} 个知识片段参与回答</small>}
         </div>) : <div className="assistant-welcome"><BrainCircuit size={24} /><strong>需要我帮你怎么用这套系统？</strong><p>我会结合当前页面、产品知识库和运维 Runbook 给出下一步。</p></div>}

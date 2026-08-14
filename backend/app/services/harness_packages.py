@@ -13,6 +13,8 @@ import hashlib
 import json
 import os
 import re
+import tempfile
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -55,6 +57,13 @@ _PRIVILEGED_PERMISSIONS = {
     "kubernetes:mutate",
     "ops:execute",
 }
+_SENSITIVE_KEY = re.compile(r"(?:password|passwd|token|secret|api[_-]?key|private[_-]?key|credential)", re.I)
+_SENSITIVE_VALUE = re.compile(r"(?:bearer\s+[a-z0-9._~+/=-]{12,}|token-[a-z0-9]+:[a-z0-9]{12,})", re.I)
+_SECRET_REFERENCE_KEY = re.compile(
+    r"(?:^|[_-])(?:password|passwd|token|secret|api[_-]?key|private[_-]?key|credential)[_-]?(?:ref|reference)$",
+    re.I,
+)
+_SAFE_REFERENCE_VALUE = re.compile(r"^[a-z0-9](?:[a-z0-9._/-]{0,251}[a-z0-9])?$", re.I)
 
 
 class HarnessPackageError(ValueError):
@@ -119,6 +128,29 @@ def _load_document(path: Path) -> dict[str, Any]:
 
 def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _contains_sensitive_value(value: Any, *, key: str = "") -> bool:
+    """Reject credentials before a manifest can be persisted by the UI."""
+    if key and _SENSITIVE_KEY.search(key):
+        if _SECRET_REFERENCE_KEY.search(key):
+            if isinstance(value, str):
+                return not bool(_SAFE_REFERENCE_VALUE.fullmatch(value)) or bool(_SENSITIVE_VALUE.search(value))
+            if isinstance(value, dict):
+                return any(
+                    not isinstance(item, str)
+                    or not bool(_SAFE_REFERENCE_VALUE.fullmatch(item))
+                    or bool(_SENSITIVE_VALUE.search(item))
+                    for name, item in value.items()
+                    if str(name) in {"name", "key", "namespace"}
+                ) or any(str(name) not in {"name", "key", "namespace"} for name in value)
+            return True
+        return value not in (None, "", "[REDACTED]")
+    if isinstance(value, dict):
+        return any(_contains_sensitive_value(item, key=str(name)) for name, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_sensitive_value(item) for item in value)
+    return isinstance(value, str) and bool(_SENSITIVE_VALUE.search(value))
 
 
 def _service_rows(value: Any) -> tuple[tuple[str, str], ...]:
@@ -204,6 +236,9 @@ class HarnessPackageManager:
         self.profiles: dict[str, dict[str, Any]] = {}
         self.bundles: dict[str, dict[str, Any]] = {}
         self.runtime_write_enabled = os.getenv("HARNESS_PROFILE_RUNTIME_WRITE_ENABLED", "false").lower() in {
+            "1", "true", "yes", "on",
+        }
+        self.package_write_enabled = os.getenv("HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED", "false").lower() in {
             "1", "true", "yes", "on",
         }
         self.development_mode = os.getenv("HARNESS_PLUGIN_DEVELOPMENT_MODE", "false").lower() in {
@@ -542,6 +577,91 @@ class HarnessPackageManager:
             raise PermissionError("HARNESS_PROFILE_RUNTIME_WRITE_ENABLED=false")
         return self.refresh(profile_name)
 
+    def validate_source(self, source: str) -> dict[str, Any]:
+        if not source.strip():
+            raise HarnessPackageError("plugin manifest is empty")
+        if len(source.encode("utf-8")) > 512 * 1024:
+            raise HarnessPackageError("plugin manifest exceeds 512 KiB")
+        try:
+            raw = yaml.safe_load(source)
+        except yaml.YAMLError as exc:
+            raise HarnessPackageError(f"cannot parse plugin manifest: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise HarnessPackageError("plugin manifest must be an object")
+        if _contains_sensitive_value(raw):
+            raise HarnessPackageError("plugin manifest must not contain credentials or plaintext secrets")
+        with tempfile.TemporaryDirectory(prefix="cisre-plugin-validate-") as directory:
+            path = Path(directory) / "plugin.yaml"
+            path.write_text(source.strip() + "\n", encoding="utf-8")
+            package = self._parse_package(path)
+        return package.public()
+
+    def install_source(self, source: str, *, add_to_active_profile: bool = True) -> dict[str, Any]:
+        """Atomically persist a validated declarative package and reconcile it."""
+        if not self.package_write_enabled:
+            raise PermissionError("HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED=false")
+        preview = self.validate_source(source)
+        plugin_id = str(preview["id"])
+        packages_dir = self.root / "packages"
+        packages_dir.mkdir(parents=True, exist_ok=True)
+        target = packages_dir / f"{plugin_id}.yaml"
+        previous = target.read_bytes() if target.exists() else None
+        profile_target = self.root / "profiles" / f"{self.active_profile}.yaml"
+        previous_profile = profile_target.read_bytes() if profile_target.exists() else None
+        staging = packages_dir / f".{plugin_id}.{uuid.uuid4().hex}.tmp"
+        try:
+            staging.write_text(source.strip() + "\n", encoding="utf-8")
+            staging.chmod(0o600)
+            os.replace(staging, target)
+            if add_to_active_profile:
+                self._add_package_to_profile(plugin_id, self.active_profile)
+            composition = self.refresh()
+        except Exception:
+            staging.unlink(missing_ok=True)
+            if previous is None:
+                target.unlink(missing_ok=True)
+            else:
+                rollback = packages_dir / f".{plugin_id}.{uuid.uuid4().hex}.rollback"
+                rollback.write_bytes(previous)
+                rollback.chmod(0o600)
+                os.replace(rollback, target)
+            if add_to_active_profile:
+                if previous_profile is None:
+                    profile_target.unlink(missing_ok=True)
+                else:
+                    profile_target.parent.mkdir(parents=True, exist_ok=True)
+                    profile_rollback = profile_target.parent / f".{self.active_profile}.{uuid.uuid4().hex}.rollback"
+                    profile_rollback.write_bytes(previous_profile)
+                    profile_rollback.chmod(0o600)
+                    os.replace(profile_rollback, profile_target)
+            self.refresh()
+            raise
+        package = next((item for item in composition["packages"] if item["id"] == plugin_id), preview)
+        return {"status": "installed", "package": package, "composition": composition}
+
+    def _add_package_to_profile(self, plugin_id: str, profile_name: str) -> None:
+        if not _SAFE_ID.fullmatch(profile_name):
+            raise HarnessPackageError(f"invalid profile id: {profile_name!r}")
+        profile = copy.deepcopy(self.profiles.get(profile_name) or {
+            "apiVersion": PACKAGE_API_VERSION,
+            "kind": PROFILE_KIND,
+            "metadata": {"name": profile_name},
+            "spec": {},
+        })
+        spec = profile.get("spec") if isinstance(profile.get("spec"), dict) else {}
+        plugins = [str(item) for item in spec.get("plugins") or []]
+        if plugin_id not in plugins:
+            plugins.append(plugin_id)
+        spec["plugins"] = plugins
+        profile["spec"] = spec
+        profiles_dir = self.root / "profiles"
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+        target = profiles_dir / f"{profile_name}.yaml"
+        staging = profiles_dir / f".{profile_name}.{uuid.uuid4().hex}.tmp"
+        staging.write_text(yaml.safe_dump(profile, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        staging.chmod(0o600)
+        os.replace(staging, target)
+
     async def invoke(self, service: str, operation: str, payload: dict[str, Any], *, scopes: tuple[str, ...] = ()) -> dict[str, Any]:
         provider = self.runtime.resolve(service, scopes=scopes)
         if not isinstance(provider, RemoteServiceProvider):
@@ -571,6 +691,7 @@ class HarnessPackageManager:
             "root": str(self.root),
             "active_profile": self.active_profile,
             "runtime_write_enabled": self.runtime_write_enabled,
+            "package_write_enabled": self.package_write_enabled,
             "development_mode": self.development_mode,
             "hot_reload_supported": True,
             "last_error": self.last_error,

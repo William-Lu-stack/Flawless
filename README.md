@@ -16,12 +16,23 @@
 
 Maintained by the **CISRE Contributors** community.
 
-Current release: **5.4.0**.
+Current release: **5.5.0**.
 
 本版本的总体架构、Harness 融合、Kubernetes 写后回读、拓扑性能和国产全栈适配合同见
 [`docs/CISRE_ARCHITECTURE_ZH.md`](docs/CISRE_ARCHITECTURE_ZH.md)。
 外置插件、Profile/Bundle/Patch、服务依赖、权限策略和事件回放开发手册见
 [`docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md`](docs/HARNESS_PLUGIN_DEVELOPMENT_ZH.md)。
+数据库、VM、存储等团队的插件交付合同与接入步骤见
+[`docs/PLUGIN_TEAM_ONBOARDING_ZH.md`](docs/PLUGIN_TEAM_ONBOARDING_ZH.md)。
+
+Release 5.5.0 introduces the operator-facing **SRE initiate** experience and a
+production-safe plugin center inspired by the official DeepSeek Harness. Teams
+can validate and install declarative provider packages from the UI, declare
+versioned `provides`/`requires` services, compose them through Profiles, and
+ship database, VM or storage evidence/Skill providers without changing the
+control-plane core. Plaintext credentials are rejected and every real mutation
+still requires typed actions, human approval, read-after-write and recovery
+verification.
 
 Release 5.4.0 adds the capability-oriented Harness plugin runtime while retaining
 canonical mutation binding. The control plane freezes the approved cluster ID,

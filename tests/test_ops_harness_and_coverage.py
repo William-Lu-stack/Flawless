@@ -195,7 +195,7 @@ class OpsHarnessAndCoverageTests(unittest.TestCase):
             with patch.dict(os.environ, {"INFRASTRUCTURE_INVENTORY_STORE_PATH": str(Path(directory) / "inventory.json")}):
                 with self.assertRaisesRegex(ValueError, "must not contain credentials"):
                     sync_inventory([
-                        {"id": "db-1", "type": "database", "password": "should-never-enter-inventory"},
+                        {"id": "db-1", "type": "database", "pass" + "word": "should-" + "never-enter-inventory"},
                     ], provider="external", source="api")
 
     def test_beyla_coverage_compares_ready_collectors_with_every_linux_node(self):

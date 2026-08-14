@@ -69,7 +69,7 @@ fi
 docker info >/dev/null
 
 image_names=(
-  "$image_namespace/flawless:5.4.0"
+  "$image_namespace/flawless:5.5.0"
   "$image_namespace/flawless-node-exec:1.36"
 )
 if [[ "$core_only" != "true" ]]; then

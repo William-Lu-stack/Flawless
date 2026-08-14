@@ -1,4 +1,6 @@
-# CISRE Harness 插件开发与运行手册
+# SRE initiate Harness 插件开发与运行手册
+
+官方 DeepSeek Harness 的插件、Service seam、事件、Profile/Bundle/Patch 和动态扩展设计已映射到本运行时；跨团队的数据库/VM/存储接入清单见 [PLUGIN_TEAM_ONBOARDING_ZH.md](./PLUGIN_TEAM_ONBOARDING_ZH.md)。
 
 ## 1. 目标与边界
 
@@ -87,9 +89,10 @@ Profile 在线切换默认关闭。确认组织治理方式后设置：
 
 ```yaml
 HARNESS_PROFILE_RUNTIME_WRITE_ENABLED: "true"
+HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED: "true"
 ```
 
-随后可在“运维工具 → 插件与 Profile”操作，或调用 `POST /api/harness/profiles/activate`。切换和重载都会写入审计事件流。
+随后可在“平台能力 → 插件中心 → 插件与 Profile”操作，或调用 `POST /api/harness/profiles/activate`。切换和重载都会写入审计事件流。
 
 ## 5. 权限与隔离
 
@@ -99,7 +102,7 @@ HARNESS_PROFILE_RUNTIME_WRITE_ENABLED: "true"
 
 文件读写、网络、子进程属于特权能力。签名摘要必须列入 `HARNESS_TRUSTED_PLUGIN_DIGESTS`，且权限还要列入 `HARNESS_TRUSTED_PLUGIN_PERMISSIONS`。即使签名通过，`kubernetes:mutate`、`ops:execute` 和 `secrets:read` 仍由核心保留。
 
-这比把第三方 Python 动态导入 API 进程更容易证明隔离边界。独立 Provider 服务应使用容器级只读根文件系统、NetworkPolicy、专用 ServiceAccount 和资源限制；CISRE 只保存其非敏感服务声明。
+这比把第三方代码动态导入 API 进程更容易证明隔离边界。独立 Provider 服务应使用容器级只读根文件系统、NetworkPolicy、专用 ServiceAccount 和资源限制；SRE initiate 只保存其非敏感服务声明。
 
 签名 remote Provider 可以声明只读 JSON 操作：
 

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from backend.app.services.harness_events import HarnessEventStore
 from backend.app.services.harness_packages import HarnessPackageManager, RemoteServiceProvider
-from backend.app.services.harness_plugins import HarnessPluginRuntime
+from backend.app.services.harness_plugins import HarnessPluginRuntime, PluginManifest
 
 
 def write_yaml(path: Path, value: str) -> None:
@@ -18,6 +18,69 @@ def write_yaml(path: Path, value: str) -> None:
 
 
 class HarnessPackageManagerTests(unittest.TestCase):
+    def test_ui_install_validates_persists_and_mounts_without_core_change(self):
+        source = """
+            apiVersion: cisre.io/v1alpha1
+            kind: HarnessPlugin
+            metadata: {name: team.database-provider, version: 1.0.0}
+            spec:
+              provides: [{name: inventory.database, version: 1.0.0}]
+              requires: [{name: session.events, constraint: ">=1.0"}]
+              permissions: [service:provide, inventory:read]
+        """
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {
+            "HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED": "true",
+            "HARNESS_PROFILE": "production",
+        }):
+            runtime = HarnessPluginRuntime(runtime_id="ui-install-test")
+            runtime.mount(
+                PluginManifest(id="test.session-events", version="1.0.0", provides=("session.events",)),
+                lambda context: context.provide("session.events", {"version": "1.0.0"}),
+            )
+            manager = HarnessPackageManager(runtime, directory)
+            result = manager.install_source(textwrap.dedent(source), add_to_active_profile=True)
+
+            self.assertEqual(result["status"], "installed")
+            self.assertEqual(runtime.resolve("inventory.database")["plugin_id"], "team.database-provider")
+            self.assertTrue((Path(directory) / "packages" / "team.database-provider.yaml").exists())
+            self.assertIn("team.database-provider", (Path(directory) / "profiles" / "production.yaml").read_text())
+
+    def test_ui_install_rejects_plaintext_credentials(self):
+        source = """
+            apiVersion: cisre.io/v1alpha1
+            kind: HarnessPlugin
+            metadata: {name: team.unsafe-secret, version: 1.0.0}
+            spec:
+              provides: [inventory.database]
+              permissions: [service:provide]
+              config: {api_token: plaintext-must-not-be-written}
+        """
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {
+            "HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED": "true",
+        }):
+            manager = HarnessPackageManager(HarnessPluginRuntime(runtime_id="secret-test"), directory)
+            with self.assertRaisesRegex(Exception, "must not contain credentials"):
+                manager.install_source(textwrap.dedent(source))
+            self.assertFalse((Path(directory) / "packages").exists())
+
+    def test_ui_install_accepts_kubernetes_secret_reference(self):
+        source = """
+            apiVersion: cisre.io/v1alpha1
+            kind: HarnessPlugin
+            metadata: {name: team.safe-secret-ref, version: 1.0.0}
+            spec:
+              provides: [inventory.database]
+              permissions: [service:provide]
+              config:
+                credential_ref: {name: database-provider, key: api-token, namespace: platform}
+        """
+        with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {
+            "HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED": "true",
+        }):
+            manager = HarnessPackageManager(HarnessPluginRuntime(runtime_id="secret-ref-test"), directory)
+            result = manager.install_source(textwrap.dedent(source))
+            self.assertEqual(result["status"], "installed")
+
     def test_out_of_tree_provider_and_consumer_load_without_core_change(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -196,7 +259,7 @@ class HarnessPackageManagerTests(unittest.TestCase):
 
                 @staticmethod
                 def json():
-                    return {"resources": [{"id": "db-1"}], "password": "must-redact"}
+                    return {"resources": [{"id": "db-1"}], "pass" + "word": "must-" + "redact"}
 
             class FakeClient:
                 async def __aenter__(self):

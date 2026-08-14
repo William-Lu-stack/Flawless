@@ -17,7 +17,6 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from importlib.util import find_spec
 from typing import Any, Awaitable, Callable
 
 
@@ -791,25 +790,28 @@ def compact_planner_context(
 
 
 def official_deepseek_harness_status() -> dict[str, Any]:
-    """Report optional upstream SDK readiness without importing or launching it."""
-    installed = find_spec("deepseek_harness") is not None
+    """Report the optional out-of-process official dsh planner boundary."""
     enabled = os.getenv("DEEPSEEK_HARNESS_UPSTREAM_ENABLED", "false").lower() in {
         "1", "true", "yes", "on",
     }
     config_path = os.getenv("DEEPSEEK_HARNESS_CORDIS_CONFIG", "").strip()
-    safe_to_start = installed and enabled and bool(config_path)
+    gateway_url = os.getenv("DEEPSEEK_HARNESS_GATEWAY_URL", "").strip()
+    safe_to_start = enabled and bool(config_path) and bool(gateway_url)
     return {
         "project": "deepseek-ai/deepseek-harness",
-        "sdk_installed": installed,
+        "distribution": "@deepseek-ai/dsh",
+        "audited_version": "0.1.0-rc.5",
+        "release_stage": "developer-preview",
         "enabled": enabled,
         "safe_planner_configured": bool(config_path),
+        "gateway_configured": bool(gateway_url),
         "ready": safe_to_start,
-        "mode": "optional_jsonrpc_planner",
+        "mode": "optional_out_of_process_planner",
         "mutation_authority": False,
         "reason": (
-            "ready; upstream runtime is restricted to planning"
+            "ready; official dsh runtime is isolated behind a planner-only gateway"
             if safe_to_start
-            else "native compatible plugin runtime active; upstream Developer Preview runtime is not required"
+            else "SRE-native compatible plugin runtime active; official Developer Preview runtime is optional"
         ),
     }
 
@@ -844,5 +846,8 @@ def harness_capabilities_payload() -> dict[str, Any]:
         "owner_scoped_jobs": True,
         "goal_round_continuation": True,
         "official_runtime_cannot_mutate_kubernetes": True,
+        "ui_manifest_validation_and_install": True,
+        "plaintext_plugin_secrets_rejected": True,
+        "team_provider_templates": ["database", "virtual_machine", "storage"],
     }
     return payload

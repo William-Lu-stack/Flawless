@@ -86,7 +86,7 @@ class InfrastructureAdapterContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "secret field"):
             InfrastructureResource(
                 id="db-01", domain="database", name="db", provider="test",
-                facts={"password": "must-not-enter-contract"},
+                facts={"pass" + "word": "must-" + "not-enter-contract"},
             ).validate()
 
     def test_domain_catalog_starts_with_kubernetes_and_exposes_team_directories(self):

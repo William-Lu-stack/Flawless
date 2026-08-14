@@ -61,7 +61,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
+          image: ghcr.dockerproxy.net/your-org/cisre:5.5.0
           imagePullPolicy: Always
           command:
             - python
@@ -104,6 +104,8 @@ spec:
             - name: HARNESS_PROFILE
               value: production
             - name: HARNESS_PROFILE_RUNTIME_WRITE_ENABLED
+              value: "false"
+            - name: HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED
               value: "false"
             - name: HARNESS_EVENT_STORE_PATH
               value: /var/lib/flawless/harness-events.jsonl

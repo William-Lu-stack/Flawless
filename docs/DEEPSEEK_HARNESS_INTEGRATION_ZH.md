@@ -11,9 +11,9 @@
 1. 将官方 Harness 的插件、作用域服务、事件模式、可逆 Effect、Session Event、Profile/Bundle/Patch、上下文压缩、Goal/Job 等设计落入 CISRE。
 2. DeepSeek 或任意 OpenAI 兼容模型继续负责根因假设、Skill 排序和结构化方案。
 3. Kubernetes 取证、人工审批、动作校验、Rancher/kubeconfig 执行、写后回读和持续恢复验证仍由 CISRE 掌握。
-4. 官方 Python SDK/JSON-RPC 以后可作为无写权限的 Planner 进程启用，但永远不能成为 Kubernetes mutation authority。
+4. 官方 Node/TypeScript `@deepseek-ai/dsh` 以后可作为无写权限、进程外的 Planner 启用，但永远不能成为 Kubernetes mutation authority。
 
-原因：官方仓库当前明确标注 Developer Preview，未来可能发生破坏性变更；Python SDK 的项目版本仍为 `0.0.0.dev0`。其默认 SDK 组合还会加载本地 Bash，官方 minimal 示例使用 `danger-full-access` 文件系统策略。直接替换生产 AIOps 控制面会扩大供应链、兼容性和执行权限风险。
+原因：官方仓库当前明确标注 Developer Preview，审计版本为 `0.1.0-rc.5`，未来可能发生破坏性变更。官方动态 Cordis 包的 `node:vm` 只隔离全局变量，官方文档明确说明它不是安全边界，应像 Bash 一样对待。直接替换生产 AIOps 控制面会扩大供应链、兼容性和执行权限风险。
 
 ## 生产架构
 
@@ -40,7 +40,7 @@ flowchart LR
 
   H --> EVT --> CMP --> PLAN --> SKILL --> G1 --> G2 --> EXEC --> RAW --> REC --> GOAL --> JOB
   EVT --> STORE["Hash-chained JSONL\nReplay / Fork / Resume"]
-  PLAN -. "optional planner only" .-> DSH["Official DeepSeek Harness\nPython SDK / JSON-RPC"]
+  PLAN -. "optional planner only" .-> DSH["Official DeepSeek Harness\nNode runtime / isolated gateway"]
   EXEC --> R["Rancher API"]
   EXEC --> K["Encrypted kubeconfig"]
   R --> C["Kubernetes API"]
@@ -81,7 +81,7 @@ flowchart LR
 - `cisre.owner-scoped-jobs`
 - `cisre.telemetry`
 
-`GET /api/ops/capabilities` 会返回每个插件的状态、依赖、服务、事件、Profile、权限与上游 SDK 就绪状态。前端“运行总览 → 运维工具”展示插件/Profile、服务依赖图、会话事件、分支恢复与权限审计。外置插件开发、目录和 API 见 [HARNESS_PLUGIN_DEVELOPMENT_ZH.md](./HARNESS_PLUGIN_DEVELOPMENT_ZH.md)。
+`GET /api/ops/capabilities` 会返回每个插件的状态、依赖、服务、事件、Profile、权限与上游运行时就绪状态。前端“平台能力 → 插件中心”展示插件/Profile、服务依赖图、团队接入、会话事件、分支恢复与权限审计，并支持校验和导入声明式插件。外置插件开发、目录和 API 见 [HARNESS_PLUGIN_DEVELOPMENT_ZH.md](./HARNESS_PLUGIN_DEVELOPMENT_ZH.md)，数据库/VM/存储团队接入见 [PLUGIN_TEAM_ONBOARDING_ZH.md](./PLUGIN_TEAM_ONBOARDING_ZH.md)。
 
 ## 安全边界
 
@@ -103,11 +103,11 @@ flowchart LR
 
 ## 上游运行时启用条件
 
-当前默认不安装、不启动官方 SDK。只有同时满足以下条件才能将它作为可选 Planner：
+当前默认不安装、不启动官方 dsh 运行时。只有同时满足以下条件才能将它作为可选 Planner：
 
-1. 官方发布带稳定版本号的 Python SDK/runtime wheel，不再是 `0.0.0.dev0`；
+1. 官方结束 Developer Preview，并发布兼容性承诺稳定的版本；
 2. 固定版本和制品哈希，完成 amd64/arm64、SBOM、许可证和漏洞扫描；
-3. 使用无 Bash、无 FS、无 subprocess 的 Cordis 配置；
+3. 使用无 Bash、无 FS、无 subprocess、无动态代码执行的 Cordis 配置；
 4. 内部 OAuth/OpenAI-compatible 网关、TLS 和 structured JSON 回归通过；
 5. 故障或超时会自动回退现有 `GatewayChatModel`，且不会卡住根因诊断；
 6. 上游 Agent 的输出仍需经过 CISRE Skill/action normalization 和人工审批。
@@ -117,6 +117,7 @@ flowchart LR
 ```text
 DEEPSEEK_HARNESS_UPSTREAM_ENABLED=false
 DEEPSEEK_HARNESS_CORDIS_CONFIG=
+DEEPSEEK_HARNESS_GATEWAY_URL=
 ```
 
 即使第一个变量误设为 `true`，没有已审计的 Planner-only Cordis 配置也不会将上游运行时标记为 ready。

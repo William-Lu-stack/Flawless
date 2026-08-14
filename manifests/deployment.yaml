@@ -4,7 +4,7 @@ metadata:
   name: k8s-agent-config
   namespace: k8s-agent
 data:
-  APP_BUILD_VERSION: '5.4.0'
+  APP_BUILD_VERSION: '5.5.0'
   OAUTH_TOKEN_URL: ''
   LLM_GATEWAY_BASE: ''
   LLM_API_BASE: http://ollama.default.svc.cluster.local:11434/v1
@@ -158,6 +158,7 @@ data:
   HARNESS_PLUGIN_ROOT: /var/lib/flawless/harness
   HARNESS_PROFILE: production
   HARNESS_PROFILE_RUNTIME_WRITE_ENABLED: 'false'
+  HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED: 'false'
   HARNESS_PLUGIN_DEVELOPMENT_MODE: 'false'
   HARNESS_EVENT_STORE_PATH: /var/lib/flawless/harness-events.jsonl
   HARNESS_EVENT_STORE_FALLBACK_PATH: /tmp/cisre/harness-events.jsonl
@@ -302,7 +303,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: mcp-server
-        image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
+        image: ghcr.dockerproxy.net/your-org/cisre:5.5.0
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -340,7 +341,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: observability-agent
-        image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
+        image: ghcr.dockerproxy.net/your-org/cisre:5.5.0
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -397,7 +398,7 @@ spec:
             cpu: 1
             memory: 1Gi
       - name: healing-agent
-        image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
+        image: ghcr.dockerproxy.net/your-org/cisre:5.5.0
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -435,7 +436,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: incident-agent
-        image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
+        image: ghcr.dockerproxy.net/your-org/cisre:5.5.0
         imagePullPolicy: Always
         command:
         - uvicorn
@@ -473,7 +474,7 @@ spec:
             cpu: 500m
             memory: 512Mi
       - name: postmortem-agent
-        image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
+        image: ghcr.dockerproxy.net/your-org/cisre:5.5.0
         imagePullPolicy: Always
         command:
         - sh
@@ -525,7 +526,7 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 3
       - name: openwebui-adapter
-        image: ghcr.dockerproxy.net/your-org/cisre:5.4.0
+        image: ghcr.dockerproxy.net/your-org/cisre:5.5.0
         imagePullPolicy: Always
         command:
         - uvicorn

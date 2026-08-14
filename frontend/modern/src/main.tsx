@@ -4,6 +4,7 @@ import {
   Activity,
   BookOpen,
   Bot,
+  Blocks,
   Boxes,
   BrainCircuit,
   Beaker,
@@ -68,6 +69,7 @@ import {
   IntegrationsPage,
   OpsSkillsPage,
   OperationsPage,
+  PluginCenterPage,
   ResourcesPage,
   SignalsPage,
 } from "./UnifiedPages";
@@ -75,7 +77,7 @@ import "./styles.css";
 
 type PageKey = "chat" | "inspection" | "topology" | "skills" | "platform";
 type Theme = "light" | "dark";
-type PlatformTab = "overview" | "effectiveness" | "reliability" | "models" | "knowledge" | "observability" | "algorithms" | "infrastructure" | "integrations";
+type PlatformTab = "overview" | "effectiveness" | "plugins" | "reliability" | "models" | "knowledge" | "observability" | "algorithms" | "infrastructure" | "integrations";
 
 type ChatMessage = {
   id: string;
@@ -109,7 +111,7 @@ type ModelProfile = {
 };
 
 const navItems = [
-  { key: "chat", label: "SRE 对话", group: "核心", icon: MessageSquareText },
+  { key: "chat", label: "SRE Run", group: "核心", icon: MessageSquareText },
   { key: "inspection", label: "AI 巡检", group: "核心", icon: Search },
   { key: "topology", label: "拓扑影响", group: "核心", icon: Network },
   { key: "skills", label: "Skill 库", group: "核心", icon: BrainCircuit }
@@ -118,6 +120,7 @@ const navItems = [
 const platformItems: Array<{ key: PlatformTab; label: string; icon: any }> = [
   { key: "overview", label: "运行总览", icon: LayoutDashboard },
   { key: "effectiveness", label: "运维成效", icon: LineChart },
+  { key: "plugins", label: "插件中心", icon: Blocks },
   { key: "reliability", label: "发布治理", icon: ShieldCheck },
   { key: "models", label: "模型实验室", icon: Beaker },
   { key: "knowledge", label: "知识库", icon: BookOpen },
@@ -255,7 +258,7 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark" aria-label="CISRE logo">
+          <div className="brand-mark" aria-label="SRE initiate logo">
             <svg viewBox="0 0 48 48" role="img" aria-hidden="true">
               <path d="M34.7 10.2A17 17 0 1 0 35.9 36" />
               <path d="M31.8 16.3a9.4 9.4 0 1 0 .8 14.7" />
@@ -264,8 +267,8 @@ function App() {
             </svg>
           </div>
           <div>
-            <strong>CISRE</strong>
-            <span>{build.data?.version || "Intelligent Reliability Engine"}</span>
+            <strong>SRE initiate</strong>
+            <span>{build.data?.version || "Infrastructure Reliability"}</span>
           </div>
         </div>
         <nav className="nav">
@@ -328,16 +331,16 @@ function App() {
           </div>
           <button className="ghost tiny" onClick={refreshHealth}><RefreshCcw size={13} />刷新状态</button>
         </div>
-        <div className="author-watermark" title="Created by the maintainer">
-          <span>Created by</span>
-          <strong>the maintainer</strong>
+        <div className="author-watermark" title="SRE initiate control plane">
+          <span>Operate with</span>
+          <strong>SRE initiate</strong>
         </div>
       </aside>
 
       <main className="main">
         <header className="topbar">
           <div className="topbar-title">
-            <span>CISRE · CONTROL PLANE</span>
+            <span>SRE INITIATE · CONTROL PLANE</span>
             <h1>{page === "platform" ? platformItems.find((x) => x.key === platformTab)?.label : navItems.find((x) => x.key === page)?.label}</h1>
           </div>
           <div className="top-actions">
@@ -418,6 +421,7 @@ function PlatformPage({
     <section className="hub-page">
       {tab === "overview" && <RuntimeOverviewPage />}
       {tab === "effectiveness" && <EffectivenessPage />}
+      {tab === "plugins" && <PluginCenterPage />}
       {tab === "reliability" && <ReliabilityPage />}
       {tab === "models" && <ModelLabPage activeModelId={activeModelId} onActivate={onActivate} refreshRegistry={refreshRegistry} registry={registry} />}
       {tab === "knowledge" && <KnowledgePage activeModelId={activeModelId} />}
@@ -827,7 +831,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
     <article className={cx("message", message.role, message.status === "streaming" && "streaming")}>
       <div className="avatar">{message.role === "assistant" ? <Bot size={16} /> : "我"}</div>
       <div className="bubble">
-        <div className="message-meta">{message.role === "assistant" ? "CISRE" : "你"} {message.status === "streaming" && <span>正在生成</span>}{message.status === "stopped" && <span>已中断</span>}</div>
+        <div className="message-meta">{message.role === "assistant" ? "SRE initiate" : "你"} {message.status === "streaming" && <span>正在生成</span>}{message.status === "stopped" && <span>已中断</span>}</div>
         {message.target && <div className="message-target"><CircleDot size={11} /><span>{message.target.cluster} / {message.target.namespace}</span><b>{message.target.workload_name ? `${message.target.workload_type}/${message.target.workload_name}` : `Pod/${message.target.pod_name}`}</b></div>}
         {message.role === "assistant" && activities.length > 0 && (
           <details className="agent-activity" open={message.status === "streaming"}>
@@ -868,13 +872,13 @@ function chatPlanFromResponse(data: any) {
         : fallbackTarget;
   return {
     id: `chat-${makeId()}`,
-    title: "SRE 对话处置计划",
+    title: "SRE Run 处置计划",
     cluster: remediation.cluster || raw.k8s_context?.cluster || alert.cluster || "all",
     cluster_id: remediation.cluster_id || raw.k8s_context?.cluster_id || alert.cluster_id || alert.cluster || "all",
     namespace: remediation.namespace || raw.k8s_context?.pod?.namespace || alert.namespace || "default",
     target,
     pod_name: remediation.pod_name || raw.k8s_context?.pod?.name || alert.pod || "",
-    summary: diagnosis.root_cause || diagnosis.summary || "基于 SRE 对话证据生成的处置计划。",
+    summary: diagnosis.root_cause || diagnosis.summary || "基于 SRE Run 证据生成的处置计划。",
     reason: remediation.reason || decision.reason || diagnosis.root_cause || "",
     evidence_gap: remediation.evidence_gap || diagnosis.evidence_gap || "",
     root_cause_hypotheses: remediation.root_cause_hypotheses || remediation.hypotheses || diagnosis.root_cause_hypotheses || [],
@@ -2807,7 +2811,7 @@ function EffectivenessPage() {
         <Metric title="恢复 Pod" value={summary.pods_recovered || 0} tone="good" />
       </div>
       <Panel className="span-all">
-        <PanelTitle icon={CheckCircle2} title="CISRE 已解决的问题" subtitle="这里只展示恢复验证已通过的运维结果" action={<button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button>} />
+        <PanelTitle icon={CheckCircle2} title="SRE initiate 已解决的问题" subtitle="这里只展示恢复验证已通过的运维结果" action={<button className="ghost" onClick={refresh}><RefreshCcw size={15} />刷新</button>} />
         {state.loading && <div className="quiet-empty">正在读取已验证的恢复记录...</div>}
         {state.error && <div className="error-box">{state.error}</div>}
         <div className="resolved-problem-list">
@@ -2827,7 +2831,7 @@ function EffectivenessPage() {
         </div>
       </Panel>
       {selectedRecord && <Panel className="span-all">
-        <PanelTitle icon={FileUp} title={issueTitle(selectedRecord)} subtitle="CISRE 解决细节" action={<button className="ghost tiny" onClick={() => setSelectedRecord(null)}>关闭</button>} />
+        <PanelTitle icon={FileUp} title={issueTitle(selectedRecord)} subtitle="SRE initiate 解决细节" action={<button className="ghost tiny" onClick={() => setSelectedRecord(null)}>关闭</button>} />
         <div className="effectiveness-detail">
           <div><span>目标</span><strong>{selectedRecord.target || selectedRecord.model_id || "-"}</strong></div>
           <div><span>范围</span><strong>{selectedRecord.cluster || "-"} / {selectedRecord.namespace || "-"}</strong></div>
@@ -3285,7 +3289,7 @@ function KnowledgePage({ activeModelId }: { activeModelId: string }) {
         </div>
         <div className="profile-grid">
           {asList(sources.data?.domains).map((item: any) => (
-            <div className="profile-card" key={item.id}><strong>{item.name}</strong><p>{item.documents} 个知识片段，可被小助手、SRE 对话和运维流程复用。</p></div>
+            <div className="profile-card" key={item.id}><strong>{item.name}</strong><p>{item.documents} 个知识片段，可被小助手、SRE Run 和运维流程复用。</p></div>
           ))}
         </div>
       </Panel>

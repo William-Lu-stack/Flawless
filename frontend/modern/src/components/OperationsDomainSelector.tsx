@@ -73,24 +73,12 @@ export function OperationsDomainSelector({
   }
 
   return <section className="domain-gate">
-    <div className="domain-gate-copy">
-      <span>UNIFIED SRE ENTRY</span>
-      <h2>先选择要解决哪一类基础设施风险</h2>
-      <p>每个运维域拥有独立证据和 Skill，但共用同一套人工审批、执行审计、写后回读与恢复验证。</p>
-      <label>运维对象域
-        <select value={value} onChange={(event) => onChange(event.target.value as OperationsDomainId)}>
-          <option value="">请选择</option>
-          {domains.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.target_label}</option>)}
-        </select>
-      </label>
-    </div>
-    <div className="domain-gate-grid">
-      {domains.map((item) => <button key={item.id} onClick={() => onChange(item.id)}>
-        <span className="domain-card-icon"><DomainIcon id={item.id} /></span>
-        <div><small>{item.short_name}</small><strong>{item.name}</strong></div>
-        <p>{item.description}</p>
-        <footer><span>{item.resource_count == null ? "内置完整能力" : item.resource_count ? `${item.resource_count} resources` : "Adapter 接口已就绪"}</span><b>进入 →</b></footer>
+    <nav className="domain-gate-grid" aria-label="基础设施运维入口">
+      {domains.map((item) => <button key={item.id} onClick={() => onChange(item.id)} aria-label={`进入${item.name}`}>
+        <span className="domain-card-icon"><DomainIcon id={item.id} size={27} /></span>
+        <div><strong>{item.name}</strong><small>{item.short_name}</small></div>
+        <span className="domain-card-enter" aria-hidden="true">→</span>
       </button>)}
-    </div>
+    </nav>
   </section>;
 }

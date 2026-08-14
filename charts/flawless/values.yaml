@@ -103,6 +103,7 @@ config:
   HARNESS_PLUGIN_ROOT: /var/lib/flawless/harness
   HARNESS_PROFILE: production
   HARNESS_PROFILE_RUNTIME_WRITE_ENABLED: "false"
+  HARNESS_PACKAGE_RUNTIME_WRITE_ENABLED: "false"
   HARNESS_PLUGIN_DEVELOPMENT_MODE: "false"
   HARNESS_EVENT_STORE_PATH: /var/lib/flawless/harness-events.jsonl
   HARNESS_EVENT_STORE_FALLBACK_PATH: /tmp/cisre/harness-events.jsonl

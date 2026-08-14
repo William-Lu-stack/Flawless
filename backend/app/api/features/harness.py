@@ -23,6 +23,11 @@ class ServiceInvokeRequest(BaseModel):
     scopes: list[str] = Field(default_factory=list, max_length=8)
 
 
+class PluginManifestRequest(BaseModel):
+    manifest: str = Field(min_length=20, max_length=512 * 1024)
+    add_to_active_profile: bool = True
+
+
 def _actor(request: Request) -> str:
     return str(
         request.headers.get("x-auth-request-user")
@@ -44,11 +49,45 @@ def build_router() -> APIRouter:
         return {
             "active_profile": value["active_profile"],
             "runtime_write_enabled": value["runtime_write_enabled"],
+            "package_write_enabled": value["package_write_enabled"],
             "profiles": value["profiles"],
             "bundles": value["bundles"],
             "packages": value["packages"],
             "last_error": value["last_error"],
         }
+
+    @router.post("/api/harness/plugins/validate")
+    async def validate_plugin(body: PluginManifestRequest):
+        try:
+            package = HARNESS_PACKAGE_MANAGER.validate_source(body.manifest)
+        except HarnessPackageError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"status": "valid", "package": package}
+
+    @router.post("/api/harness/plugins/install")
+    async def install_plugin(body: PluginManifestRequest, request: Request):
+        try:
+            result = HARNESS_PACKAGE_MANAGER.install_source(
+                body.manifest,
+                add_to_active_profile=body.add_to_active_profile,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (HarnessPackageError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        plugin_id = str(result.get("package", {}).get("id") or "plugin")
+        HARNESS_EVENT_STORE.append(
+            "harness-runtime",
+            "plugin/installed",
+            stage="plugin_installed",
+            phase="runtime",
+            status="completed",
+            message=f"Plugin {plugin_id} installed and reconciled",
+            actor=_actor(request),
+            plugin_id="cisre.plugin-loader",
+            data={"installed_plugin": plugin_id, "active_profile": HARNESS_PACKAGE_MANAGER.active_profile},
+        )
+        return result
 
     @router.post("/api/harness/profiles/activate")
     async def activate_profile(body: ProfileActivationRequest, request: Request):

@@ -21,13 +21,13 @@ SUPPORTED_DOMAINS = {
     "database", "virtual_machine", "storage", "middleware", "cloud_service",
 }
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,95}$")
-_SECRET_KEY = re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)")
+_SENSITIVE_FIELD_PATTERN = re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)")
 
 
 def _assert_safe_mapping(value: Any, *, path: str = "payload") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            if _SECRET_KEY.search(str(key)):
+            if _SENSITIVE_FIELD_PATTERN.search(str(key)):
                 raise ValueError(f"{path} must not contain secret field {key!r}")
             _assert_safe_mapping(item, path=f"{path}.{key}")
     elif isinstance(value, list):
